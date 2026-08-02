@@ -1,0 +1,12 @@
+changelog:
+  categories:
+    - title: 🚀 Features
+      labels: [feature]
+    - title: 🐛 Fixes
+      labels: [defect]
+    - title: 🧹 Maintenance
+      labels: [task]
+    - title: ⬆️ Dependencies
+      labels: [dependencies, github_actions]
+    - title: Other
+      labels: ["*"]

@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+PackageIdentifier: ShuwariAfrica.Hedwig
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Shuwari Africa
+PublisherUrl: https://github.com/shuwariafrica
+PublisherSupportUrl: https://github.com/shuwariafrica/hedwig/issues
+PackageName: hedwig
+PackageUrl: https://github.com/shuwariafrica/hedwig
+License: MIT
+LicenseUrl: https://github.com/shuwariafrica/hedwig/blob/main/LICENSE
+ShortDescription: Forward the Windows gpg-agent to Linux hosts over ssh -R
+Description: |-
+  A loopback relay that makes gpg-agent on Windows forwardable with plain
+  OpenSSH, so git commits on remote Linux hosts (VMs, servers, Coder
+  workspaces) can be signed with an OpenPGP key held on a YubiKey plugged into
+  the Windows machine. Speaks GnuPG's Windows socket emulation (port file plus
+  nonce handshake), verifies both peers' identity at the OS level, and relays
+  the restricted agent socket by default.
+Moniker: hedwig
+Tags:
+  - gpg
+  - gnupg
+  - gpg-agent
+  - ssh
+  - yubikey
+  - signing
+  - git
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0

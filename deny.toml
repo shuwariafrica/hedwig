@@ -1,0 +1,27 @@
+# Keep these triples in step with the release matrix in .github/workflows/build.yml:
+# an unlisted target's dependency edges are never evaluated.
+[graph]
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-pc-windows-msvc" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+# Only what the current graph uses; a new license type should fail CI and get a
+# conscious review rather than be pre-blessed.
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

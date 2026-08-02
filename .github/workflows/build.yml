@@ -1,0 +1,274 @@
+name: "build"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  push:
+    branches: [main]
+    tags: [v*]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: "test / ${{ matrix.arch }} / ${{ matrix.toolchain }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+            toolchain: pinned
+          - arch: aarch64
+            runner: windows-11-arm
+            toolchain: pinned
+          # Toolchain coverage stays on x86_64: a second architecture answers
+          # nothing that a question about the compiler asks.
+          - arch: x86_64
+            runner: windows-2025
+            toolchain: beta
+            rust: beta
+          - arch: x86_64
+            runner: windows-2025
+            toolchain: msrv
+            rust: "1.85.0"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    # beta is early warning for the next stable; a beta regression must not block.
+    continue-on-error: ${{ matrix.toolchain == 'beta' }}
+    env:
+      # The vendor, system and ABI are the same for every row, so the triple is
+      # not a matrix dimension. Naming the ABI once here is also what stops a
+      # row being edited into a target that disagrees with its own `arch`.
+      TARGET: ${{ matrix.arch }}-pc-windows-msvc
+      # Windows spells architectures differently from Rust, and winget's
+      # `Architecture` field takes the Windows spelling. Two-valued, so a
+      # conditional carries it; a third architecture needs a real mapping.
+      ASSET: ${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}
+    steps:
+      # Full history and tags: build.rs stamps the binary with `git describe`,
+      # which reports a bare sha against a shallow clone.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # A row naming no `rust` takes the channel, components and targets from
+      # rust-toolchain.toml, which rustup installs on the first cargo command.
+      # RUSTUP_TOOLCHAIN is the only thing that outranks that file.
+      - name: Override Toolchain
+        if: matrix.rust != ''
+        shell: pwsh
+        run: |
+          rustup toolchain install ${{ matrix.rust }} --profile minimal --component clippy --target ${{ env.TARGET }}
+          "RUSTUP_TOOLCHAIN=${{ matrix.rust }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # --target is what pins the MSVC ABI; relying on the runner's default host
+      # would leave it to the image.
+      - name: Build
+        run: cargo build --release --locked --target ${{ env.TARGET }}
+
+      - name: Test
+        run: cargo test --locked --target ${{ env.TARGET }}
+
+      # The MSRV row runs an older clippy whose lint set differs; holding it to
+      # today's warnings would fail on lints that did not exist then.
+      - name: Clippy
+        if: matrix.toolchain != 'msrv'
+        run: cargo clippy --locked --all-targets --target ${{ env.TARGET }} -- -D warnings
+
+      - name: Docs
+        if: matrix.toolchain == 'pinned' && matrix.arch == 'x86_64'
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked --no-deps --target ${{ env.TARGET }}
+
+      - name: Stage Release Binary
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.toolchain == 'pinned'
+        shell: pwsh
+        run: Copy-Item target/${{ env.TARGET }}/release/hedwig.exe hedwig-${{ env.ASSET }}.exe
+
+      - name: Upload Release Binary
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.toolchain == 'pinned'
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.arch }}
+          path: hedwig-${{ env.ASSET }}.exe
+          retention-days: 1
+          if-no-files-found: error
+
+  static_analysis:
+    name: Static Analysis
+    # Formatting is text-only and cargo-deny reads metadata, so neither compiles
+    # the crate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify Formatting
+        id: fmt
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+      - name: Verify Supply Chain
+        id: deny
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+      # Aggregate so one run reports every failing check, not just the first.
+      - name: Check for failures
+        if: always()
+        run: |
+          failed=""
+          [[ "${{ steps.fmt.outcome }}" == "failure" ]] && failed="$failed rustfmt"
+          [[ "${{ steps.deny.outcome }}" == "failure" ]] && failed="$failed cargo-deny"
+          if [[ -n "$failed" ]]; then
+            echo "::error::Static analysis checks failed:$failed"
+            exit 1
+          fi
+
+  release:
+    name: Publish Release
+    needs: [test, static_analysis]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Backstop for the same check in ./release. The binary reports
+      # CARGO_PKG_VERSION, so a mismatched tag ships binaries that disagree with
+      # the release they are attached to.
+      - name: Verify Tag Matches Crate Version
+        run: |
+          crate_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [[ "$crate_version" != "${GITHUB_REF_NAME#v}" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate_version}"
+            exit 1
+          fi
+
+      - name: Collect Binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Generate Checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      # Authenticode is unavailable: Azure Artifact Signing admits only US, CA,
+      # EU and UK organisations. A detached OpenPGP signature is what users have
+      # to verify against instead.
+      - name: Import Signing Key
+        id: signing-key
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.OSS_PUBLISH_USER_SIGNING_KEY }}
+          trust_level: 5
+
+      # SECURITY.md and the README are what a user is told to trust, so they are
+      # the source of truth: a key that does not match them must not sign a
+      # release, and a rotation that misses either document fails here. Git
+      # hashes do not collide with this pattern, being lower case.
+      - name: Verify Signing Key Is The Published One
+        env:
+          FINGERPRINT: ${{ steps.signing-key.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          published=$(grep -ohE '[0-9A-F]{40}' README.md SECURITY.md | sort -u)
+          if [[ "$(grep -ohE '[0-9A-F]{40}' README.md SECURITY.md | sort -u | wc -l)" -ne 1 ]]; then
+            echo "::error::README.md and SECURITY.md must publish exactly one fingerprint, found: $published"
+            exit 1
+          fi
+          if [[ "${FINGERPRINT^^}" != "$published" ]]; then
+            echo "::error::signing key ${FINGERPRINT} is not the published fingerprint ${published}"
+            exit 1
+          fi
+          echo "signing key matches the published fingerprint: ${published}"
+
+      # A loop rather than `find -exec`, which reports success even when the
+      # command it ran failed. The glob is expanded once, so the .asc files
+      # this creates are not themselves signed.
+      - name: Sign Release Artefacts
+        run: |
+          set -euo pipefail
+          for artefact in release/*; do
+            gpg --batch --yes --armor --detach-sign "$artefact"
+          done
+          ls -l release/
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: release/hedwig-*.exe
+
+      # The release is created under the org app identity, not the ephemeral
+      # default actor.
+      - name: Mint Release Bot Token
+        id: release-bot
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ steps.release-bot.outputs.token }}
+          FINGERPRINT: ${{ steps.signing-key.outputs.fingerprint }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          if [[ "$TAG" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          gh release create "$TAG" --repo "$REPO" --title "$TAG" \
+            --generate-notes --verify-tag $prerelease_flag release/*
+          # Restating the fingerprint here keeps it correct across key rotation.
+          # It is a convenience, not the trust anchor: the key must be fetched
+          # from a keyserver, never from the release it authenticates.
+          gh release view "$TAG" --repo "$REPO" --json body --jq .body > notes.md
+          printf '\n## Verifying this download\n\nEvery asset has a detached signature beside it.\n\n```\ngpg --keyserver hkps://keyserver.ubuntu.com --recv-keys %s\ngpg --verify hedwig-x64.exe.asc hedwig-x64.exe\n```\n' \
+            "$FINGERPRINT" >> notes.md
+          gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
+
+  winget:
+    name: Submit to WinGet
+    needs: release
+    # The action only adds versions to a package already in the community
+    # repository, so this stays off until one has been published by hand.
+    if: vars.WINGET_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Submit Manifest Update
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: ShuwariAfrica.Hedwig
+          # Anchored so SHA256SUMS is never taken for an installer.
+          installers-regex: 'hedwig-(x64|arm64)\.exe$'
+          token: ${{ secrets.WINGET_TOKEN }}

@@ -1,0 +1,66 @@
+[package]
+name = "hedwig"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Forward the Windows gpg-agent to Linux hosts over ssh -R: a loopback relay that speaks GnuPG's Windows socket emulation"
+license = "MIT"
+repository = "https://github.com/shuwariafrica/hedwig"
+categories = ["command-line-utilities", "cryptography"]
+keywords = ["gpg", "gpg-agent", "yubikey", "ssh", "forwarding"]
+
+[dependencies]
+zeroize = "1.9"
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+]
+
+[lints.rust]
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
+elided_lifetimes_in_paths = "deny"
+redundant_lifetimes = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unit_bindings = "deny"
+unreachable_pub = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
+exit = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+mem_forget = "deny"
+multiple_unsafe_ops_per_block = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+undocumented_unsafe_blocks = "allow"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+# Left unwinding: a panic must cost one connection, not the whole relay.

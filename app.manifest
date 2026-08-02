@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+  <assemblyIdentity type="win32" name="ShuwariAfrica.Hedwig" version="1.0.0.0" processorArchitecture="*"/>
+
+  <!-- Declaring a level at all is what disables file and registry virtualisation,
+       so the HKCU write in `install` cannot be silently redirected. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10, Windows 11, Server 2016 through Server 2022 and later -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <asmv3:application>
+    <asmv3:windowsSettings xmlns:ws2016="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+      <!-- The socketdir and log-file options are user-supplied and may exceed MAX_PATH. -->
+      <ws2016:longPathAware>true</ws2016:longPathAware>
+    </asmv3:windowsSettings>
+    <asmv3:windowsSettings xmlns:ws2024="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
+      <!-- Console subsystem, but no window when there is no parent terminal:
+           output reaches a terminal that runs it, and logon start is silent. -->
+      <ws2024:consoleAllocationPolicy>detached</ws2024:consoleAllocationPolicy>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+</assembly>

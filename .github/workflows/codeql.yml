@@ -1,0 +1,43 @@
+name: "codeql"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  schedule:
+    # Catches newly published queries against unchanged code.
+    - cron: "17 3 * * 1"
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyse:
+    name: Analyse
+    # build-mode none still resolves types, and the crate is unconditionally
+    # Windows: on a Linux runner std::os::windows and windows-sys do not resolve
+    # and most of the code goes unanalysed.
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          build-mode: none
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v4

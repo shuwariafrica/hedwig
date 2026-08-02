@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+PackageIdentifier: ShuwariAfrica.Hedwig
+PackageVersion: 0.1.0
+InstallerLocale: en-US
+Platform:
+  - Windows.Desktop
+MinimumOSVersion: 10.0.26100.0
+InstallerType: portable
+# Sets the name winget links onto PATH. Without it the alias would be the asset
+# filename, architecture suffix and all.
+Commands:
+  - hedwig
+UpgradeBehavior: uninstallPrevious
+ReleaseDate: 2026-08-02
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/shuwariafrica/hedwig/releases/download/v0.1.0/hedwig-x64.exe
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+  - Architecture: arm64
+    InstallerUrl: https://github.com/shuwariafrica/hedwig/releases/download/v0.1.0/hedwig-arm64.exe
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+ManifestType: installer
+ManifestVersion: 1.12.0

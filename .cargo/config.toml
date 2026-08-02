@@ -1,0 +1,24 @@
+# Without a static CRT the binary imports VCRUNTIME140.dll, which ships with the
+# VC++ redistributable rather than Windows, so a clean machine cannot run it.
+# Setting RUSTFLAGS in the environment replaces these flags rather than adding to
+# them, and the loss is silent: never set it in CI.
+#
+# CETCOMPAT is x64-only; ARM64 gets equivalent protection from pointer
+# authentication in hardware, with no opt-in flag.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "control-flow-guard=yes",
+    "-C", "link-arg=/CETCOMPAT",
+    "-C", "link-arg=/MANIFEST:EMBED",
+    "-C", "link-arg=/MANIFESTINPUT:app.manifest",
+]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "control-flow-guard=yes",
+    "-C", "link-arg=/MANIFEST:EMBED",
+    "-C", "link-arg=/MANIFESTINPUT:app.manifest",
+]

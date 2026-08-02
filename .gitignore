@@ -1,0 +1,12 @@
+.*
+*.md
+
+!.gitignore
+!.cargo/
+!.github/
+
+!README.md
+!CONTRIBUTING.md
+!SECURITY.md
+
+/target/
