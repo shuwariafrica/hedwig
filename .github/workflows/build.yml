@@ -59,7 +59,7 @@ jobs:
       # Full history and tags: build.rs stamps the binary with `git describe`,
       # which reports a bare sha against a shallow clone.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -100,7 +100,7 @@ jobs:
 
       - name: Upload Release Binary
         if: startsWith(github.ref, 'refs/tags/v') && matrix.toolchain == 'pinned'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: binary-${{ matrix.arch }}
           path: hedwig-${{ env.ASSET }}.exe
@@ -115,7 +115,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Verify Formatting
         id: fmt
@@ -125,7 +125,7 @@ jobs:
       - name: Verify Supply Chain
         id: deny
         continue-on-error: true
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
 
@@ -153,7 +153,7 @@ jobs:
       attestations: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Backstop for the same check in ./release. The binary reports
       # CARGO_PKG_VERSION, so a mismatched tag ships binaries that disagree with
@@ -167,7 +167,7 @@ jobs:
           fi
 
       - name: Collect Binaries
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: release
           pattern: binary-*
@@ -184,7 +184,7 @@ jobs:
       # to verify against instead.
       - name: Import Signing Key
         id: signing-key
-        uses: crazy-max/ghaction-import-gpg@v7
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7
         with:
           gpg_private_key: ${{ secrets.OSS_PUBLISH_USER_SIGNING_KEY }}
           trust_level: 5
@@ -221,7 +221,7 @@ jobs:
           ls -l release/
 
       - name: Attest Build Provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-path: release/hedwig-*.exe
 
@@ -229,7 +229,7 @@ jobs:
       # default actor.
       - name: Mint Release Bot Token
         id: release-bot
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
@@ -266,7 +266,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Submit Manifest Update
-        uses: vedantmgoyal9/winget-releaser@v2
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
         with:
           identifier: ShuwariAfrica.Hedwig
           # Anchored so SHA256SUMS is never taken for an installer.
