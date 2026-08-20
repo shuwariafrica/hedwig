@@ -1,7 +1,7 @@
 # CI's beta and MSRV jobs override this with RUSTUP_TOOLCHAIN, which outranks it.
 
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.0"
 components = ["clippy", "rustfmt"]
 targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
 profile = "minimal"
