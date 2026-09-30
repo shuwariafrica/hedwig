@@ -15,9 +15,9 @@ ReleaseDate: 2026-08-02
 Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/shuwariafrica/hedwig/releases/download/v0.1.0/hedwig-x64.exe
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerSha256: 0019722B3968AF7C208F0BF1958758F7FE9B669E77784CA37FB40B63DEB6D907
   - Architecture: arm64
     InstallerUrl: https://github.com/shuwariafrica/hedwig/releases/download/v0.1.0/hedwig-arm64.exe
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerSha256: 33A0189E4C1A26950D38464C03FF1FEF2BA6CE2DEA9AA690093275B81EE51693
 ManifestType: installer
 ManifestVersion: 1.12.0

@@ -44,6 +44,9 @@ jobs:
             rust: "1.85.0"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
     # beta is early warning for the next stable; a beta regression must not block.
     continue-on-error: ${{ matrix.toolchain == 'beta' }}
     env:
@@ -68,35 +71,43 @@ jobs:
       # RUSTUP_TOOLCHAIN is the only thing that outranks that file.
       - name: Override Toolchain
         if: matrix.rust != ''
-        shell: pwsh
+        env:
+          CHANNEL: ${{ matrix.rust }}
         run: |
-          rustup toolchain install ${{ matrix.rust }} --profile minimal --component clippy --target ${{ env.TARGET }}
-          "RUSTUP_TOOLCHAIN=${{ matrix.rust }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install $env:CHANNEL --profile minimal --component clippy --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw "rustup could not install $env:CHANNEL (exit code $LASTEXITCODE)" }
+          "RUSTUP_TOOLCHAIN=$env:CHANNEL" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # --target is what pins the MSVC ABI; relying on the runner's default host
       # would leave it to the image.
       - name: Build
-        run: cargo build --release --locked --target ${{ env.TARGET }}
+        run: cargo build --release --locked --target $env:TARGET
 
+      # Tests run the profile that ships.
       - name: Test
-        run: cargo test --locked --target ${{ env.TARGET }}
+        run: cargo test --release --locked --target $env:TARGET
 
       # The MSRV row runs an older clippy whose lint set differs; holding it to
       # today's warnings would fail on lints that did not exist then.
       - name: Clippy
         if: matrix.toolchain != 'msrv'
-        run: cargo clippy --locked --all-targets --target ${{ env.TARGET }} -- -D warnings
+        run: cargo clippy --locked --all-targets --target $env:TARGET -- -D warnings
 
       - name: Docs
         if: matrix.toolchain == 'pinned' && matrix.arch == 'x86_64'
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --locked --no-deps --target ${{ env.TARGET }}
+        run: cargo doc --locked --no-deps --target $env:TARGET
 
       - name: Stage Release Binary
         if: startsWith(github.ref, 'refs/tags/v') && matrix.toolchain == 'pinned'
-        shell: pwsh
-        run: Copy-Item target/${{ env.TARGET }}/release/hedwig.exe hedwig-${{ env.ASSET }}.exe
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $binary = Join-Path -Path 'target' -ChildPath $env:TARGET -AdditionalChildPath 'release', 'hedwig.exe'
+          Copy-Item -LiteralPath $binary -Destination "hedwig-$env:ASSET.exe"
 
       - name: Upload Release Binary
         if: startsWith(github.ref, 'refs/tags/v') && matrix.toolchain == 'pinned'
@@ -109,10 +120,22 @@ jobs:
 
   static_analysis:
     name: Static Analysis
-    # Formatting is text-only and cargo-deny reads metadata, so neither compiles
-    # the crate.
+    # Linux, so no step here may compile the Windows-only crate.
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Change each version together with its release asset's SHA-256.
+      SHELLCHECK_VERSION: v0.11.0
+      SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+      SHFMT_VERSION: v3.14.1
+      SHFMT_SHA256: 76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf
+      PESTER_VERSION: 6.2.0
+      PSSCRIPTANALYZER_VERSION: 1.25.0
+      # Must stay inside the checkout for .shellcheckrc and .editorconfig to apply.
+      WORKFLOW_SCRIPTS: target/workflow-scripts
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -120,7 +143,9 @@ jobs:
       - name: Verify Formatting
         id: fmt
         continue-on-error: true
-        run: cargo fmt --all --check
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
 
       - name: Verify Supply Chain
         id: deny
@@ -129,15 +154,147 @@ jobs:
         with:
           command: check
 
+      - name: Install Shell Tools
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}" "${GITHUB_PATH:?}" "${SHELLCHECK_VERSION:?}" "${SHELLCHECK_SHA256:?}" \
+            "${SHFMT_VERSION:?}" "${SHFMT_SHA256:?}"
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          archive="${RUNNER_TEMP}/shellcheck.tar.xz"
+          curl --fail --silent --show-error --location --output "${archive}" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          printf '%s  %s\n' "${SHELLCHECK_SHA256}" "${archive}" | sha256sum --check --strict
+          tar --extract --xz --file "${archive}" --directory "${bin}" --strip-components=1 \
+            "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          curl --fail --silent --show-error --location --output "${bin}/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          printf '%s  %s\n' "${SHFMT_SHA256}" "${bin}/shfmt" | sha256sum --check --strict
+          chmod +x "${bin}/shfmt"
+          printf '%s\n' "${bin}" >>"${GITHUB_PATH}"
+
+      - name: Install PowerShell Modules
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $gallery = @{
+              Repository      = 'PSGallery'
+              TrustRepository = $true
+              Scope           = 'CurrentUser'
+          }
+          Install-PSResource -Name Pester -Version $env:PESTER_VERSION @gallery
+          Install-PSResource -Name PSScriptAnalyzer -Version $env:PSSCRIPTANALYZER_VERSION @gallery
+
+      # Fails any run: block with no shell of its own or from its job's defaults:
+      # the runner's default differs between Linux and Windows.
+      - name: Extract Workflow Scripts
+        id: extract
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          : "${WORKFLOW_SCRIPTS:?}"
+          rm -rf "${WORKFLOW_SCRIPTS}"
+          mkdir -p "${WORKFLOW_SCRIPTS}"
+          for workflow in .github/workflows/*.yml; do
+            name=$(basename "${workflow}" .yml)
+            # shellcheck disable=SC2016 # $job and $default are yq variables.
+            steps=$(yq '.jobs | to_entries | .[] | .key as $job | (.value.defaults.run.shell // "") as $default | .value.steps | to_entries | .[] | select(.value | has("run")) | [$job, .key, .value.shell // $default] | @tsv' "${workflow}")
+            if [[ -z "${steps}" ]]; then
+              continue
+            fi
+            while IFS=$'\t' read -r job index shell; do
+              case "${shell}" in
+                bash) extension='sh' ;;
+                pwsh) extension='ps1' ;;
+                *)
+                  printf '::error file=%s::job %s, step %s runs under shell "%s"; declare bash or pwsh\n' \
+                    "${workflow}" "${job}" "${index}" "${shell}"
+                  exit 1
+                  ;;
+              esac
+              # yq prints a newline after the block's own final one; capturing
+              # strips both, so the file ends as the block does.
+              script=$(yq ".jobs.\"${job}\".steps[${index}].run" "${workflow}")
+              printf '%s\n' "${script}" >"${WORKFLOW_SCRIPTS}/${name}.${job}.${index}.${extension}"
+            done <<<"${steps}"
+          done
+          ls -1 "${WORKFLOW_SCRIPTS}"
+
+      - name: Lint Shell
+        id: shellcheck
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          : "${WORKFLOW_SCRIPTS:?}"
+          shellcheck --version
+          shellcheck --severity=style "${WORKFLOW_SCRIPTS}"/*.sh
+
+      - name: Verify Shell Formatting
+        id: shfmt
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          : "${WORKFLOW_SCRIPTS:?}"
+          shfmt --version
+          shfmt --diff "${WORKFLOW_SCRIPTS}"/*.sh
+
+      - name: Lint PowerShell
+        id: psscriptanalyzer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Import-Module -Name PSScriptAnalyzer -RequiredVersion $env:PSSCRIPTANALYZER_VERSION
+          $findings = @(Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+          if ($findings) {
+              $findings | Format-List -Property ScriptPath, Line, RuleName, Severity, Message
+              throw "PSScriptAnalyzer reported $($findings.Count) finding(s)."
+          }
+
+      - name: Test Release Script
+        id: pester
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Import-Module -Name Pester -RequiredVersion $env:PESTER_VERSION
+          $configuration = New-PesterConfiguration
+          $configuration.Run.Path = '.'
+          $configuration.Run.PassThru = $true
+          $configuration.Output.Verbosity = 'Detailed'
+          $result = Invoke-Pester -Configuration $configuration
+          # A run that discovers no tests still reports Passed.
+          if ($result.Result -ne 'Passed' -or $result.PassedCount -eq 0) {
+              throw "Pester: $($result.PassedCount) passed, $($result.FailedCount) failed, $($result.NotRunCount) not run."
+          }
+
       # Aggregate so one run reports every failing check, not just the first.
       - name: Check for failures
         if: always()
+        env:
+          FMT: ${{ steps.fmt.outcome }}
+          DENY: ${{ steps.deny.outcome }}
+          EXTRACT: ${{ steps.extract.outcome }}
+          SHELLCHECK: ${{ steps.shellcheck.outcome }}
+          SHFMT: ${{ steps.shfmt.outcome }}
+          PSSCRIPTANALYZER: ${{ steps.psscriptanalyzer.outcome }}
+          PESTER: ${{ steps.pester.outcome }}
         run: |
-          failed=""
-          [[ "${{ steps.fmt.outcome }}" == "failure" ]] && failed="$failed rustfmt"
-          [[ "${{ steps.deny.outcome }}" == "failure" ]] && failed="$failed cargo-deny"
-          if [[ -n "$failed" ]]; then
-            echo "::error::Static analysis checks failed:$failed"
+          set -euo pipefail
+          : "${FMT:?}" "${DENY:?}" "${EXTRACT:?}" "${SHELLCHECK:?}" "${SHFMT:?}" "${PSSCRIPTANALYZER:?}" "${PESTER:?}"
+          failed=()
+          if [[ "${FMT}" == failure ]]; then failed+=(rustfmt); fi
+          if [[ "${DENY}" == failure ]]; then failed+=(cargo-deny); fi
+          if [[ "${EXTRACT}" == failure ]]; then failed+=(workflow-script-extraction); fi
+          if [[ "${SHELLCHECK}" == failure ]]; then failed+=(shellcheck); fi
+          if [[ "${SHFMT}" == failure ]]; then failed+=(shfmt); fi
+          if [[ "${PSSCRIPTANALYZER}" == failure ]]; then failed+=(PSScriptAnalyzer); fi
+          if [[ "${PESTER}" == failure ]]; then failed+=(Pester); fi
+          if ((${#failed[@]} > 0)); then
+            printf '::error::Static analysis checks failed: %s\n' "${failed[*]}"
             exit 1
           fi
 
@@ -151,6 +308,9 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -160,9 +320,13 @@ jobs:
       # the release they are attached to.
       - name: Verify Tag Matches Crate Version
         run: |
-          crate_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          if [[ "$crate_version" != "${GITHUB_REF_NAME#v}" ]]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate_version}"
+          set -euo pipefail
+          : "${GITHUB_REF_NAME:?}"
+          line=$(grep --max-count=1 '^version = ' Cargo.toml)
+          crate_version=${line#version = \"}
+          crate_version=${crate_version%\"}
+          if [[ "${crate_version}" != "${GITHUB_REF_NAME#v}" ]]; then
+            printf '::error::tag %s does not match Cargo.toml version %s\n' "${GITHUB_REF_NAME}" "${crate_version}"
             exit 1
           fi
 
@@ -175,8 +339,9 @@ jobs:
 
       - name: Generate Checksums
         run: |
+          set -euo pipefail
           cd release
-          sha256sum * > SHA256SUMS
+          sha256sum -- * >SHA256SUMS
           cat SHA256SUMS
 
       # Authenticode is unavailable: Azure Artifact Signing admits only US, CA,
@@ -198,16 +363,21 @@ jobs:
           FINGERPRINT: ${{ steps.signing-key.outputs.fingerprint }}
         run: |
           set -euo pipefail
-          published=$(grep -ohE '[0-9A-F]{40}' README.md SECURITY.md | sort -u)
-          if [[ "$(grep -ohE '[0-9A-F]{40}' README.md SECURITY.md | sort -u | wc -l)" -ne 1 ]]; then
-            echo "::error::README.md and SECURITY.md must publish exactly one fingerprint, found: $published"
+          : "${FINGERPRINT:?}"
+          if ! fingerprints=$(grep --only-matching --no-filename --extended-regexp '[0-9A-F]{40}' README.md SECURITY.md); then
+            printf '::error::README.md and SECURITY.md publish no fingerprint\n'
             exit 1
           fi
-          if [[ "${FINGERPRINT^^}" != "$published" ]]; then
-            echo "::error::signing key ${FINGERPRINT} is not the published fingerprint ${published}"
+          published=$(sort --unique <<<"${fingerprints}")
+          if [[ "${published}" == *$'\n'* ]]; then
+            printf '::error::README.md and SECURITY.md must publish exactly one fingerprint, found: %s\n' "${published//$'\n'/ }"
             exit 1
           fi
-          echo "signing key matches the published fingerprint: ${published}"
+          if [[ "${FINGERPRINT^^}" != "${published}" ]]; then
+            printf '::error::signing key %s is not the published fingerprint %s\n' "${FINGERPRINT}" "${published}"
+            exit 1
+          fi
+          printf 'signing key matches the published fingerprint: %s\n' "${published}"
 
       # A loop rather than `find -exec`, which reports success even when the
       # command it ran failed. The glob is expanded once, so the .asc files
@@ -216,7 +386,7 @@ jobs:
         run: |
           set -euo pipefail
           for artefact in release/*; do
-            gpg --batch --yes --armor --detach-sign "$artefact"
+            gpg --batch --yes --armor --detach-sign "${artefact}"
           done
           ls -l release/
 
@@ -242,19 +412,21 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          prerelease_flag=""
-          if [[ "$TAG" == *-* ]]; then
-            prerelease_flag="--prerelease"
+          : "${TAG:?}" "${REPO:?}" "${FINGERPRINT:?}"
+          flags=()
+          if [[ "${TAG}" == *-* ]]; then
+            flags+=(--prerelease)
           fi
-          gh release create "$TAG" --repo "$REPO" --title "$TAG" \
-            --generate-notes --verify-tag $prerelease_flag release/*
+          gh release create "${TAG}" --repo "${REPO}" --title "${TAG}" \
+            --generate-notes --verify-tag "${flags[@]}" release/*
           # Restating the fingerprint here keeps it correct across key rotation.
           # It is a convenience, not the trust anchor: the key must be fetched
           # from a keyserver, never from the release it authenticates.
-          gh release view "$TAG" --repo "$REPO" --json body --jq .body > notes.md
+          gh release view "${TAG}" --repo "${REPO}" --json body --jq .body >notes.md
+          # shellcheck disable=SC2016 # The backticks are a Markdown code fence.
           printf '\n## Verifying this download\n\nEvery asset has a detached signature beside it.\n\n```\ngpg --keyserver hkps://keyserver.ubuntu.com --recv-keys %s\ngpg --verify hedwig-x64.exe.asc hedwig-x64.exe\n```\n' \
-            "$FINGERPRINT" >> notes.md
-          gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
+            "${FINGERPRINT}" >>notes.md
+          gh release edit "${TAG}" --repo "${REPO}" --notes-file notes.md
 
   winget:
     name: Submit to WinGet

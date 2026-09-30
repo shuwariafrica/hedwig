@@ -1,0 +1,12 @@
+root = true
+
+# shfmt reads its settings from here.
+[*.sh]
+indent_style = space
+indent_size = 2
+shell_variant = bash
+switch_case_indent = true
+
+[*.{ps1,psm1,psd1}]
+indent_style = space
+indent_size = 4

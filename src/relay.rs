@@ -192,7 +192,7 @@ mod tests {
         drop(end_a);
         let mut rest = Vec::new();
         end_b.read_to_end(&mut rest).unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         drop(end_b);
         spliced.join().unwrap();
     }
