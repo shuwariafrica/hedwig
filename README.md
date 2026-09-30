@@ -66,8 +66,18 @@ stanza that forwards to it, and a remote host that leaves the socket path alone.
 
 ### On the workstation
 
-In `~/.ssh/config`, add the forward to every host you sign on. The remote path
-contains your numeric uid on that host (`id -u` there):
+The forward ends at the socket the remote's own GnuPG connects to, and only the
+remote knows where that is. Ask it:
+
+```
+$ ssh devbox gpgconf --list-dirs agent-socket
+/run/user/1000/gnupg/S.gpg-agent
+```
+
+The answer carries the account's uid, and a host without `/run/user`, such as a
+GitHub Codespace, answers a path under `~/.gnupg` instead, so ask each host
+rather than reusing another's. In `~/.ssh/config`, forward that path to hedwig
+for every host you sign on:
 
 ```
 Host devbox
@@ -75,12 +85,18 @@ Host devbox
     RemoteForward /run/user/1000/gnupg/S.gpg-agent 127.0.0.1:47470
 ```
 
-For a Coder workspace the stanza attaches to the generated host pattern -
-`coder config-ssh` writes `coder.*`, so:
+OpenSSH does not create a missing parent directory for the forward, so the
+directory must exist on the remote before you connect. A fresh Codespace has no
+`~/.gnupg` until `gpgconf --create-socketdir` or a first `gpg` run creates it.
+
+For a Coder workspace the stanza attaches to the host pattern that
+`coder config-ssh` writes, `coder.*`. One stanza then serves every workspace, so
+it holds only while they all answer the same path; ask one of them with
+`ssh coder.<workspace> gpgconf --list-dirs agent-socket` and forward its answer:
 
 ```
 Host coder.*
-    RemoteForward /run/user/1000/gnupg/S.gpg-agent 127.0.0.1:47470
+    RemoteForward <agent-socket path> 127.0.0.1:47470
 ```
 
 Put the override *above* the `coder config-ssh` managed block; OpenSSH takes the
@@ -154,12 +170,14 @@ key management. That is deliberate; signing with an explicit key works.
 ### From a Linux workstation instead
 
 hedwig is not needed - gpg-agent already listens on a real Unix socket. The
-remote-host setup above is identical, and the client stanza differs only in the
-local endpoint, which `gpgconf --list-dirs agent-extra-socket` prints:
+remote-host setup above is identical, and the stanza differs only in its local
+end: in place of `127.0.0.1:47470`, the socket that
+`gpgconf --list-dirs agent-extra-socket` prints on the workstation. Each end
+comes from asking its own machine:
 
 ```
 Host devbox
-    RemoteForward /run/user/1000/gnupg/S.gpg-agent /run/user/1000/gnupg/S.gpg-agent.extra
+    RemoteForward <agent-socket on devbox> <agent-extra-socket on this workstation>
 ```
 
 Everything else is the same on both platforms, so a team can publish one runbook
@@ -212,7 +230,7 @@ forward only to hosts that warrant it.
 | symptom | cause and fix |
 |---|---|
 | remote: `can't connect to the agent` | Forward not up (reconnect ssh), or a local agent owns the socket path - apply step 2 above. |
-| remote: `Warning: remote port forwarding failed` | Stale socket and `StreamLocalBindUnlink` not set (step 1), or `/run/user/<uid>/gnupg` missing - run `gpgconf --create-socketdir` on the remote. |
+| remote: `Warning: remote port forwarding failed` | Stale socket and `StreamLocalBindUnlink` not set (step 1), or the directory of the path `gpgconf --list-dirs agent-socket` prints does not exist - run `gpgconf --create-socketdir` on the remote. |
 | remote: `signing failed: No secret key` | Public key not imported on the remote, or `user.signingkey` not set to your fingerprint. |
 | `status`: `relay ... unreachable` | Not running: `hedwig install`, or run `hedwig serve --verbose` in a terminal to watch it. |
 | `status`: `is not this user's relay` | Something else holds the port. Stop it, or move hedwig to another `--port`. |

@@ -1,0 +1,3 @@
+enable=all
+# Workflow run: blocks carry no shebang; the workflows run them under bash.
+shell=bash

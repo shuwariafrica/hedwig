@@ -1,7 +1,8 @@
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, HandleOrNull, OwnedHandle};
 
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP_STATE_ESTAB, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
     TCP_TABLE_OWNER_PID_CONNECTIONS,
@@ -173,14 +174,6 @@ fn convert_row(row: &MIB_TCPROW_OWNER_PID) -> TcpRow {
     }
 }
 
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
 struct ProcessToken {
     pid: u32,
     token: OwnedHandle,
@@ -188,19 +181,18 @@ struct ProcessToken {
 
 impl ProcessToken {
     fn open(pid: u32) -> Result<Self, PeerError> {
-        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
-        if process.is_null() {
-            return Err(PeerError::ProcessQuery(pid, last_error("OpenProcess")));
-        }
-        let process = OwnedHandle(process);
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+        // SAFETY: OpenProcess returns either a new handle the caller owns or null.
+        let process = OwnedHandle::try_from(unsafe { HandleOrNull::from_raw_handle(raw) })
+            .map_err(|_| PeerError::ProcessQuery(pid, last_error("OpenProcess")))?;
         let mut token: HANDLE = std::ptr::null_mut();
-        if unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &raw mut token) } == 0 {
+        if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &raw mut token) } == 0 {
             return Err(PeerError::ProcessQuery(pid, last_error("OpenProcessToken")));
         }
-        Ok(ProcessToken {
-            pid,
-            token: OwnedHandle(token),
-        })
+        // SAFETY: on success OpenProcessToken has written a new token handle
+        // that the caller owns and must close.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        Ok(ProcessToken { pid, token })
     }
 
     fn current_process() -> Result<Self, PeerError> {
@@ -222,9 +214,12 @@ impl ProcessToken {
                 last_error("OpenProcessToken(self)"),
             ));
         }
+        // SAFETY: on success OpenProcessToken has written a new token handle
+        // that the caller owns and must close.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
         Ok(ProcessToken {
             pid: std::process::id(),
-            token: OwnedHandle(token),
+            token,
         })
     }
 
@@ -234,7 +229,7 @@ impl ProcessToken {
         let mut size: u32 = 0;
         unsafe {
             GetTokenInformation(
-                self.token.0,
+                self.token.as_raw_handle(),
                 TokenUser,
                 std::ptr::null_mut(),
                 0,
@@ -244,7 +239,7 @@ impl ProcessToken {
         let mut buf = vec![0u64; (size as usize).div_ceil(8).max(1)];
         if unsafe {
             GetTokenInformation(
-                self.token.0,
+                self.token.as_raw_handle(),
                 TokenUser,
                 buf.as_mut_ptr().cast(),
                 size,
@@ -273,7 +268,7 @@ impl ProcessToken {
         let mut size: u32 = 0;
         if unsafe {
             GetTokenInformation(
-                self.token.0,
+                self.token.as_raw_handle(),
                 TokenIsAppContainer,
                 (&raw mut value).cast(),
                 len_of::<u32>(),
@@ -290,7 +285,7 @@ impl ProcessToken {
     }
 
     fn is_restricted(&self) -> bool {
-        unsafe { IsTokenRestricted(self.token.0) != 0 }
+        unsafe { IsTokenRestricted(self.token.as_raw_handle()) != 0 }
     }
 }
 
@@ -382,7 +377,7 @@ mod tests {
         let mut new_token: HANDLE = std::ptr::null_mut();
         let ok = unsafe {
             CreateRestrictedToken(
-                own.token.0,
+                own.token.as_raw_handle(),
                 0,
                 0,
                 std::ptr::null(),
@@ -394,13 +389,30 @@ mod tests {
             )
         };
         assert_ne!(ok, 0, "CreateRestrictedToken failed");
+        // SAFETY: on success CreateRestrictedToken has written a new token
+        // handle that the caller owns and must close.
         let restricted = ProcessToken {
             pid: 0,
-            token: OwnedHandle(new_token),
+            token: unsafe { OwnedHandle::from_raw_handle(new_token) },
         };
         assert!(restricted.same_user_as_current_process().unwrap());
         assert!(restricted.is_restricted());
         assert_eq!(admit(&restricted), Err(PeerError::RestrictedToken(0)));
+    }
+
+    /// PID 0 is the System Idle Process, which `OpenProcess` always refuses;
+    /// the error must carry the refusal's own OS error, not a later call's.
+    #[test]
+    fn unopenable_process_reports_the_open_process_error() {
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+        let error = ProcessToken::open(0)
+            .err()
+            .expect("OpenProcess(0) must fail");
+        let refusal = std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            error,
+            PeerError::ProcessQuery(0, format!("OpenProcess: {refusal}"))
+        );
     }
 
     #[test]

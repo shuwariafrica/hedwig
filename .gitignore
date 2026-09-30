@@ -4,6 +4,8 @@
 !.gitignore
 !.cargo/
 !.github/
+!.editorconfig
+!.shellcheckrc
 
 !README.md
 !CONTRIBUTING.md
