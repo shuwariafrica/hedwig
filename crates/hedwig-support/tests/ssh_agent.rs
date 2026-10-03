@@ -759,10 +759,13 @@ struct MachineKey {
 impl MachineKey {
     fn make(what: &str, kind: hedwig_model::capability::KeyKind) -> MachineKey {
         let name = hedwig_model::text::Name::try_from(
-            format!("s4k-support-{}-{what}", std::process::id()).as_str(),
+            format!("hedwig-test-support-{}-{what}", std::process::id()).as_str(),
         )
         .unwrap();
-        let made = hedwig_core::machine::make(&name, kind).expect("made in this TPM");
+        let made = match hedwig_core::machine::make(&name, kind) {
+            Err(Refusal::NoTpm) => panic!("needs a TPM that makes ECDSA P-256 and RSA 2048 keys"),
+            made => made.expect("made in this TPM"),
+        };
         MachineKey {
             name,
             key: made.key,
@@ -783,6 +786,7 @@ impl Drop for MachineKey {
 /// OpenSSH verifies what an ECDSA key and an RSA key signed. Refused, nothing
 /// is signed.
 #[test]
+#[ignore = "needs a TPM that makes ECDSA P-256 and RSA 2048 keys"]
 #[allow(
     clippy::too_many_lines,
     reason = "one scene, both kinds and both answers"
@@ -900,7 +904,7 @@ fn a_key_the_tpm_holds_is_offered_and_signs_a_commit_through_the_relay() {
     }
 }
 
-/// KN-1: each key `gpg` offers from a home carries the public half
+/// Each key `gpg` offers from a home carries the public half
 /// gpg-agent's own SSH socket lists it by - Ed25519, NIST P-256 and RSA
 /// alike - read with `READKEY --format=ssh`; an encryption subkey, which SSH
 /// has no form for, carries none. The agent's SSH list and the keyring name

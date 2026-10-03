@@ -529,6 +529,19 @@ mod tests {
         format!("hedwig-win-test-{}-{what}", std::process::id())
     }
 
+    /// This workstation's TPM, or the panic that says the test needs one.
+    fn platform(need: &str) -> Provider {
+        Provider::platform().unwrap_or_else(|error| panic!("{need}: {error}"))
+    }
+
+    /// A key made, or the panic that says the test needs a TPM that makes it.
+    fn made(provider: &Provider, name: &str, algorithm: Algorithm, need: &str) -> Key {
+        match provider.make(name, algorithm) {
+            Err(TpmError::Unavailable(code)) => panic!("{need}: {code:#x}"),
+            made => made.expect("made"),
+        }
+    }
+
     /// Deletes the run's key of this name when dropped, should a test stop
     /// before deleting it itself.
     struct Cleared(String);
@@ -570,8 +583,9 @@ mod tests {
     /// read for its public half, listed under its prefix, opened by name,
     /// signs a digest, and is gone once deleted.
     #[test]
+    #[ignore = "needs a TPM that makes ECDSA P-256 and P-384 and RSA 2048 keys"]
     fn a_key_is_made_read_listed_signed_and_deleted() {
-        let provider = Provider::platform().expect("this workstation's TPM");
+        let provider = platform("needs a TPM that makes ECDSA P-256 and P-384 and RSA 2048 keys");
         let prefix = named("kinds-");
         for (what, algorithm, padding, length) in [
             ("p256", Algorithm::EcdsaP256, Padding::None, 64),
@@ -585,7 +599,12 @@ mod tests {
         ] {
             let name = format!("{prefix}{what}");
             let _cleared = Cleared(name.clone());
-            let key = provider.make(&name, algorithm).expect("made");
+            let key = made(
+                &provider,
+                &name,
+                algorithm,
+                "needs a TPM that makes ECDSA P-256 and P-384 and RSA 2048 keys",
+            );
             assert!(!key.exportable().expect("its policy"));
             let public = key.public().expect("its public half");
             match (algorithm, &public) {
@@ -624,13 +643,17 @@ mod tests {
     /// A name is never made twice, and the first key stays as it was; a
     /// padding the key does not take fails rather than signing.
     #[test]
+    #[ignore = "needs a TPM that makes ECDSA P-256 keys"]
     fn a_name_is_never_overwritten_and_a_wrong_padding_signs_nothing() {
-        let provider = Provider::platform().expect("this workstation's TPM");
+        let provider = platform("needs a TPM that makes ECDSA P-256 keys");
         let name = named("twice");
         let _cleared = Cleared(name.clone());
-        let first = provider
-            .make(&name, Algorithm::EcdsaP256)
-            .expect("made once");
+        let first = made(
+            &provider,
+            &name,
+            Algorithm::EcdsaP256,
+            "needs a TPM that makes ECDSA P-256 keys",
+        );
         let public = first.public().expect("its half");
         assert_eq!(
             provider.make(&name, Algorithm::EcdsaP256).map(drop),
@@ -651,8 +674,9 @@ mod tests {
     /// What this TPM does not make is said as such; where another TPM makes
     /// it, it is made and deleted like any key.
     #[test]
+    #[ignore = "needs a TPM"]
     fn a_kind_the_tpm_does_not_make_is_unsupported() {
-        let provider = Provider::platform().expect("this workstation's TPM");
+        let provider = platform("needs a TPM");
         for (what, algorithm) in [
             ("p521", Algorithm::EcdsaP521),
             ("rsa4096", Algorithm::Rsa { bits: 4096 }),

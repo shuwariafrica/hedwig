@@ -344,7 +344,7 @@ fn a_key_is_found_unlent_then_deleted() {
 
 /// A name of this run's own beneath Hedwig's prefix.
 fn run_name(what: &str) -> Name {
-    name(&format!("s4k-test-{}-{what}", std::process::id()))
+    name(&format!("hedwig-test-{}-{what}", std::process::id()))
 }
 
 /// Deletes the run's key by name when dropped, should a test stop first.
@@ -397,14 +397,21 @@ fn signed_as(answer: &[u8]) -> String {
 /// twice and a kind this TPM does not make are refused; a key is deleted by
 /// its public half alone.
 #[test]
+#[ignore = "needs a TPM that makes ECDSA P-256 and P-384 and RSA 2048 keys"]
 fn the_core_s_signer_makes_lists_signs_and_deletes_keys_in_the_tpm() {
     let p256 = run_name("p256");
     let p384 = run_name("p384");
     let rsa = run_name("rsa");
     let _cleared = [&p256, &p384, &rsa].map(|name| Cleared(name.clone()));
-    let made_p256 = machine::make(&p256, KeyKind::EcdsaP256).expect("made");
-    let made_p384 = machine::make(&p384, KeyKind::EcdsaP384).expect("made");
-    let made_rsa = machine::make(&rsa, KeyKind::Rsa2048).expect("made");
+    let made = |name: &Name, kind: KeyKind| match machine::make(name, kind) {
+        Err(Refusal::NoTpm) => {
+            panic!("needs a TPM that makes ECDSA P-256 and P-384 and RSA 2048 keys")
+        }
+        made => made.expect("made"),
+    };
+    let made_p256 = made(&p256, KeyKind::EcdsaP256);
+    let made_p384 = made(&p384, KeyKind::EcdsaP384);
+    let made_rsa = made(&rsa, KeyKind::Rsa2048);
     assert_eq!(made_p256.key.kind(), "ecdsa-sha2-nistp256");
     assert_eq!(made_p384.key.kind(), "ecdsa-sha2-nistp384");
     assert_eq!(made_rsa.key.kind(), "ssh-rsa");

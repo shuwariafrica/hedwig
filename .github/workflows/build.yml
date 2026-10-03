@@ -93,7 +93,7 @@ jobs:
 
       # Of the tests ignored for what they need, a hosted runner provides only
       # an elevated session; the rest need an SSH server on loopback, a
-      # registered GnuPG for Windows or a COM port.
+      # registered GnuPG for Windows, a COM port or a TPM.
       - name: Test In An Elevated Session
         run: |
           Set-StrictMode -Version Latest

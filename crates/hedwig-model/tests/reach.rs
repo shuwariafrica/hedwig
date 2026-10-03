@@ -108,7 +108,7 @@ fn each_form_says_who_on_the_remote_reaches_it_under_each_setup() {
     assert!(!gpg.open_everywhere(Setup::Inspect));
 }
 
-/// ADB-2: from write to inspect, `adb`'s forward leaves the socket only the
+/// From write to inspect, `adb`'s forward leaves the socket only the
 /// remote user opens for port 5037, which every user there reaches.
 #[test]
 fn taking_consent_back_lets_more_through_where_the_forward_moves_to_a_port() {

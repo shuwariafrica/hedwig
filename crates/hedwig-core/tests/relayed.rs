@@ -2821,7 +2821,7 @@ fn a_client_that_listed_the_ports_is_told_when_windows_changes_them() {
     assert!(!relisted(&scene.step(Input::PortsMoved)));
 }
 
-/// KN-1: a signature through gpg-agent's SSH socket naming a key the keyring
+/// A signature through gpg-agent's SSH socket naming a key the keyring
 /// the core holds does not account for waits for the source to be read
 /// again, its payload kept; read, it is decided as the key the keyring ties
 /// it to - here by a statement naming that key's `OpenPGP` fingerprint - and
