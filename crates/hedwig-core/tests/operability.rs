@@ -277,6 +277,15 @@ fn read_back(link: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// A path in full, as the shell reads a shortcut's target back whatever was
+/// written: a runner's temporary folder can be an 8.3 short name.
+fn long(path: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+    let full = fs::canonicalize(path).unwrap();
+    full.to_str()
+        .and_then(|full| full.strip_prefix(r"\\?\"))
+        .map_or_else(|| full.clone(), std::path::PathBuf::from)
+}
+
 /// The application identity the shell reads from a shortcut, through its own
 /// property system, run apart from Hedwig.
 fn identity_of(link: &std::path::Path) -> String {
@@ -312,14 +321,12 @@ fn the_start_entry_opens_the_icons_program_of_its_own_hedwig_under_its_identity(
     fs::write(&icon, b"").unwrap();
 
     hedwig_win::shortcut::make(&link, &icon, &names.shortcut_arguments(), &names.entry()).unwrap();
+    let [target, arguments, folder] = <[String; 3]>::try_from(read_back(&link)).unwrap();
     assert_eq!(
-        read_back(&link),
-        [
-            icon.display().to_string(),
-            names.shortcut_arguments(),
-            program.path().display().to_string(),
-        ]
+        [long(target), long(folder)],
+        [long(&icon), long(program.path())]
     );
+    assert_eq!(arguments, names.shortcut_arguments());
     assert_eq!(identity_of(&link), names.entry());
     assert!(names.entry().starts_with("ShuwariAfrica.Hedwig."));
 

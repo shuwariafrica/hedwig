@@ -88,7 +88,13 @@ impl Remote {
         let folder = Folder::new(purpose);
         let mut drawn = [0u8; 4];
         hedwig_win::random::fill(&mut drawn).unwrap();
-        let home = std::env::temp_dir().join(format!("hs{:08x}", u32::from_le_bytes(drawn)));
+        // Under the known folder, which Windows answers in full, not where
+        // `TEMP` points: a runner's is an 8.3 short name, and the survey
+        // refuses its `~` in a socket's path.
+        let home = hedwig_win::folder::local()
+            .unwrap()
+            .join("Temp")
+            .join(format!("hs{:08x}", u32::from_le_bytes(drawn)));
         fs::create_dir_all(&home).unwrap();
         Remote {
             sh,
