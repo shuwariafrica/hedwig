@@ -22,7 +22,7 @@ permissions:
 jobs:
   analyse:
     name: Analyse
-    # build-mode none still resolves types, and the crate is unconditionally
+    # build-mode none still resolves types, and the crates are unconditionally
     # Windows: on a Linux runner std::os::windows and windows-sys do not resolve
     # and most of the code goes unanalysed.
     runs-on: windows-2025

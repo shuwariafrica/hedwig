@@ -1,0 +1,19 @@
+[package]
+name = "hedwig-client"
+description = "Finds the Hedwig a person runs, speaks to its core over the control pipe, and installs, starts, stops and removes it"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+
+[dependencies]
+hedwig-model.workspace = true
+hedwig-win.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
