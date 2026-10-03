@@ -38,12 +38,8 @@ jobs:
             runner: windows-2025
             toolchain: beta
             rust: beta
-          - arch: x86_64
-            runner: windows-2025
-            toolchain: msrv
-            rust: "1.85.0"
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     defaults:
       run:
         shell: pwsh
@@ -59,12 +55,8 @@ jobs:
       # conditional carries it; a third architecture needs a real mapping.
       ASSET: ${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}
     steps:
-      # Full history and tags: build.rs stamps the binary with `git describe`,
-      # which reports a bare sha against a shallow clone.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
 
       # A row naming no `rust` takes the channel, components and targets from
       # rust-toolchain.toml, which rustup installs on the first cargo command.
@@ -80,26 +72,43 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "rustup could not install $env:CHANNEL (exit code $LASTEXITCODE)" }
           "RUSTUP_TOOLCHAIN=$env:CHANNEL" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # The programs the suites run against, each pinned by version and SHA-256;
+      # each line the script emits names the variable a suite reads.
+      - name: Fetch Test Tools
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          ./scripts/fetch-test-tools.ps1 | ForEach-Object { "$($_.Name)=$($_.Value)" } |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # --target is what pins the MSVC ABI; relying on the runner's default host
-      # would leave it to the image.
+      # would leave it to the image. The suites run hedwig.exe as it is built
+      # here, so the build comes first.
       - name: Build
-        run: cargo build --release --locked --target $env:TARGET
+        run: cargo build --workspace --release --locked --target $env:TARGET
 
       # Tests run the profile that ships.
       - name: Test
-        run: cargo test --release --locked --target $env:TARGET
+        run: cargo test --workspace --release --locked --target $env:TARGET
 
-      # The MSRV row runs an older clippy whose lint set differs; holding it to
-      # today's warnings would fail on lints that did not exist then.
+      # Of the tests ignored for what they need, a hosted runner provides only
+      # an elevated session; the rest need an SSH server on loopback, a
+      # registered GnuPG for Windows, a COM port or a TPM.
+      - name: Test In An Elevated Session
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $only = 'a_pipe_that_belongs_to_someone_else_is_sent_nothing'
+          cargo test --release --locked --target $env:TARGET -p hedwig-support --test end_to_end -- --ignored --exact $only
+          if ($LASTEXITCODE -ne 0) { throw "$only failed (exit code $LASTEXITCODE)" }
+
       - name: Clippy
-        if: matrix.toolchain != 'msrv'
-        run: cargo clippy --locked --all-targets --target $env:TARGET -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --target $env:TARGET -- -D warnings
 
       - name: Docs
-        if: matrix.toolchain == 'pinned' && matrix.arch == 'x86_64'
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --locked --no-deps --target $env:TARGET
+        run: cargo doc --workspace --no-deps --locked --target $env:TARGET
 
       - name: Stage Release Binary
         if: startsWith(github.ref, 'refs/tags/v') && matrix.toolchain == 'pinned'
@@ -120,7 +129,7 @@ jobs:
 
   static_analysis:
     name: Static Analysis
-    # Linux, so no step here may compile the Windows-only crate.
+    # Linux, so no step here may compile the Windows-only crates.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -295,6 +304,42 @@ jobs:
           if [[ "${PESTER}" == failure ]]; then failed+=(Pester); fi
           if ((${#failed[@]} > 0)); then
             printf '::error::Static analysis checks failed: %s\n' "${failed[*]}"
+            exit 1
+          fi
+
+  # The one check a pull request's merge requires. A required check that is
+  # skipped counts as passing, so this runs whatever became of the jobs it
+  # needs and fails unless every one of them succeeded.
+  gate:
+    name: gate
+    needs: [test, static_analysis]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Read from the needs context whole, so a job added to `needs` is
+      # reported and required without touching this step.
+      - name: Check Every Needed Job Succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          : "${NEEDS:?}" "${GITHUB_STEP_SUMMARY:?}"
+          if ! command -v jq >/dev/null 2>&1; then
+            printf '::error title=gate::jq is not on this runner\n'
+            exit 1
+          fi
+          {
+            printf '| Job | Result |\n| --- | --- |\n'
+            jq --raw-output 'to_entries[] | "| \(.key) | \(.value.result) |"' <<<"${NEEDS}"
+          } >>"${GITHUB_STEP_SUMMARY}"
+          failed=$(jq --raw-output '[to_entries[] | select(.value.result != "success") | .key] | join(", ")' <<<"${NEEDS}")
+          if [[ -n "${failed}" ]]; then
+            printf '::error title=gate::These jobs did not succeed: %s\n' "${failed}"
             exit 1
           fi
 

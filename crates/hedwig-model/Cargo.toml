@@ -1,0 +1,22 @@
+[package]
+name = "hedwig-model"
+description = "Hedwig's model: what a workstation lends and to whom, the gate that decides every request, the written form and the control protocol, with no call to Windows"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+
+# Wipes the one secret the protocol carries, a typed answer, when it is dropped.
+[dependencies]
+zeroize.workspace = true
+
+# The reference the parser is compared against; it never reaches a binary.
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
