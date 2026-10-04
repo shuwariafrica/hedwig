@@ -778,9 +778,11 @@ fn chrome_forward() -> Forward {
 
 /// A forward on a lent device is placed on the remote at the port it
 /// named; then the server is asked for a listener of its own choosing to the
-/// device, and the remote told the server took it.
+/// device. The remote is answered only once the core has recorded the forward
+/// and given its endpoint the server's listener, as the server answers only
+/// once its listener is installed.
 #[test]
-fn a_forward_is_placed_on_the_remote_then_the_server_listens_for_it() {
+fn a_forward_is_placed_on_the_remote_and_answered_once_the_server_and_the_core_listen() {
     let mut talk = opened(lent(&[RECORDED]));
     let request = framed(
         b"host-serial:127.0.0.1:15555:forward:tcp:9222;localabstract:chrome_devtools_remote",
@@ -804,15 +806,19 @@ fn a_forward_is_placed_on_the_remote_then_the_server_listens_for_it() {
         .unwrap();
     assert_eq!(
         talk.server_closed(&recorded_view()).unwrap(),
-        vec![
-            Out::ToClient(b"OKAYOKAY".to_vec()),
-            Out::Forwarded {
-                forward: chrome_forward(),
-                replaced: None,
-                id: 1,
-            }
-        ]
+        vec![Out::Forwarded {
+            forward: chrome_forward(),
+            replaced: None,
+            id: 1,
+        }]
     );
+    assert!(talk.open(), "the remote waits for its answer");
+    assert_eq!(
+        talk.listened(Ok(())),
+        vec![Out::ToClient(b"OKAYOKAY".to_vec())]
+    );
+    assert!(!talk.open());
+    assert_eq!(talk.listened(Ok(())), Vec::new(), "answered once");
 }
 
 /// `tcp:0` is answered with the port bound on the remote, never the
@@ -826,18 +832,20 @@ fn a_forward_from_any_port_is_answered_with_the_port_bound_on_the_remote() {
     talk.from_server(b"OKAYOKAY000558766", &recorded_view())
         .unwrap();
     let outs = talk.server_closed(&recorded_view()).unwrap();
+    assert!(matches!(
+        &outs[..],
+        [Out::Forwarded { forward, .. }] if forward.port == port(44863) && forward.server == port(58766)
+    ));
     let mut answered = b"OKAYOKAY".to_vec();
     answered.extend(framed(b"44863"));
-    assert_eq!(outs[0], Out::ToClient(answered));
-    assert!(matches!(
-        &outs[1],
-        Out::Forwarded { forward, .. } if forward.port == port(44863) && forward.server == port(58766)
-    ));
+    assert_eq!(talk.listened(Ok(())), vec![Out::ToClient(answered)]);
 }
 
 /// Where the remote's side cannot be bound the remote reads ADB's own words
 /// for it; where the server refuses after the remote's side was placed, the
-/// remote reads the server's refusal and the carrier is ended.
+/// remote reads the server's refusal and the carrier is ended; and where the
+/// core cannot give the endpoint the server's listener, the remote reads
+/// ADB's words for a listener not installed and the carrier is ended.
 #[test]
 fn a_forward_that_cannot_be_placed_or_is_refused_is_told_in_adbs_words() {
     let mut talk = opened(every());
@@ -864,6 +872,23 @@ fn a_forward_that_cannot_be_placed_or_is_refused_is_told_in_adbs_words() {
             Out::Unplaced(port(9222))
         ]
     );
+    let mut talk = opened(every());
+    talk.from_client(&framed(b"host:forward:tcp:9222;tcp:9222"), &recorded_view())
+        .unwrap();
+    talk.placed(Ok(port(9222)));
+    talk.from_server(b"OKAYOKAY000558765", &recorded_view())
+        .unwrap();
+    talk.server_closed(&recorded_view()).unwrap();
+    assert_eq!(
+        talk.listened(Err("the workstation's endpoint for it has ended".to_owned())),
+        vec![
+            Out::ToClient(fail(
+                "cannot bind listener: the workstation's endpoint for it has ended"
+            )),
+            Out::Unplaced(port(9222))
+        ]
+    );
+    assert!(!talk.open());
 }
 
 /// A forward at a port the remote holds one at gives the server's own
@@ -888,17 +913,18 @@ fn a_forward_at_a_port_held_rebinds_and_a_malformed_one_is_refused() {
     let outs = talk.server_closed(&recorded_view()).unwrap();
     assert_eq!(
         outs,
-        vec![
-            Out::ToClient(b"OKAYOKAY".to_vec()),
-            Out::Forwarded {
-                forward: Forward {
-                    socket: DeviceSocket::try_from("tcp:9000").unwrap(),
-                    ..chrome_forward()
-                },
-                replaced: Some(chrome_forward()),
-                id: 1,
-            }
-        ]
+        vec![Out::Forwarded {
+            forward: Forward {
+                socket: DeviceSocket::try_from("tcp:9000").unwrap(),
+                ..chrome_forward()
+            },
+            replaced: Some(chrome_forward()),
+            id: 1,
+        }]
+    );
+    assert_eq!(
+        talk.listened(Ok(())),
+        vec![Out::ToClient(b"OKAYOKAY".to_vec())]
     );
     let mut talk = Conversation::opened(carried, every());
     assert_eq!(

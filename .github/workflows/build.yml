@@ -89,7 +89,7 @@ jobs:
 
       # Tests run the profile that ships.
       - name: Test
-        run: cargo test --workspace --release --locked --target $env:TARGET
+        run: cargo test --workspace --release --locked --target $env:TARGET --no-fail-fast
 
       # Of the tests ignored for what they need, a hosted runner provides only
       # an elevated session; the rest need an SSH server on loopback, a

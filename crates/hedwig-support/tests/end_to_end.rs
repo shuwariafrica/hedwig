@@ -466,9 +466,8 @@ fn a_client_at_another_integrity_level_is_served_and_recorded_as_it_is() {
 /// Who is a client is decided by the pipe alone: its access list names the
 /// person's account and its label admits medium integrity and above. The
 /// person's own process below medium is refused, and so is one under a token
-/// restricted to less than their account; one restricted to a set that
-/// includes their account is the person, as it is for their own files. The
-/// core adds no check of its own and refuses nobody it is shown.
+/// restricted to less than their account. The core adds no check of its own
+/// and refuses nobody it is shown.
 #[test]
 fn the_pipe_admits_the_person_and_nothing_less() {
     let folder = Folder::new("admits");
@@ -496,24 +495,51 @@ fn the_pipe_admits_the_person_and_nothing_less() {
     assert_eq!(attached(), 1);
     assert_eq!(met_by(Lowered::at(Level::Low, &line).unwrap()), met::DENIED);
 
-    // Restricted code, everyone and users - and then the person as well.
-    let me = Token::own().unwrap().user().unwrap().to_text().unwrap();
+    // Restricted code, everyone and users.
     let bare = ["S-1-5-12", "S-1-1-0", "S-1-5-32-545"];
-    let with_me = [me.as_str(), "S-1-5-12", "S-1-1-0", "S-1-5-32-545"];
-    let greeted = |restricting: &[&str]| {
-        as_restricted(restricting, || {
-            Session::open(&pipe).map(|mut session| session.greet(ClientKind::Terminal))
-        })
-        .unwrap()
-    };
-    assert!(matches!(greeted(&bare), Err(OpenError::Denied)));
+    let greeted = as_restricted(&bare, || {
+        Session::open(&pipe).map(|mut session| session.greet(ClientKind::Terminal))
+    })
+    .unwrap();
+    assert!(matches!(greeted, Err(OpenError::Denied)));
     assert_eq!(attached(), 1, "neither reached the core");
-    let you = greeted(&with_me).unwrap().unwrap().unwrap();
+    stopped(folder.path());
+}
+
+/// A token restricted to a set that keeps the person's account is the
+/// person, as it is for their own files. Only at medium integrity: an
+/// elevated administrator's own process and token are open to Administrators
+/// and SYSTEM, not to the account, so a client restricted to it cannot read
+/// its own token.
+#[test]
+#[ignore = "needs a session at medium integrity"]
+fn a_token_restricted_to_a_set_that_keeps_the_persons_account_is_the_person() {
+    assert_eq!(
+        own_origin().integrity,
+        Integrity::Medium,
+        "needs a session at medium integrity"
+    );
+    let folder = Folder::new("restricted");
+    assert_eq!(command_line(folder.path(), "start").0, 0);
+    let (pipe, _, _) = serving(&look(folder.path()).unwrap()).unwrap();
+    let me = Token::own().unwrap().user().unwrap().to_text().unwrap();
+    let with_me = [me.as_str(), "S-1-5-12", "S-1-1-0", "S-1-5-32-545"];
+    let you = as_restricted(&with_me, || {
+        Session::open(&pipe).map(|mut session| session.greet(ClientKind::Terminal))
+    })
+    .unwrap()
+    .unwrap()
+    .unwrap()
+    .unwrap();
     assert_eq!(
         (you.process, you.integrity),
-        (std::process::id(), own_origin().integrity)
+        (std::process::id(), Integrity::Medium)
     );
-    assert_eq!(attached(), 2);
+    let attached = trail(folder.path())
+        .iter()
+        .filter(|entry| matches!(entry.event, Event::Attached { .. }))
+        .count();
+    assert_eq!(attached, 1);
     stopped(folder.path());
 }
 

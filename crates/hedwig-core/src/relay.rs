@@ -538,6 +538,9 @@ pub struct Settle {
     /// A held forward's port on the remote, or the words for why none was
     /// bound there.
     placed: Mutex<Option<Result<Port, String>>>,
+    /// Whether the forward the server took was recorded and its endpoint
+    /// given the server's listener, or the words for why it was not.
+    listening: Mutex<Option<Result<(), String>>>,
     /// What the connection's grant lends now.
     lending: Mutex<Option<crate::adb::Lending>>,
     /// The carrier a served callback goes on through: the channel whose job
@@ -556,6 +559,7 @@ impl Settle {
             word: Mutex::new(None),
             endpoint: Mutex::new(None),
             placed: Mutex::new(None),
+            listening: Mutex::new(None),
             lending: Mutex::new(None),
             carrier: Mutex::new(None),
             interaction: Mutex::new(None),
@@ -631,6 +635,25 @@ impl Settle {
 
     pub(crate) fn take_placed(&self) -> Option<Result<Port, String>> {
         self.placed.lock().ok().and_then(|mut placed| placed.take())
+    }
+
+    /// Tells a forward the server took that the core recorded it and its
+    /// endpoint goes on to the server's listener, or the words for why it
+    /// does not. Never waits.
+    pub fn listen(&self, listening: Result<(), String>) {
+        if let Ok(mut held) = self.listening.lock() {
+            *held = Some(listening);
+        }
+        match self.wake.try_send(Event::Settled) {
+            Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    pub(crate) fn take_listening(&self) -> Option<Result<(), String>> {
+        self.listening
+            .lock()
+            .ok()
+            .and_then(|mut listening| listening.take())
     }
 
     /// What the connection's grant lends changed. Never waits.

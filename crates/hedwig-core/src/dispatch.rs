@@ -421,8 +421,10 @@ pub enum Effect {
         server: Service,
         carrier: Carrier,
     },
-    /// The server's listener a forward goes on to.
+    /// The server's listener a forward goes on to; the relayed connection
+    /// that asked for it is answered once its endpoint has it.
     Listen {
+        knock: Knock,
         forwarding: crate::adb::Forwarding,
         listener: Port,
     },
@@ -2901,7 +2903,8 @@ impl Core {
     }
 
     /// The server took a forward: recorded, with the one it replaced
-    /// dropped, and its endpoint given the server's listener.
+    /// dropped, and its endpoint given the server's listener once the record
+    /// is written, which is when the remote is answered.
     #[allow(
         clippy::too_many_arguments,
         reason = "what the relay told, and where it came from"
@@ -2957,6 +2960,7 @@ impl Core {
         };
         self.record(step, now, carried);
         step.effects.push(Effect::Listen {
+            knock,
             forwarding: crate::adb::Forwarding {
                 remote,
                 capability,

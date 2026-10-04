@@ -874,9 +874,10 @@ impl Desk {
                 );
             }
             Effect::Listen {
+                knock,
                 forwarding,
                 listener,
-            } => self.forwards.listen(&forwarding, Some(listener)),
+            } => self.listen(knock, &forwarding, listener),
             Effect::Unplace {
                 connection,
                 forwarding,
@@ -893,6 +894,19 @@ impl Desk {
                 thread::spawn(move || crate::adb::unlisten(&server, id, listener));
             }
             _ => {}
+        }
+    }
+
+    /// Gives a forward's endpoint the server's listener, then answers the
+    /// relayed connection that asked for it.
+    fn listen(&self, knock: Knock, forwarding: &Forwarding, listener: Port) {
+        let listening = if self.forwards.listen(forwarding, Some(listener)) {
+            Ok(())
+        } else {
+            Err("the workstation's endpoint for it has ended".to_owned())
+        };
+        if let Some(relay) = self.relays.get(&knock) {
+            relay.listen(listening);
         }
     }
 

@@ -183,7 +183,8 @@ pub enum Out {
         replaced: Option<Forward>,
         id: u64,
     },
-    /// A forward placed on the remote that the server refused: its carrier
+    /// A forward placed on the remote that the server refused, or whose
+    /// endpoint the core could not give the server's listener: its carrier
     /// is ended.
     Unplaced(Port),
     /// The forward at this port on the remote is removed.
@@ -312,6 +313,12 @@ enum Turn {
         replaced: Option<Forward>,
         zero: bool,
         id: u64,
+    },
+    /// The server took the forward at `port` on the remote; `answer` waits
+    /// for the core to record it and give its endpoint the server's listener.
+    Listening {
+        answer: Vec<u8>,
+        port: Port,
     },
     /// A removal is with the server; its whole answer is read.
     Unforwarding(Port),
@@ -1664,7 +1671,7 @@ impl Conversation {
                 replaced,
                 zero,
                 id,
-            } => Self::forwarded(&answer, forward, replaced, zero, id),
+            } => self.forwarded(&answer, forward, replaced, zero, id),
             Turn::Unforwarding(port) => {
                 // Whatever the server says, its listener is gone: removed now,
                 // or with its device.
@@ -1694,9 +1701,13 @@ impl Conversation {
     }
 
     /// The server's answer to a forward: `OKAY` twice, and the port it bound
-    /// where it chose one. The remote is told the port bound on its own
-    /// loopback where it asked for any.
+    /// where it chose one. Taken, the forward is the core's to record and
+    /// listen for, and the remote's answer - the port bound on its own
+    /// loopback where it asked for any - waits for [`Conversation::listened`]:
+    /// the server's own answer follows its listener (`adb.cpp`,
+    /// `install_listener`), and so does the relay's.
     fn forwarded(
+        &mut self,
         answer: &[u8],
         mut forward: Forward,
         replaced: Option<Forward>,
@@ -1726,18 +1737,38 @@ impl Conversation {
             };
             forward.server = bound;
         }
-        let mut answered = b"OKAYOKAY".to_vec();
+        let mut answer = b"OKAYOKAY".to_vec();
         if zero {
-            answered.extend(framed(forward.port.to_string().as_bytes()));
+            answer.extend(framed(forward.port.to_string().as_bytes()));
         }
-        vec![
-            Out::ToClient(answered),
-            Out::Forwarded {
-                forward,
-                replaced,
-                id,
-            },
-        ]
+        self.turn = Turn::Listening {
+            answer,
+            port: forward.port,
+        };
+        vec![Out::Forwarded {
+            forward,
+            replaced,
+            id,
+        }]
+    }
+
+    /// The core recorded the forward the server took and gave its endpoint
+    /// the server's listener, or could not, in these words. Only now is the
+    /// remote answered; where the endpoint has no listener, the remote reads
+    /// ADB's own words for a listener not installed and the carrier is ended.
+    pub fn listened(&mut self, listening: Result<(), String>) -> Vec<Out> {
+        let Turn::Listening { answer, port } = &self.turn else {
+            return Vec::new();
+        };
+        let (answer, port) = (answer.clone(), *port);
+        self.turn = Turn::Over;
+        match listening {
+            Ok(()) => vec![Out::ToClient(answer)],
+            Err(words) => vec![
+                Out::ToClient(fail(&format!("cannot bind listener: {words}"))),
+                Out::Unplaced(port),
+            ],
+        }
     }
 
     /// The server's forwards: those of this remote's, each named by its
@@ -2437,6 +2468,9 @@ fn settled(talk: &mut Conversation, settle: &Settle, watch: &Watch) -> Option<Ve
     if let Some(placed) = settle.take_placed() {
         outs.extend(talk.placed(placed));
     }
+    if let Some(listening) = settle.take_listening() {
+        outs.extend(talk.listened(listening));
+    }
     Some(outs)
 }
 
@@ -2686,13 +2720,17 @@ impl Forwards {
     }
 
     /// The server's listener for `forwarding` is at `listener`; `None` where
-    /// it has none any more.
-    pub fn listen(&self, forwarding: &Forwarding, listener: Option<Port>) {
-        if let Some(found) = self.found(forwarding)
-            && let Ok(mut held) = found.listener.lock()
-        {
-            *held = listener;
-        }
+    /// it has none any more. Whether `forwarding` still has an endpoint to
+    /// take it.
+    pub fn listen(&self, forwarding: &Forwarding, listener: Option<Port>) -> bool {
+        let Some(found) = self.found(forwarding) else {
+            return false;
+        };
+        let Ok(mut held) = found.listener.lock() else {
+            return false;
+        };
+        *held = listener;
+        true
     }
 
     /// Ends `forwarding`'s endpoint, and gives the port its carrier was
