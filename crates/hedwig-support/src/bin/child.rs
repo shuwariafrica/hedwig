@@ -731,7 +731,13 @@ fn shell(folder: &Path) -> ExitCode {
     let status = Command::new(r"C:\Program Files\Git\usr\bin\sh.exe")
         .arg("-s")
         .env_clear()
-        .env("PATH", "/usr/bin:/mingw64/bin:/c/Windows/System32")
+        .env(
+            "PATH",
+            format!(
+                "/usr/bin:{}:/c/Windows/System32",
+                hedwig_support::git_tools()
+            ),
+        )
         .env("HOME", msys(&home))
         .env("SHELL", "/usr/bin/bash")
         .env("SYSTEMROOT", r"C:\Windows")

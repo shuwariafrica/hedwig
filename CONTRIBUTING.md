@@ -44,8 +44,10 @@ wrong ABI. Build before testing: the suites run the `hedwig.exe` the build leave
 The suites need no privileges and leave nothing of yours touched: every GnuPG home they make has
 no card reader, every ADB server they start listens on a port of its own with USB off, and every
 `Run` value they write is named for the run and taken back. A test marked ignored needs something
-a hosted runner lacks - an SSH server on loopback, a registered GnuPG for Windows, a COM port, a
-TPM, an elevated session - and its marking says which; run it by name where you have that:
+not every machine has, and its marking says which: an SSH server on loopback, a registered GnuPG
+for Windows, a COM port, a TPM or a session at medium integrity, which a hosted runner lacks; or an
+elevated session, or a listener on every address that Windows Firewall does not ask you about,
+which CI's runners give and run by name. Run one by name where you have what it needs:
 
 ```powershell
 cargo test --release --locked --target x86_64-pc-windows-msvc -p hedwig-support --test prompts -- --ignored

@@ -33,7 +33,7 @@ use hedwig_model::capability::Query;
 use hedwig_model::setting::Keepalive;
 use hedwig_model::text::{Fingerprint, Mark, Name, Port, RemotePath, Template, Variable};
 use hedwig_model::trail::{Asking, Binding, Finding, Write};
-use hedwig_support::{Folder, SCDAEMON_LOG, readerless};
+use hedwig_support::{Folder, SCDAEMON_LOG, git_tools, readerless};
 
 const NONCE: &str = "0b7e2c4a91d35f6e8a7b0c1d2e3f4a5b";
 
@@ -98,7 +98,7 @@ impl Remote {
         fs::create_dir_all(&home).unwrap();
         Remote {
             sh,
-            path: "/usr/bin:/mingw64/bin:/c/Windows/System32".to_owned(),
+            path: format!("/usr/bin:{}:/c/Windows/System32", git_tools()),
             shell: "/usr/bin/fish".to_owned(),
             home,
             folder,
@@ -414,7 +414,7 @@ fn an_openers_variables_name_the_remotes_own_curl_at_the_socket() {
         ..Plan::default()
     };
     remote.shell = "/usr/bin/bash".to_owned();
-    remote.path = "/usr/bin:/mingw64/bin".to_owned();
+    remote.path = format!("/usr/bin:{}", git_tools());
     let report = remote.survey(&plan);
     let browser = report.answers.get(&name("browser")).unwrap();
     assert_eq!(browser.absent, None, "Git for Windows' own curl");
@@ -1676,7 +1676,7 @@ fn gits_helper_line_goes_after_the_persons_and_is_taken_back_to_the_byte() {
     let sh = posix_shell();
     let mut remote = Remote::new(sh, "survey-helper");
     remote.shell = "/usr/bin/bash".to_owned();
-    remote.path = "/usr/bin:/mingw64/bin".to_owned();
+    remote.path = format!("/usr/bin:{}", git_tools());
     let theirs = "[user]\n\tname = Dev\n[credential]\n\thelper = store\n";
     let config = remote.home.join(".gitconfig");
     fs::write(&config, theirs).unwrap();
@@ -1746,7 +1746,7 @@ fn a_hooks_notify_variable_posts_its_words_through_the_remotes_curl() {
     let sh = posix_shell();
     let mut remote = Remote::new(sh, "survey-notifier");
     remote.shell = "/usr/bin/bash".to_owned();
-    remote.path = "/usr/bin:/mingw64/bin".to_owned();
+    remote.path = format!("/usr/bin:{}", git_tools());
     let variable = Variable::try_from("HEDWIG_NOTIFY").unwrap();
     let plan = Plan {
         asks: vec![Asked {

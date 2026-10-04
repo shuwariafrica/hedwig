@@ -91,16 +91,30 @@ jobs:
       - name: Test
         run: cargo test --workspace --release --locked --target $env:TARGET --no-fail-fast
 
-      # Of the tests ignored for what they need, a hosted runner provides only
-      # an elevated session; the rest need an SSH server on loopback, a
-      # registered GnuPG for Windows, a COM port or a TPM.
-      - name: Test In An Elevated Session
+      # Of the tests ignored for what they need, a hosted runner provides an
+      # elevated session and a listener on every address with no firewall
+      # prompt; the rest need an SSH server on loopback, a registered GnuPG for
+      # Windows, a COM port, a TPM or a session at medium integrity.
+      - name: Test What A Hosted Runner Provides
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          $only = 'a_pipe_that_belongs_to_someone_else_is_sent_nothing'
-          cargo test --release --locked --target $env:TARGET -p hedwig-support --test end_to_end -- --ignored --exact $only
-          if ($LASTEXITCODE -ne 0) { throw "$only failed (exit code $LASTEXITCODE)" }
+          $provided = @(
+              [pscustomobject]@{
+                  Package = 'hedwig-support'
+                  Suite   = 'end_to_end'
+                  Test    = 'a_pipe_that_belongs_to_someone_else_is_sent_nothing'
+              }
+              [pscustomobject]@{
+                  Package = 'hedwig-win'
+                  Suite   = 'endpoint'
+                  Test    = 'no_other_socket_takes_what_is_sent_to_the_endpoint'
+              }
+          )
+          foreach ($one in $provided) {
+              cargo test --release --locked --target $env:TARGET -p $one.Package --test $one.Suite -- --ignored --exact $one.Test
+              if ($LASTEXITCODE -ne 0) { throw "$($one.Test) failed (exit code $LASTEXITCODE)" }
+          }
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --target $env:TARGET -- -D warnings

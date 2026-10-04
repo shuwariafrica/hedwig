@@ -152,6 +152,18 @@ pub fn readerless(home: &Path) -> io::Result<()> {
 /// Where the scdaemon of a [`readerless`] home logs.
 pub const SCDAEMON_LOG: &str = "scdaemon.log";
 
+/// The folder holding Git for Windows' own `git` and `curl`, as its shell
+/// names it: `/clangarm64/bin` from the ARM64 installer, `/mingw64/bin` from
+/// the x64 one.
+#[must_use]
+pub fn git_tools() -> &'static str {
+    if Path::new(r"C:\Program Files\Git\clangarm64\bin").is_dir() {
+        "/clangarm64/bin"
+    } else {
+        "/mingw64/bin"
+    }
+}
+
 /// A folder under the temporary directory, removed when dropped.
 #[derive(Debug)]
 pub struct Folder(PathBuf);

@@ -58,11 +58,19 @@ fn read_exactly(pipe: &Pipe, count: usize) -> Vec<u8> {
 #[test]
 fn the_pipe_is_owned_by_the_person_and_open_to_them_alone() {
     let (server, client) = pair("security");
-    let me = me().to_text().unwrap();
-    let expected = format!("O:{me}D:P(A;;0x12019f;;;{me})S:AI(ML;;NW;;;ME)");
-    assert_eq!(client.security().unwrap(), expected);
-    assert_eq!(server.security().unwrap(), expected);
-    assert_eq!(client.owner().unwrap(), self::me());
+    let read = client.security().unwrap();
+    // Windows writes some accounts by their SDDL alias - the built-in
+    // Administrator as `LA` - so the account is compared as an identifier.
+    let (owner, rest) = read
+        .strip_prefix("O:")
+        .and_then(|rest| rest.split_once("D:P(A;;0x12019f;;;"))
+        .unwrap_or_else(|| panic!("{read}"));
+    let (trustee, label) = rest.split_once(')').unwrap_or_else(|| panic!("{read}"));
+    assert_eq!(Sid::from_text(owner).unwrap(), me(), "{read}");
+    assert_eq!(Sid::from_text(trustee).unwrap(), me(), "{read}");
+    assert_eq!(label, "S:AI(ML;;NW;;;ME)", "{read}");
+    assert_eq!(server.security().unwrap(), read);
+    assert_eq!(client.owner().unwrap(), me());
 }
 
 /// Both ends write while the other is waiting to read, which a synchronous

@@ -77,6 +77,7 @@ fn take(address: Ipv4Addr, port: u16) -> io::Result<OwnedSocket> {
 /// to the endpoint: a connection to loopback reaches the socket bound to
 /// loopback.
 #[test]
+#[ignore = "needs a machine where a listener on every address raises no firewall prompt, as a hosted runner"]
 fn no_other_socket_takes_what_is_sent_to_the_endpoint() {
     let endpoint = Endpoint::bind().unwrap();
     assert_ne!(endpoint.port(), 0);

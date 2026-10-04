@@ -290,14 +290,21 @@ fn a_listener_is_admitted_as_the_persons_or_an_installed_services() {
     let (admission, holder) = admitted(&to_own);
     assert_eq!(admission, Ok(()));
     let holder = holder.unwrap();
+    // The suite's own rights: a full administrator's token, as the built-in
+    // Administrator's is, carries them.
+    let own_rights = if hedwig_win::token::Token::own().unwrap().elevated().unwrap() {
+        Rights::Administrator
+    } else {
+        Rights::Standard
+    };
     assert!(
         matches!(
             holder.whose,
             Whose::Person {
                 signed_in: SignedIn::Locally,
-                rights: Rights::Standard,
+                rights,
                 ..
-            }
+            } if rights == own_rights
         ),
         "{holder:?}"
     );

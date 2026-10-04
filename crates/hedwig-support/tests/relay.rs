@@ -544,6 +544,23 @@ fn a_remote_process_without_the_issued_bytes_is_closed_unanswered() {
     assert_eq!(heard(&told), [Relayed::Unpresented, Relayed::Ended]);
 }
 
+/// Grants `folder` to the person's account alone, nothing inherited, so a
+/// token reads what is made in it only through the account: Administrators,
+/// enabled in a full administrator's token, would read it too otherwise.
+fn the_account_alone(folder: &Path) {
+    let account = Token::own().unwrap().user().unwrap().to_text().unwrap();
+    let set = Command::new(r"C:\Windows\System32\icacls.exe")
+        .arg(folder)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &format!("*{account}:(OI)(CI)F"),
+        ])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{set:?}");
+}
+
 /// The listener is given the file's bytes only where its own token would be
 /// let read the file: parity, whatever lowered the token - a restricting
 /// list, the account made deny-only - and a lower integrity level, which the
@@ -551,6 +568,7 @@ fn a_remote_process_without_the_issued_bytes_is_closed_unanswered() {
 #[test]
 fn the_listener_is_given_the_bytes_only_where_it_could_read_the_socket_file() {
     let workstation = Scratch::new("relay-listener");
+    the_account_alone(workstation.path());
     workstation.launch();
     let file = workstation.dir("agent-extra-socket");
     // Low integrity may read the file but is not the person: the agent's
