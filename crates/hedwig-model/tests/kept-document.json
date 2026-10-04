@@ -1,0 +1,39 @@
+{
+  "version": 2,
+  "capabilities": [],
+  "platforms": [],
+  "routes": [],
+  "sets": [],
+  "grants": [
+    {
+      "grant": {
+        "capability": "gpg",
+        "remotes": {
+          "route": "codespaces"
+        }
+      },
+      "terms": {
+        "activation": "while-running",
+        "setup": "write",
+        "acknowledged": [],
+        "lends": []
+      }
+    }
+  ],
+  "accepted": [],
+  "denials": [],
+  "rules": [],
+  "bursts": [],
+  "heard": [],
+  "expected": [],
+  "full-screen": [],
+  "lengths": null,
+  "caps": [],
+  "autostart": "at-logon",
+  "icon": "at-logon",
+  "keep": 30,
+  "diagnostics": "faults",
+  "keepalives": [],
+  "returns": [],
+  "cadences": []
+}
