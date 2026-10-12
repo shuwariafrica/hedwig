@@ -1,0 +1,43 @@
+{
+  "id": "coder",
+  "client": {
+    "program": "ssh",
+    "before": [
+      {
+        "literal": "-o"
+      },
+      {
+        "literal": "ProxyCommand=coder ssh --stdio %n"
+      },
+      {
+        "literal": "-o"
+      },
+      {
+        "literal": "StrictHostKeyChecking=no"
+      },
+      {
+        "literal": "-o"
+      },
+      {
+        "literal": "UserKnownHostsFile=/dev/null"
+      }
+    ],
+    "after": [
+      "address"
+    ]
+  },
+  "listing": {
+    "lists": {
+      "program": "coder",
+      "arguments": [
+        "list",
+        "--search",
+        "owner:me status:running",
+        "--column",
+        "workspace"
+      ],
+      "header": 1
+    }
+  },
+  "identity": "platform"
+}

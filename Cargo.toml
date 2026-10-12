@@ -1,30 +1,33 @@
-[package]
-name = "hedwig"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-description = "Forward the Windows gpg-agent to Linux hosts over ssh -R: a loopback relay that speaks GnuPG's Windows socket emulation"
-license = "MIT"
-repository = "https://github.com/shuwariafrica/hedwig"
-categories = ["command-line-utilities", "cryptography"]
-keywords = ["gpg", "gpg-agent", "yubikey", "ssh", "forwarding"]
-
-[dependencies]
-zeroize = "1.9"
-
-[dependencies.windows-sys]
-version = "0.61"
-features = [
-    "Win32_Foundation",
-    "Win32_Networking_WinSock",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_Security",
-    "Win32_System_Registry",
-    "Win32_System_SystemInformation",
-    "Win32_System_Threading",
+[workspace]
+resolver = "3"
+members = [
+    "crates/hedwig-model",
+    "crates/hedwig-win",
+    "crates/hedwig-core",
+    "crates/hedwig-client",
+    "crates/hedwig",
+    "crates/hedwig-support",
 ]
 
-[lints.rust]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+repository = "https://github.com/shuwariafrica/hedwig"
+keywords = ["gpg", "ssh-agent", "adb", "yubikey", "forwarding"]
+categories = ["network-programming", "os::windows-apis"]
+
+[workspace.dependencies]
+hedwig-model = { path = "crates/hedwig-model", version = "0.1.0" }
+hedwig-win = { path = "crates/hedwig-win", version = "0.1.0" }
+hedwig-core = { path = "crates/hedwig-core", version = "0.1.0" }
+hedwig-client = { path = "crates/hedwig-client", version = "0.1.0" }
+serde_json = "1.0.151"
+windows-sys = "0.61"
+zeroize = "1.9"
+
+[workspace.lints.rust]
 future_incompatible = { level = "deny", priority = -1 }
 nonstandard_style = { level = "deny", priority = -1 }
 rust_2018_idioms = { level = "deny", priority = -1 }
@@ -38,7 +41,7 @@ unreachable_pub = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 unused_qualifications = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
@@ -52,14 +55,15 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"
 
 missing_errors_doc = "allow"
 must_use_candidate = "allow"
-undocumented_unsafe_blocks = "allow"
 
 [profile.release]
 opt-level = "s"
 lto = true
 strip = true
 codegen-units = 1
-# Left unwinding: a panic must cost one connection, not the whole relay.
+# Unwinding, not abort: a thread of the core that panics is joined as one that
+# failed, and the core serves on.

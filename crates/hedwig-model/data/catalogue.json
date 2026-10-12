@@ -1,0 +1,329 @@
+{
+  "capabilities": [
+    {
+      "id": "gpg",
+      "source": {
+        "gnupg": {
+          "installation": "registered",
+          "home": "default",
+          "access": "restricted"
+        }
+      }
+    },
+    {
+      "id": "gpg-unrestricted",
+      "source": {
+        "gnupg": {
+          "installation": "registered",
+          "home": "default",
+          "access": "unrestricted"
+        }
+      }
+    },
+    {
+      "id": "ssh-agent",
+      "source": {
+        "agent": {
+          "at": {
+            "pipe": "openssh-ssh-agent"
+          }
+        }
+      }
+    },
+    {
+      "id": "gpg-ssh",
+      "source": {
+        "agent": {
+          "at": {
+            "gnupg": {
+              "installation": "registered",
+              "home": "default"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "machine-ssh",
+      "source": {
+        "agent": {
+          "at": "machine"
+        }
+      }
+    },
+    {
+      "id": "adb",
+      "source": {
+        "service": {
+          "host": "workstation",
+          "port": {
+            "fixed": 5037
+          },
+          "stream": "adb",
+          "remote": [
+            {
+              "private-socket": {
+                "variable": "ADB_SERVER_SOCKET",
+                "value": "localfilesystem:{}"
+              }
+            },
+            {
+              "port": {
+                "fixed": 5037
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "openocd",
+      "source": {
+        "service": {
+          "host": "workstation",
+          "port": {
+            "fixed": 3333
+          },
+          "stream": "opaque",
+          "remote": [
+            {
+              "port": {
+                "fixed": 3333
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "probe-rs",
+      "source": {
+        "service": {
+          "host": "workstation",
+          "port": {
+            "fixed": 1337
+          },
+          "stream": "opaque",
+          "remote": [
+            {
+              "port": {
+                "fixed": 1337
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "pyocd",
+      "source": {
+        "service": {
+          "host": "workstation",
+          "port": {
+            "fixed": 5555
+          },
+          "stream": "opaque",
+          "remote": [
+            {
+              "port": {
+                "fixed": 5555
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "jlink",
+      "source": {
+        "service": {
+          "host": "workstation",
+          "port": {
+            "fixed": 2331
+          },
+          "stream": "opaque",
+          "remote": [
+            {
+              "port": {
+                "fixed": 2331
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "selenium-grid",
+      "source": {
+        "service": {
+          "host": "workstation",
+          "port": {
+            "fixed": 4444
+          },
+          "stream": "opaque",
+          "remote": [
+            {
+              "port": {
+                "fixed": 4444
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "playwright",
+      "source": {
+        "service": {
+          "host": "workstation",
+          "port": "unstated",
+          "stream": "opaque",
+          "remote": [
+            {
+              "port": "unstated"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "chrome-for-testing",
+      "source": {
+        "service": {
+          "host": "workstation",
+          "port": "unstated",
+          "stream": "opaque",
+          "remote": [
+            {
+              "port": "unstated"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "notices",
+      "source": "notices"
+    }
+  ],
+  "routes": [
+    {
+      "id": "codespaces",
+      "client": {
+        "program": "gh",
+        "before": [
+          {
+            "literal": "codespace"
+          },
+          {
+            "literal": "ssh"
+          },
+          {
+            "literal": "--codespace"
+          },
+          "address",
+          {
+            "literal": "--"
+          }
+        ],
+        "after": []
+      },
+      "listing": {
+        "lists": {
+          "program": "gh",
+          "arguments": [
+            "codespace",
+            "list",
+            "--json",
+            "name,state",
+            "--jq",
+            ".[] | select(.state == \"Available\") | .name"
+          ],
+          "header": 0
+        }
+      },
+      "identity": "platform"
+    },
+    {
+      "id": "ssh",
+      "client": {
+        "program": "ssh",
+        "before": [],
+        "after": [
+          "address"
+        ]
+      },
+      "listing": "blind",
+      "identity": "host-key"
+    }
+  ],
+  "platforms": [
+    {
+      "family": "linux",
+      "kernel": "Linux",
+      "sockets": {
+        "unix": {
+          "path-bytes": 108
+        }
+      },
+      "agent-forwarding": "served"
+    },
+    {
+      "family": "macos",
+      "kernel": "Darwin",
+      "sockets": {
+        "unix": {
+          "path-bytes": 104
+        }
+      },
+      "agent-forwarding": "served"
+    },
+    {
+      "family": "freebsd",
+      "kernel": "FreeBSD",
+      "sockets": {
+        "unix": {
+          "path-bytes": 104
+        }
+      },
+      "agent-forwarding": "served"
+    },
+    {
+      "family": "openbsd",
+      "kernel": "OpenBSD",
+      "sockets": {
+        "unix": {
+          "path-bytes": 104
+        }
+      },
+      "agent-forwarding": "served"
+    },
+    {
+      "family": "netbsd",
+      "kernel": "NetBSD",
+      "sockets": {
+        "unix": {
+          "path-bytes": 104
+        }
+      },
+      "agent-forwarding": "served"
+    },
+    {
+      "family": "illumos",
+      "kernel": "SunOS",
+      "sockets": {
+        "unix": {
+          "path-bytes": 108
+        }
+      },
+      "agent-forwarding": "served"
+    },
+    {
+      "family": "windows",
+      "kernel": "Windows_NT",
+      "sockets": "emulated",
+      "agent-forwarding": "refused"
+    }
+  ],
+  "sets": []
+}

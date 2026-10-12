@@ -1,0 +1,20 @@
+[package]
+name = "hedwig"
+description = "Exposes what a Windows workstation holds - its GnuPG, its SSH agent, its Android devices - to a remote over a channel that already reaches it, with nothing installed there"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+
+[dependencies]
+hedwig-model.workspace = true
+hedwig-win.workspace = true
+hedwig-core.workspace = true
+hedwig-client.workspace = true
+
+[lints]
+workspace = true
