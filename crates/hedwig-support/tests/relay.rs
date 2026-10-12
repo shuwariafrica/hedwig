@@ -33,7 +33,7 @@ use hedwig_model::refusal::{Refusal, Whereabouts};
 use hedwig_model::text::{Fingerprint, Folder as Place, Grip, Mark, Name, Serial};
 use hedwig_model::trail::{Card, Failure, Held, SignaturePin, Touch, Uses};
 use hedwig_support::lower::{Less, token};
-use hedwig_support::{Folder, SCDAEMON_LOG, readerless};
+use hedwig_support::{Folder, SCDAEMON_LOG, readerless, retire_home};
 use hedwig_win::process::{Job, Process};
 use hedwig_win::start::{Environment, held};
 use hedwig_win::token::Token;
@@ -156,28 +156,8 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         // Never through `installation`, which panics where GnuPG is not
         // named: a panic while a test unwinds aborts the whole suite.
-        let Some(folder) = std::env::var_os("HEDWIG_GNUPG") else {
-            return;
-        };
-        let gpgconf = |arguments: &[&str]| {
-            Command::new(PathBuf::from(&folder).join("bin").join("gpgconf.exe"))
-                .arg("--homedir")
-                .arg(self.path())
-                .args(arguments)
-                .output()
-                .ok()
-        };
-        let sockets = gpgconf(&["--list-dirs"])
-            .and_then(|listing| listed(&listing.stdout, "socketdir"))
-            .and_then(|value| String::from_utf8(value).ok())
-            .map(PathBuf::from);
-        let _ = gpgconf(&["--kill", "all"]);
-        if let Some(sockets) = sockets
-            && sockets
-                .parent()
-                .is_some_and(|parent| parent.ends_with("gnupg"))
-        {
-            let _ = std::fs::remove_dir_all(sockets);
+        if let Some(folder) = std::env::var_os("HEDWIG_GNUPG") {
+            retire_home(&PathBuf::from(folder).join("bin"), self.path());
         }
     }
 }
@@ -544,9 +524,9 @@ fn a_remote_process_without_the_issued_bytes_is_closed_unanswered() {
     assert_eq!(heard(&told), [Relayed::Unpresented, Relayed::Ended]);
 }
 
-/// Grants `folder` to the person's account alone, nothing inherited, so a
-/// token reads what is made in it only through the account: Administrators,
-/// enabled in a full administrator's token, would read it too otherwise.
+/// Grants `folder` and what is in it to the person's account alone, nothing
+/// inherited, so a token reads them only through the account: Administrators,
+/// enabled in a full administrator's token, would read them too otherwise.
 fn the_account_alone(folder: &Path) {
     let account = Token::own().unwrap().user().unwrap().to_text().unwrap();
     let set = Command::new(r"C:\Windows\System32\icacls.exe")
@@ -568,9 +548,20 @@ fn the_account_alone(folder: &Path) {
 #[test]
 fn the_listener_is_given_the_bytes_only_where_it_could_read_the_socket_file() {
     let workstation = Scratch::new("relay-listener");
-    the_account_alone(workstation.path());
     workstation.launch();
+    // GnuPG puts a home's sockets below the person's local application data,
+    // in a `d.` folder named for this home alone, which the scratch removes.
+    let sockets = workstation.dir("socketdir");
+    assert!(
+        sockets
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("d.")),
+        "{}",
+        sockets.display()
+    );
+    the_account_alone(&sockets);
     let file = workstation.dir("agent-extra-socket");
+    assert!(file.starts_with(&sockets), "{}", file.display());
     // Low integrity may read the file but is not the person: the agent's
     // listener must be both.
     let person = Token::own().unwrap().user().unwrap();

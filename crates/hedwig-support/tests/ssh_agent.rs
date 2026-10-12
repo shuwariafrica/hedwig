@@ -32,7 +32,7 @@ use hedwig_model::holder::Whose;
 use hedwig_model::refusal::{Refusal, Whereabouts, Withheld};
 use hedwig_model::text::{AgentPipe, Folder as Place, SshKey, Words};
 use hedwig_model::trail::{Failure, Payload};
-use hedwig_support::{Folder, readerless};
+use hedwig_support::{Folder, readerless, retire_home};
 use hedwig_win::Signal;
 use hedwig_win::pipe::{Listener, Moved, Pipe};
 use hedwig_win::token::Token;
@@ -157,11 +157,7 @@ impl Drop for Scratch {
         // Never through `installation`, which panics where GnuPG is not
         // named: a panic while a test unwinds aborts the whole suite.
         if let Some(folder) = std::env::var_os("HEDWIG_GNUPG") {
-            let _ = Command::new(PathBuf::from(folder).join("bin").join("gpgconf.exe"))
-                .arg("--homedir")
-                .arg(self.path())
-                .args(["--kill", "all"])
-                .output();
+            retire_home(&PathBuf::from(folder).join("bin"), self.path());
         }
     }
 }

@@ -280,9 +280,10 @@ fn a_service_named_by_its_host_is_resolved_and_a_name_with_no_address_said() {
 }
 
 /// The listener check: the person's own is admitted as theirs, and so is a
-/// service an administrator installed, whose token is closed to this
-/// account, named by the services the service control manager runs in it:
-/// the RPC endpoint mapper, which Windows runs as Network Service on port 135.
+/// service an administrator installed, named by the services the service
+/// control manager runs in it whether or not this account may read its
+/// token: the RPC endpoint mapper, which Windows runs as Network Service on
+/// port 135.
 #[test]
 fn a_listener_is_admitted_as_the_persons_or_an_installed_services() {
     let own = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -317,12 +318,16 @@ fn a_listener_is_admitted_as_the_persons_or_an_installed_services() {
 
     let to_service = TcpStream::connect(("127.0.0.1", 135)).unwrap();
     let listener = hedwig_win::endpoint::owner(&to_service).unwrap().unwrap();
-    assert!(
-        hedwig_win::process::Process::open(listener)
-            .and_then(|process| process.token())
-            .is_err(),
-        "its token is closed to this account"
-    );
+    // A standard account cannot open the service's token, so only its
+    // services can name it; an administrator's reads it as another account's.
+    if own_rights == Rights::Standard {
+        assert!(
+            hedwig_win::process::Process::open(listener)
+                .and_then(|process| process.token())
+                .is_err(),
+            "its token is closed to a standard account"
+        );
+    }
     let (admission, holder) = admitted(&to_service);
     assert_eq!(admission, Ok(()));
     let holder = holder.unwrap();

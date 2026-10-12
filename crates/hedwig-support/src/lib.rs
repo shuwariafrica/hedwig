@@ -152,6 +152,57 @@ pub fn readerless(home: &Path) -> io::Result<()> {
 /// Where the scdaemon of a [`readerless`] home logs.
 pub const SCDAEMON_LOG: &str = "scdaemon.log";
 
+/// Stops every daemon of the `GnuPG` home at `home`, with the `gpgconf` in
+/// `bin`, and removes the folder `GnuPG` keeps that home's sockets in: on
+/// Windows, a `d.` folder named for the home alone below the person's local
+/// application data's `gnupg`, which is never removed itself.
+pub fn retire_home(bin: &Path, home: &Path) {
+    let gpgconf = |arguments: &[&str]| {
+        std::process::Command::new(bin.join("gpgconf.exe"))
+            .arg("--homedir")
+            .arg(home)
+            .args(arguments)
+            .output()
+            .ok()
+    };
+    let sockets = gpgconf(&["--list-dirs", "socketdir"])
+        .map(|listed| PathBuf::from(String::from_utf8_lossy(&listed.stdout).trim()));
+    let _ = gpgconf(&["--kill", "all"]);
+    if let Some(sockets) = sockets.filter(|folder| {
+        folder
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("d."))
+            && folder.parent().and_then(Path::file_name) == Some("gnupg".as_ref())
+    }) {
+        let _ = std::fs::remove_dir_all(sockets);
+    }
+}
+
+/// A `GnuPG` home [`retire_home`] puts away when this is dropped, whether the
+/// test passed or not.
+#[derive(Debug)]
+pub struct Retired {
+    bin: PathBuf,
+    home: PathBuf,
+}
+
+impl Retired {
+    /// The home at `home`, put away with the `gpgconf` in `bin`.
+    #[must_use]
+    pub fn of(bin: &Path, home: &Path) -> Retired {
+        Retired {
+            bin: bin.to_path_buf(),
+            home: home.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for Retired {
+    fn drop(&mut self) {
+        retire_home(&self.bin, &self.home);
+    }
+}
+
 /// The folder holding Git for Windows' own `git` and `curl`, as its shell
 /// names it: `/clangarm64/bin` from the ARM64 installer, `/mingw64/bin` from
 /// the x64 one.

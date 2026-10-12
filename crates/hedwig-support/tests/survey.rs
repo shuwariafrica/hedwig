@@ -33,7 +33,7 @@ use hedwig_model::capability::Query;
 use hedwig_model::setting::Keepalive;
 use hedwig_model::text::{Fingerprint, Mark, Name, Port, RemotePath, Template, Variable};
 use hedwig_model::trail::{Asking, Binding, Finding, Write};
-use hedwig_support::{Folder, SCDAEMON_LOG, git_tools, readerless};
+use hedwig_support::{Folder, Retired, SCDAEMON_LOG, git_tools, readerless};
 
 const NONCE: &str = "0b7e2c4a91d35f6e8a7b0c1d2e3f4a5b";
 
@@ -892,6 +892,7 @@ fn a_windows_remote_s_earlier_marker_is_written_again_and_taken_back() {
     let folder = Folder::new("writes-windows-earlier");
     let home = folder.path().join("gnupg");
     readerless(&home).unwrap();
+    let _retired = Retired::of(&registered_gnupg(), &home);
     let config = folder.path().join("gitconfig");
     fs::write(
         &config,
@@ -1984,6 +1985,7 @@ fn gpg4win(bin: &Path, home: &Path, arguments: &[&str]) -> std::process::Output 
 /// fingerprint and its public half, armoured.
 fn windows_key(bin: &Path, maker: &Path) -> (Fingerprint, String) {
     readerless(maker).unwrap();
+    let _retired = Retired::of(bin, maker);
     let made_key = gpg4win(
         bin,
         maker,
@@ -2011,11 +2013,6 @@ fn windows_key(bin: &Path, maker: &Path) -> (Fingerprint, String) {
         maker,
         &["--armor", "--export", "hedwig@hedwig.example"],
     );
-    let _ = Command::new(bin.join("gpgconf.exe"))
-        .arg("--homedir")
-        .arg(maker)
-        .args(["--kill", "all"])
-        .output();
     (
         Fingerprint::try_from(fingerprint.as_str()).unwrap(),
         String::from_utf8(exported.stdout)
