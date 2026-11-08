@@ -10,7 +10,8 @@
 )]
 
 use hedwig_core::channel::{
-    Askpass, Heard, PIPE, SET, ended, environment, forward, heard, options, words,
+    Askpass, CARRIER_SAYS, Heard, PIPE, SET, ended, environment, forward, haul, heard, options,
+    words,
 };
 use hedwig_core::dispatch::{Core, Effect, Input, Knock, Link, Now, Step, Then, Told};
 use hedwig_core::relay::{Gnupg, Relaying};
@@ -719,10 +720,64 @@ fn what_the_client_says_is_read() {
             "dev@build-7.example: Permission denied (publickey).",
             Heard::Other,
         ),
+        // A carrier with a local forward, as the in-box client 9.5p2 says it
+        // with `CARRIER_SAYS`.
+        (
+            r"debug1: C:\\__w\\1\\s\\clientloop.c:client_loop():1460 (pid=21680): Entering interactive session.",
+            Heard::Entered,
+        ),
+        // The same words from anything but the session's loop: a client not
+        // made to say it never says it.
+        ("Entering interactive session.", Heard::Other),
+        (
+            "channel_setup_fwd_listener_tcpip: cannot listen to port: 20059",
+            Heard::Unlistened { port: 20059 },
+        ),
+        ("bind [127.0.0.1]:20059: Permission denied", Heard::Other),
+        ("Could not request local forwarding.", Heard::Other),
     ];
     for (line, read) in cases {
         assert_eq!(heard(line), read, "{line}");
     }
+}
+
+/// A carrier with a local forward is made to say the line its session's loop
+/// begins with, which tells the core it listens; a channel, a placer and a
+/// console keep [`SET`]'s, so a channel's ending is still told by the
+/// client's own last words. OpenSSH keeps the first `LogVerbose` it is given,
+/// so each has exactly one.
+#[test]
+fn only_a_carrier_with_a_local_forward_is_made_to_say_it_listens() {
+    let said = |options: &[String]| -> Vec<String> {
+        options
+            .iter()
+            .filter(|option| option.starts_with("LogVerbose="))
+            .cloned()
+            .collect()
+    };
+    let channel = options(&[], Asking::Nobody, Keepalive::SHIPS);
+    assert_eq!(
+        said(&channel),
+        ["LogVerbose=*:ssh_confirm_remote_forward():*"]
+    );
+    assert!(SET.contains(&"LogVerbose=*:ssh_confirm_remote_forward():*"));
+    let metro = hedwig_model::trail::Target::Loopback(Port::try_from(8081).unwrap());
+    let carrier = haul(
+        &metro,
+        Port::try_from(50140).unwrap(),
+        Asking::Nobody,
+        Keepalive::SHIPS,
+    );
+    assert_eq!(said(&carrier), [CARRIER_SAYS]);
+    let rest = |options: &[String]| -> Vec<String> {
+        options
+            .iter()
+            .filter(|option| !option.starts_with("LogVerbose=") && *option != "-L")
+            .filter(|option| !option.starts_with("127.0.0.1:"))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(rest(&carrier), rest(&channel), "otherwise as a channel");
 }
 
 /// Words kept from a client hold nothing that drives a terminal and are no

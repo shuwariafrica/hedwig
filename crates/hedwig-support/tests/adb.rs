@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hedwig_core::adb::{Carriage, Carried, Lending, Reverse, Watch, query};
-use hedwig_core::channel::Jobs;
+use hedwig_core::adb::{Carriage, Carried, Lending, Reverse, Unsent, Watch, query};
+use hedwig_core::channel::{Hauled, Jobs};
 use hedwig_core::devices::{Listing, View};
 use hedwig_core::relay::{Relayed, Settle};
 use hedwig_core::service::Service;
@@ -109,7 +109,7 @@ fn decide(heard: &Receiver<Relayed>, settle: &Settle, kept: &Mutex<Vec<Relayed>>
     for relayed in heard {
         match &relayed {
             Relayed::Reached(Ok(())) => settle.settle(Ok(())),
-            Relayed::Reverse(_) => settle.carry(Err(Some(Withheld::Uncarriable))),
+            Relayed::Reverse(_) => settle.carry(Err(Unsent::Withheld(Withheld::Uncarriable))),
             _ => {}
         }
         let ended = matches!(relayed, Relayed::Ended);
@@ -376,8 +376,8 @@ fn an_endpoint_carries_only_the_servers_connections_and_only_to_the_channels_car
     // A carrier in the channel's job carries the server's connection.
     let inside = free_port();
     let mut held = carrier(inside, echoed, Some(&job), &folder.join("inside.log"));
-    carriage.haul(&adb, connection, port(inside));
-    assert!(carriage.hauled(&adb, connection));
+    stands(&carriage, &adb, connection, inside);
+    assert_eq!(carriage.standing(&adb), Some((connection, port(inside))));
     assert_eq!(round_trip(endpoint), b"ping");
 
     // Another ADB capability's server - the suite again, at a second port -
@@ -398,14 +398,14 @@ fn an_endpoint_carries_only_the_servers_connections_and_only_to_the_channels_car
         own, endpoint,
         "each capability's server has its own endpoint"
     );
-    assert!(!carriage.hauled(&emulator, connection));
-    carriage.haul(&emulator, connection, port(inside));
+    assert_eq!(carriage.withdraw(&emulator), None);
+    stands(&carriage, &emulator, connection, inside);
     assert_eq!(round_trip(own), b"ping");
 
     // A process outside the job at the carrier's port is not the carrier.
     let outside = free_port();
     let mut stray = carrier(outside, echoed, None, &folder.join("outside.log"));
-    carriage.haul(&adb, connection, port(outside));
+    stands(&carriage, &adb, connection, outside);
     assert_eq!(round_trip(endpoint), b"");
 
     // A connection from a process other than the server's is not carried:
@@ -419,7 +419,7 @@ fn an_endpoint_carries_only_the_servers_connections_and_only_to_the_channels_car
     };
     let other = reverse("adb", &other);
     let second = carriage.endpoint(other.clone(), foreign, &jobs).unwrap();
-    carriage.haul(&other, connection, port(inside));
+    stands(&carriage, &other, connection, inside);
     assert_eq!(round_trip(second), b"");
 
     for child in [&mut held, &mut stray, &mut foreign_server] {
@@ -429,6 +429,184 @@ fn an_endpoint_carries_only_the_servers_connections_and_only_to_the_channels_car
     let _ = job.end();
     drop(server);
     drop(emulator_server);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A carriage tells at once where the carrier of a reverse stands in the
+/// channel asked for, waits where one starts there, gives the caller back
+/// where none is there - another channel's, one ended, or one withdrawn to
+/// be ended - and tells a reverse with no endpoint that nothing carries it.
+#[test]
+fn a_carriage_tells_at_once_waits_or_gives_back() {
+    let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let service = Service {
+        host: ServiceHost::Workstation,
+        port: port(server.local_addr().unwrap().port()),
+    };
+    let jobs: Jobs = Jobs::default();
+    let remote = RemoteId {
+        route: Name::try_from("ssh").unwrap(),
+        address: Address::try_from("dev@build-7.example").unwrap(),
+    };
+    let reverse = |number: u16| Reverse {
+        remote: remote.clone(),
+        capability: Name::try_from("adb").unwrap(),
+        target: Target::Loopback(port(number)),
+    };
+    let (first, second) = (ConnectionId(Seq(7)), ConnectionId(Seq(8)));
+    let carriage = Carriage::default();
+    carriage
+        .endpoint(reverse(8081), service.clone(), &jobs)
+        .unwrap();
+    let told: Arc<Mutex<Vec<Result<(), String>>>> = Arc::default();
+    let tell = || {
+        let kept = Arc::clone(&told);
+        let then: hedwig_core::adb::Awaiting =
+            Box::new(move |standing| kept.lock().unwrap().push(standing));
+        then
+    };
+
+    assert!(
+        carriage.stand(&reverse(8081), first, tell()).is_some(),
+        "none there"
+    );
+    carriage.start(&reverse(8081), first, port(50150), tell());
+    assert!(
+        carriage.stand(&reverse(8081), first, tell()).is_none(),
+        "waits"
+    );
+    assert_eq!(*told.lock().unwrap(), Vec::new());
+    carriage.told(&reverse(8081), first, port(50150), Hauled::Stands);
+    assert_eq!(*told.lock().unwrap(), [Ok(()), Ok(())]);
+    assert!(
+        carriage.stand(&reverse(8081), first, tell()).is_none(),
+        "at once"
+    );
+    assert_eq!(told.lock().unwrap().len(), 3);
+    assert!(
+        carriage.stand(&reverse(8081), second, tell()).is_some(),
+        "another channel's"
+    );
+    carriage.told(&reverse(8081), first, port(50150), Hauled::Ended);
+    assert_eq!(carriage.withdraw(&reverse(8081)), None);
+    assert!(
+        carriage.stand(&reverse(8081), first, tell()).is_some(),
+        "ended"
+    );
+
+    // Withdrawn while it starts, for it to be ended: what waited is told, a
+    // reverse asked again starts another, and the withdrawn one's word on
+    // itself comes to nothing.
+    told.lock().unwrap().clear();
+    carriage.start(&reverse(8081), first, port(50151), tell());
+    assert_eq!(
+        carriage.withdraw(&reverse(8081)),
+        Some((first, port(50151)))
+    );
+    assert!(matches!(told.lock().unwrap().as_slice(), [Err(_)]));
+    assert!(
+        carriage.stand(&reverse(8081), first, tell()).is_some(),
+        "withdrawn"
+    );
+    carriage.start(&reverse(8081), first, port(50152), tell());
+    let ended = "the carrier ended before it listened".to_owned();
+    carriage.told(&reverse(8081), first, port(50151), Hauled::Cannot(ended));
+    assert_eq!(told.lock().unwrap().len(), 1, "the withdrawn one's word");
+    carriage.told(&reverse(8081), first, port(50152), Hauled::Stands);
+    assert_eq!(told.lock().unwrap().last(), Some(&Ok(())));
+
+    told.lock().unwrap().clear();
+    assert!(carriage.stand(&reverse(9000), first, tell()).is_none());
+    assert_eq!(
+        *told.lock().unwrap(),
+        [Err(
+            "the workstation holds no endpoint for it in this run".to_owned()
+        )]
+    );
+    drop(server);
+}
+
+/// The carrier of `reverse` started in `connection`'s channel at `listen`,
+/// and heard to listen there.
+fn stands(carriage: &Carriage, reverse: &Reverse, connection: ConnectionId, listen: u16) {
+    carriage.start(reverse, connection, port(listen), Box::new(|_| {}));
+    carriage.told(reverse, connection, port(listen), Hauled::Stands);
+}
+
+/// A connection the server makes to an endpoint while its carrier starts -
+/// the first, or one started again as the channel returned - is held until
+/// the carrier stands and then carried; one whose carrier never stands is
+/// closed with nothing written once `PATIENCE` is out. What waited for the
+/// carrier is told it stands.
+#[test]
+fn a_server_connection_meeting_its_carrier_starting_waits_for_it_at_most_patience() {
+    let folder = std::env::temp_dir().join(format!("hedwig-adb-wait-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).unwrap();
+    let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let service = Service {
+        host: ServiceHost::Workstation,
+        port: port(server.local_addr().unwrap().port()),
+    };
+    let jobs: Jobs = Jobs::default();
+    let connection = ConnectionId(Seq(7));
+    let job = Arc::new(Job::new().unwrap());
+    jobs.lock().unwrap().insert(connection, Arc::clone(&job));
+    let adb = Reverse {
+        remote: RemoteId {
+            route: Name::try_from("ssh").unwrap(),
+            address: Address::try_from("dev@build-7.example").unwrap(),
+        },
+        capability: Name::try_from("adb").unwrap(),
+        target: Target::Loopback(port(8081)),
+    };
+    let carriage = Carriage::default();
+    let endpoint = carriage.endpoint(adb.clone(), service, &jobs).unwrap();
+    let echoed = echo();
+    let inside = free_port();
+    let mut held = carrier(inside, echoed, Some(&job), &folder.join("inside.log"));
+    let told: Arc<Mutex<Vec<Result<(), String>>>> = Arc::default();
+    let kept = Arc::clone(&told);
+    carriage.start(
+        &adb,
+        connection,
+        port(inside),
+        Box::new(move |standing| kept.lock().unwrap().push(standing)),
+    );
+
+    let mut waiting = TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.number())).unwrap();
+    waiting
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    waiting.write_all(b"ping").unwrap();
+    let mut back = [0u8; 4];
+    let meanwhile = waiting.read(&mut back);
+    assert!(
+        matches!(&meanwhile, Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "held while the carrier starts, not closed: {meanwhile:?}"
+    );
+    carriage.told(&adb, connection, port(inside), Hauled::Stands);
+    waiting
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    waiting.read_exact(&mut back).unwrap();
+    assert_eq!(&back, b"ping");
+    assert_eq!(*told.lock().unwrap(), [Ok(())]);
+
+    carriage.start(&adb, connection, port(free_port()), Box::new(|_| {}));
+    let started = Instant::now();
+    let mut late = TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.number())).unwrap();
+    late.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let _ = late.write_all(b"ping");
+    let mut rest = Vec::new();
+    let _ = late.read_to_end(&mut rest);
+    assert!(rest.is_empty(), "{rest:?}");
+    assert!(started.elapsed() >= hedwig_core::PATIENCE);
+
+    let _ = held.kill();
+    let _ = held.wait();
+    let _ = job.end();
+    drop(server);
     let _ = std::fs::remove_dir_all(&folder);
 }
 

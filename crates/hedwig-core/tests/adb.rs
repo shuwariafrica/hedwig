@@ -1055,10 +1055,11 @@ fn a_forward_is_carried_from_the_remotes_port_to_the_cores_endpoint() {
 }
 
 /// The recorded reverse is held for its endpoint, sent on naming that
-/// endpoint as its host side, and the device's answer reaches the client
-/// whole, with the reverse it took told to the core.
+/// endpoint as its host side, and the reverse the device took told to the
+/// core; the device's answer reaches the client whole only once the core
+/// says the reverse is recorded and its carrier stands, and only once.
 #[test]
-fn a_reverse_is_held_rewritten_to_its_endpoint_and_its_answer_carried() {
+fn a_reverse_is_held_rewritten_to_its_endpoint_and_answered_once_it_stands() {
     let reads = &recorded()[&7];
     let (mut got, mut talk) = relay(&reads[0..3], Carried::default(), every(), &recorded_view());
     let Read::Client(reverse) = &reads[3] else {
@@ -1088,6 +1089,7 @@ fn a_reverse_is_held_rewritten_to_its_endpoint_and_its_answer_carried() {
         got.server[before..],
         framed(b"reverse:forward:tcp:8081;tcp:50131")
     );
+    let answered = got.client.len();
     for read in &reads[4..] {
         let outs = match read {
             Read::Server(bytes) => talk.from_server(bytes, &recorded_view()).unwrap(),
@@ -1096,9 +1098,6 @@ fn a_reverse_is_held_rewritten_to_its_endpoint_and_its_answer_carried() {
         };
         take(&mut got, &mut spliced, &mut talk, &recorded_view(), outs);
     }
-    let (_, server) = sent(reads);
-    assert_eq!(got.client, server);
-    assert!(!spliced);
     assert_eq!(
         got.asked[2],
         Out::Reversed {
@@ -1106,6 +1105,143 @@ fn a_reverse_is_held_rewritten_to_its_endpoint_and_its_answer_carried() {
             endpoint: port(50131),
         }
     );
+    assert_eq!(got.client.len(), answered, "nothing answered yet");
+    assert!(talk.open(), "the remote waits for its answer");
+    let outs = talk.stood(Ok(()));
+    take(&mut got, &mut spliced, &mut talk, &recorded_view(), outs);
+    let (_, server) = sent(reads);
+    assert_eq!(got.client, server);
+    assert!(!spliced);
+    assert!(!talk.open());
+    assert_eq!(talk.stood(Ok(())), Vec::new(), "answered once");
+}
+
+/// A reverse whose carrier cannot stand is refused in Hedwig's words, which
+/// the remote's client prints after "error: ", and nothing reaches the
+/// device: it holds no reverse nothing carries.
+#[test]
+fn a_reverse_whose_carrier_cannot_stand_is_refused_and_never_sent() {
+    let mut talk = opened(every());
+    talk.from_client(&framed(b"host:transport-any"), &recorded_view())
+        .unwrap();
+    talk.from_server(b"OKAY", &recorded_view()).unwrap();
+    talk.from_client(
+        &framed(b"reverse:forward:tcp:8081;tcp:8081"),
+        &recorded_view(),
+    )
+    .unwrap();
+    assert!(talk.holds());
+    assert_eq!(
+        talk.unhauled("bind [127.0.0.1]:50140: Permission denied"),
+        vec![Out::ToClient(fail(
+            "Hedwig cannot carry the reverse on to the remote: bind [127.0.0.1]:50140: Permission denied"
+        ))]
+    );
+    assert!(!talk.open());
+    assert_eq!(talk.carry(port(50131)), Vec::new(), "never sent after");
+}
+
+/// A device's refusal of a reverse reaches the remote as it comes; a reverse
+/// the device took whose carrier cannot stand when its answer is due is told
+/// to the remote as kept by the device and carried once the channel can.
+#[test]
+fn a_device_refusal_comes_at_once_and_a_carrier_lost_meanwhile_is_told() {
+    let held = |talk: &mut Conversation| {
+        talk.from_client(&framed(b"host:transport-any"), &recorded_view())
+            .unwrap();
+        talk.from_server(b"OKAY", &recorded_view()).unwrap();
+        talk.from_client(
+            &framed(b"reverse:forward:norebind:tcp:8081;tcp:8081"),
+            &recorded_view(),
+        )
+        .unwrap();
+        talk.carry(port(50131));
+    };
+    let mut talk = opened(every());
+    held(&mut talk);
+    let refused = {
+        let mut answer = b"OKAY".to_vec();
+        answer.extend(fail("cannot rebind existing socket"));
+        answer
+    };
+    talk.from_server(&refused, &recorded_view()).unwrap();
+    assert_eq!(
+        talk.server_closed(&recorded_view()).unwrap(),
+        vec![Out::ToClient(refused)]
+    );
+    assert!(!talk.open());
+
+    let mut talk = opened(every());
+    held(&mut talk);
+    talk.from_server(b"OKAYOKAY", &recorded_view()).unwrap();
+    assert_eq!(
+        talk.server_closed(&recorded_view()).unwrap(),
+        vec![Out::Reversed {
+            target: Target::Loopback(port(8081)),
+            endpoint: port(50131),
+        }]
+    );
+    assert_eq!(
+        talk.stood(Err("the remote's route is no longer defined".to_owned())),
+        vec![Out::ToClient(fail(
+            "Hedwig cannot carry the reverse on to the remote now (the remote's route is no \
+             longer defined); the device keeps it, and Hedwig carries it once the remote's \
+             channel can"
+        ))]
+    );
+    assert!(!talk.open());
+
+    // Taken, and nothing records it: the remote reads only that nothing carries it.
+    let mut talk = opened(every());
+    held(&mut talk);
+    talk.from_server(b"OKAYOKAY", &recorded_view()).unwrap();
+    talk.server_closed(&recorded_view()).unwrap();
+    assert_eq!(
+        talk.unhauled("the remote's channel is down"),
+        vec![Out::ToClient(fail(
+            "Hedwig cannot carry the reverse on to the remote: the remote's channel is down"
+        ))]
+    );
+    assert_eq!(talk.stood(Ok(())), Vec::new(), "answered once");
+}
+
+/// A remote that leaves while the device answers its reverse leaves the
+/// answer still read: what the device took reaches the core, which records
+/// what the device holds.
+#[test]
+fn a_reverse_answered_after_its_remote_left_is_still_read() {
+    let mut talk = opened(every());
+    talk.from_client(&framed(b"host:transport-any"), &recorded_view())
+        .unwrap();
+    talk.from_server(b"OKAY", &recorded_view()).unwrap();
+    talk.from_client(
+        &framed(b"reverse:forward:tcp:8081;tcp:8081"),
+        &recorded_view(),
+    )
+    .unwrap();
+    talk.carry(port(50131));
+    assert_eq!(talk.client_closed(), Ok(()));
+    assert!(talk.reads_a_reverse());
+    talk.from_server(b"OKAYOKAY", &recorded_view()).unwrap();
+    assert_eq!(
+        talk.server_closed(&recorded_view()).unwrap(),
+        vec![Out::Reversed {
+            target: Target::Loopback(port(8081)),
+            endpoint: port(50131),
+        }]
+    );
+    // A remote gone before the device was asked leaves nothing to read.
+    let mut talk = opened(every());
+    talk.from_client(&framed(b"host:transport-any"), &recorded_view())
+        .unwrap();
+    talk.from_server(b"OKAY", &recorded_view()).unwrap();
+    talk.from_client(
+        &framed(b"reverse:forward:tcp:8081;tcp:8081"),
+        &recorded_view(),
+    )
+    .unwrap();
+    assert_eq!(talk.client_closed(), Ok(()));
+    assert!(!talk.open());
 }
 
 /// A reverse listing names each of this remote's endpoints as the target it

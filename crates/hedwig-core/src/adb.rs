@@ -24,8 +24,9 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use hedwig_model::capability::Lends;
 use hedwig_model::holder::SourceHolder;
@@ -36,7 +37,7 @@ use hedwig_model::trail::{ConnectionId, Failure, Target};
 use hedwig_win::Signal;
 use hedwig_win::endpoint::{Endpoint, owner};
 
-use crate::channel::Jobs;
+use crate::channel::{Hauled, Jobs};
 use crate::devices::{
     Device, Form, Resolved, Selection, View, kept, missing, net_address, resolve, strtol,
 };
@@ -194,6 +195,32 @@ pub enum Out {
     RemoveAll(Vec<(u64, Forward)>),
 }
 
+/// Why the core gives a held request no way on: a reverse it sends to no
+/// device, or whose answer from the device it does not give, or a forward it
+/// sends to no server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unsent {
+    /// Refused, and recorded as the remote turned away.
+    Withheld(Withheld),
+    /// Nothing carries the reverse, for this reason.
+    Unhauled(String),
+}
+
+impl fmt::Display for Unsent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unsent::Withheld(withheld) => f.write_str(reason(withheld)),
+            Unsent::Unhauled(why) => write!(f, "{UNHAULED}: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for Unsent {}
+
+/// The words that open every message saying Hedwig cannot carry a reverse,
+/// the residual's included.
+const UNHAULED: &str = "Hedwig cannot carry the reverse on to the remote";
+
 /// What a request is, as the server would take it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -276,6 +303,11 @@ enum Turn {
     Reversing {
         carried: Option<(Target, Port)>,
         listing: bool,
+    },
+    /// The device took the reverse; its `answer` waits for the core to record
+    /// it and its carrier to stand in the remote's live channel.
+    Standing {
+        answer: Vec<u8>,
     },
     /// A request sent naming `id` in place of what the remote selected:
     /// its whole answer is read.
@@ -885,6 +917,18 @@ impl Conversation {
     /// Whether a reverse waits for the core's word.
     pub fn holds(&self) -> bool {
         matches!(self.turn, Turn::Carrying { .. })
+    }
+
+    /// Whether a reverse carried to an endpoint is with the device, its
+    /// answer not yet read.
+    pub fn reads_a_reverse(&self) -> bool {
+        matches!(
+            self.turn,
+            Turn::Reversing {
+                carried: Some(_),
+                ..
+            }
+        )
     }
 
     /// Whether a forward waits for its port on the remote.
@@ -1528,6 +1572,40 @@ impl Conversation {
         self.refuse(withheld)
     }
 
+    /// Nothing carries the reverse, for `why`: one held is never sent to the
+    /// device; of one the device took, the device's answer is not given. The
+    /// remote reads why.
+    pub fn unhauled(&mut self, why: &str) -> Vec<Out> {
+        if !self.holds() && !matches!(self.turn, Turn::Standing { .. }) {
+            return Vec::new();
+        }
+        self.turn = Turn::Over;
+        vec![Out::ToClient(fail(&format!("{UNHAULED}: {why}")))]
+    }
+
+    /// The core recorded the reverse the device took and its carrier stands
+    /// in the remote's live channel, or cannot, for `why`. Only now is the
+    /// remote given the device's answer, whose `OKAY` says that a connection
+    /// the device makes from here reaches the remote. Where the carrier
+    /// cannot stand, the device keeps the reverse the core recorded, and the
+    /// remote is told so.
+    pub fn stood(&mut self, standing: Result<(), String>) -> Vec<Out> {
+        let answer = match std::mem::replace(&mut self.turn, Turn::Over) {
+            Turn::Standing { answer } => answer,
+            other => {
+                self.turn = other;
+                return Vec::new();
+            }
+        };
+        match standing {
+            Ok(()) => vec![Out::ToClient(answer)],
+            Err(why) => vec![Out::ToClient(fail(&format!(
+                "{UNHAULED} now ({why}); the device keeps it, and Hedwig carries it once the \
+                 remote's channel can"
+            )))],
+        }
+    }
+
     /// Takes what the server sent.
     ///
     /// # Errors
@@ -1817,6 +1895,12 @@ impl Conversation {
     ///
     /// [`Breach::Cut`] where it closed in the middle of a request.
     pub fn client_closed(&mut self) -> Result<(), Breach> {
+        // The device may take a reverse it was asked for whoever is left to
+        // hear it: its answer is still read, so the core knows what the
+        // device holds.
+        if self.reads_a_reverse() {
+            return Ok(());
+        }
         let cut = matches!(self.turn, Turn::Request) && !self.client.is_empty()
             || matches!(self.turn, Turn::Passing(_));
         self.turn = Turn::Over;
@@ -1827,27 +1911,28 @@ impl Conversation {
         }
     }
 
-    /// The device's whole answer to a reverse, for the client: a listing with
-    /// each endpoint of this remote's named as the target it carries to.
+    /// The device's whole answer to a reverse. One the device took waits for
+    /// [`Conversation::stood`]; any other - a refusal, a removal, a listing
+    /// with each endpoint of this remote's named as the target it carries to -
+    /// is the client's as it comes.
     fn reversed(
-        &self,
+        &mut self,
         answer: Vec<u8>,
         carried: Option<(Target, Port)>,
         listing: bool,
     ) -> Vec<Out> {
-        let mut outs = Vec::new();
         if let Some((target, endpoint)) = carried
             && answer.starts_with(b"OKAYOKAY")
         {
-            outs.push(Out::Reversed { target, endpoint });
+            self.turn = Turn::Standing { answer };
+            return vec![Out::Reversed { target, endpoint }];
         }
         let answer = if listing {
             self.reverses_listed(&answer).unwrap_or(answer)
         } else {
             answer
         };
-        outs.insert(0, Out::ToClient(answer));
-        outs
+        vec![Out::ToClient(answer)]
     }
 
     /// A reverse listing - `OKAY`, then lines of serial, device side and host
@@ -2181,8 +2266,9 @@ pub fn unlisten(server: &Service, id: u64, listener: Port) {
 
 /// Carries one admitted connection to the workstation's ADB server. `tell`
 /// reaches the deciding thread. Returns where the deciding thread settles the
-/// connection's opening and the run gives a held reverse its endpoint, a held
-/// forward its port on the remote, and a change to what the grant lends; the
+/// connection's opening and the run gives a held reverse its endpoint once its
+/// carrier stands, and the device's answer to it once it is recorded; a held
+/// forward its port on the remote; and a change to what the grant lends. The
 /// connection itself runs on threads of its own.
 pub fn carry(
     client: TcpStream,
@@ -2427,7 +2513,7 @@ fn converse(ends: &Ends<'_>, early: Vec<u8>, opened: Opened, tell: &impl Fn(Rela
                 break 'carry;
             }
         }
-        if client_done {
+        if client_done && !talk.reads_a_reverse() {
             if spliced.load(Ordering::Acquire) {
                 // The client's close is passed on; the server's answer still
                 // reaches the client until the server closes too.
@@ -2456,20 +2542,19 @@ fn settled(talk: &mut Conversation, settle: &Settle, watch: &Watch) -> Option<Ve
         }
     }
     match settle.take_endpoint() {
-        Some(Ok(endpoint)) if talk.holds() => outs.extend(talk.carry(endpoint)),
-        Some(Err(Some(withheld))) if talk.holds() || talk.places() => {
-            outs.extend(talk.withhold(withheld));
-        }
-        // No endpoint could be bound: the workstation's side failed, and
-        // the connection ends with nothing more said.
-        Some(Err(None)) if talk.holds() => return None,
-        _ => {}
+        Some(Ok(endpoint)) => outs.extend(talk.carry(endpoint)),
+        Some(Err(Unsent::Withheld(withheld))) => outs.extend(talk.withhold(withheld)),
+        Some(Err(Unsent::Unhauled(why))) => outs.extend(talk.unhauled(&why)),
+        None => {}
     }
     if let Some(placed) = settle.take_placed() {
         outs.extend(talk.placed(placed));
     }
     if let Some(listening) = settle.take_listening() {
         outs.extend(talk.listened(listening));
+    }
+    if let Some(standing) = settle.take_standing() {
+        outs.extend(talk.stood(standing));
     }
     Some(outs)
 }
@@ -2530,22 +2615,87 @@ pub struct Reverse {
     pub target: Target,
 }
 
+/// What is given once a reverse's carrier stands in the channel it was asked
+/// to stand in, or the words for why it cannot.
+pub type Awaiting = Box<dyn FnOnce(Result<(), String>) + Send>;
+
+/// Where a reverse's carrier is: in which channel's job, and the workstation
+/// port it listens on.
+enum Stance {
+    /// Started, not yet heard to listen; `waiting` are told whether it does.
+    Starting {
+        connection: ConnectionId,
+        listen: Port,
+        waiting: Vec<Awaiting>,
+    },
+    Standing {
+        connection: ConnectionId,
+        listen: Port,
+    },
+}
+
+impl fmt::Debug for Stance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stance::Starting {
+                connection,
+                listen,
+                waiting,
+            } => f
+                .debug_struct("Starting")
+                .field("connection", connection)
+                .field("listen", listen)
+                .field("waiting", &waiting.len())
+                .finish(),
+            Stance::Standing { connection, listen } => f
+                .debug_struct("Standing")
+                .field("connection", connection)
+                .field("listen", listen)
+                .finish(),
+        }
+    }
+}
+
 /// One carried reverse: the endpoint the workstation's ADB server reaches it
-/// through, held for the run, and the carrier behind it while the remote's
-/// channel is up.
+/// through, held for the run, and the carrier behind it while it has one.
 #[derive(Debug)]
 struct Held {
     port: Port,
     server: Service,
-    /// The channel whose job holds the carrier, and the port it listens on.
-    carrier: Mutex<Option<(ConnectionId, Port)>>,
+    carrier: Mutex<Option<Stance>>,
+    /// Signalled whenever `carrier` changes.
+    changed: Condvar,
 }
 
-/// Every carried reverse's endpoint.
+impl Held {
+    /// The channel and port of the carrier standing, waiting at most
+    /// `patience` for one starting.
+    fn standing(&self, patience: Duration) -> Option<(ConnectionId, Port)> {
+        let deadline = Instant::now().checked_add(patience)?;
+        let mut carrier = self.carrier.lock().ok()?;
+        loop {
+            match &*carrier {
+                Some(Stance::Standing { connection, listen }) => {
+                    return Some((*connection, *listen));
+                }
+                Some(Stance::Starting { .. }) => {
+                    let left = deadline.checked_duration_since(Instant::now())?;
+                    carrier = self.changed.wait_timeout(carrier, left).ok()?.0;
+                }
+                None => return None,
+            }
+        }
+    }
+}
+
+/// Every carried reverse's endpoint, and where its carrier is.
 #[derive(Debug, Default)]
 pub struct Carriage {
     endpoints: Mutex<BTreeMap<Reverse, Arc<Held>>>,
 }
+
+/// Why a reverse with no endpoint in this run is carried by no carrier.
+const UNBOUND: &str = "the workstation holds no endpoint for it in this run";
 
 impl Carriage {
     /// The endpoint of `reverse`, bound now where it has none. A connection
@@ -2570,6 +2720,7 @@ impl Carriage {
             port,
             server,
             carrier: Mutex::new(None),
+            changed: Condvar::new(),
         });
         endpoints.insert(reverse, Arc::clone(&carried));
         let (stop, jobs) = (Signal::new()?, Arc::clone(jobs));
@@ -2582,22 +2733,145 @@ impl Carriage {
         Ok(port)
     }
 
-    /// Whether the carrier of the endpoint of `reverse` is already in
-    /// `connection`'s channel.
-    pub fn hauled(&self, reverse: &Reverse, connection: ConnectionId) -> bool {
-        self.found(reverse)
-            .and_then(|carried| carried.carrier.lock().ok().map(|carrier| *carrier))
-            .flatten()
-            .is_some_and(|(held, _)| held == connection)
+    /// Tells `then` whether the carrier of `reverse` stands in `connection`'s
+    /// channel: at once where it stands there, once it is heard where it is
+    /// starting there. Where none is there, `then` is given back, for a
+    /// carrier to be started with [`Carriage::start`]; where `reverse` has no
+    /// endpoint, nothing can carry it and `then` is told so.
+    pub fn stand(
+        &self,
+        reverse: &Reverse,
+        connection: ConnectionId,
+        then: Awaiting,
+    ) -> Option<Awaiting> {
+        let Some(held) = self.found(reverse) else {
+            then(Err(UNBOUND.to_owned()));
+            return None;
+        };
+        let Ok(mut carrier) = held.carrier.lock() else {
+            return Some(then);
+        };
+        match &mut *carrier {
+            Some(Stance::Standing { connection: at, .. }) if *at == connection => {
+                drop(carrier);
+                then(Ok(()));
+                None
+            }
+            Some(Stance::Starting {
+                connection: at,
+                waiting,
+                ..
+            }) if *at == connection => {
+                waiting.push(then);
+                None
+            }
+            _ => Some(then),
+        }
     }
 
-    /// The carrier of the endpoint of `reverse` is in `connection`'s channel,
-    /// listening at `listen`.
-    pub fn haul(&self, reverse: &Reverse, connection: ConnectionId, listen: Port) {
-        if let Some(carried) = self.found(reverse)
-            && let Ok(mut carrier) = carried.carrier.lock()
-        {
-            *carrier = Some((connection, listen));
+    /// A carrier of `reverse` is starting in `connection`'s channel, to
+    /// listen at `listen`, in place of any it had: `then`, and whatever
+    /// waited for one starting elsewhere, are told whether it stands.
+    pub fn start(&self, reverse: &Reverse, connection: ConnectionId, listen: Port, then: Awaiting) {
+        let Some(held) = self.found(reverse) else {
+            return then(Err(UNBOUND.to_owned()));
+        };
+        let Ok(mut carrier) = held.carrier.lock() else {
+            return then(Err("the carriage was poisoned".to_owned()));
+        };
+        let mut waiting = match carrier.take() {
+            Some(Stance::Starting { waiting, .. }) => waiting,
+            _ => Vec::new(),
+        };
+        waiting.push(then);
+        *carrier = Some(Stance::Starting {
+            connection,
+            listen,
+            waiting,
+        });
+        drop(carrier);
+        held.changed.notify_all();
+    }
+
+    /// What the carrier of `reverse` started in `connection`'s channel to
+    /// listen at `listen` said of itself. Nothing comes of it where another
+    /// carrier has taken its place.
+    pub fn told(&self, reverse: &Reverse, connection: ConnectionId, listen: Port, hauled: Hauled) {
+        let Some(held) = self.found(reverse) else {
+            return;
+        };
+        let (waiting, standing) = {
+            let Ok(mut carrier) = held.carrier.lock() else {
+                return;
+            };
+            let ours = match &*carrier {
+                Some(
+                    Stance::Starting {
+                        connection: at,
+                        listen: on,
+                        ..
+                    }
+                    | Stance::Standing {
+                        connection: at,
+                        listen: on,
+                    },
+                ) => *at == connection && *on == listen,
+                None => false,
+            };
+            if !ours {
+                return;
+            }
+            let waiting = match carrier.take() {
+                Some(Stance::Starting { waiting, .. }) => waiting,
+                _ => Vec::new(),
+            };
+            let standing = match hauled {
+                Hauled::Stands => {
+                    *carrier = Some(Stance::Standing { connection, listen });
+                    Ok(())
+                }
+                Hauled::Cannot(why) => Err(why),
+                Hauled::Ended => Err("the carrier ended before it listened".to_owned()),
+            };
+            (waiting, standing)
+        };
+        held.changed.notify_all();
+        for then in waiting {
+            then(standing.clone());
+        }
+    }
+
+    /// Withdraws the carrier of `reverse`, starting or standing, for it to be
+    /// ended: the channel and port it was at. What waited for it is told it
+    /// was ended, a reverse asked again starts another, and what the
+    /// withdrawn one says of itself comes to nothing.
+    pub fn withdraw(&self, reverse: &Reverse) -> Option<(ConnectionId, Port)> {
+        let held = self.found(reverse)?;
+        let (at, waiting) = {
+            let mut carrier = held.carrier.lock().ok()?;
+            match carrier.take()? {
+                Stance::Starting {
+                    connection,
+                    listen,
+                    waiting,
+                } => ((connection, listen), waiting),
+                Stance::Standing { connection, listen } => ((connection, listen), Vec::new()),
+            }
+        };
+        held.changed.notify_all();
+        for then in waiting {
+            then(Err("its carrier was ended".to_owned()));
+        }
+        Some(at)
+    }
+
+    /// The channel and port of the carrier of `reverse` that stands.
+    pub fn standing(&self, reverse: &Reverse) -> Option<(ConnectionId, Port)> {
+        let held = self.found(reverse)?;
+        let carrier = held.carrier.lock().ok()?;
+        match &*carrier {
+            Some(Stance::Standing { connection, listen }) => Some((*connection, *listen)),
+            _ => None,
         }
     }
 
@@ -2608,16 +2882,18 @@ impl Carriage {
 
 /// Carries one connection the workstation's ADB server made to an endpoint,
 /// as a device asked, on to the remote through the carrier; anything else
-/// that connects is closed with nothing written.
+/// that connects is closed with nothing written. A connection that meets its
+/// carrier starting - the first, or one started again as the remote's channel
+/// returned - waits for it to stand, at most [`crate::PATIENCE`].
 fn through(stream: &TcpStream, carried: &Held, jobs: &Jobs) {
     let from_server = reach(&carried.server)
         .result
         .ok()
         .and_then(|server| owner(&server).ok().flatten())
         .is_some_and(|server| owner(stream).ok().flatten() == Some(server));
-    let held = carried.carrier.lock().ok().and_then(|carrier| *carrier);
-    let onward = held
-        .filter(|_| from_server)
+    let onward = from_server
+        .then(|| carried.standing(crate::PATIENCE))
+        .flatten()
         .and_then(|(connection, listen)| {
             let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, listen.number());
             let onward = TcpStream::connect_timeout(&address.into(), crate::PATIENCE).ok()?;

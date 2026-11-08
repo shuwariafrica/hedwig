@@ -8,11 +8,12 @@
 //! own server scans.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -120,6 +121,19 @@ impl Drop for Server {
 /// Where the client cannot be started.
 #[allow(clippy::expect_used, reason = "test scaffolding")]
 pub fn client(adb: &Path, host: &str, port: u16, arguments: &[&str]) -> Output {
+    started(adb, host, port, arguments)
+        .wait_with_output()
+        .expect("the client ends")
+}
+
+/// [`client`] left running, both its streams piped, for a suite that
+/// watches what happens while it waits for its answer.
+///
+/// # Panics
+///
+/// Where the client cannot be started.
+#[allow(clippy::expect_used, reason = "test scaffolding")]
+pub fn started(adb: &Path, host: &str, port: u16, arguments: &[&str]) -> Child {
     Command::new(adb)
         .args(["-H", host, "-P", &port.to_string()])
         .args(arguments)
@@ -127,7 +141,9 @@ pub fn client(adb: &Path, host: &str, port: u16, arguments: &[&str]) -> Output {
         .env("ADB_EMU", "0")
         .env("ADB_MDNS", "0")
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("the client starts")
 }
 
@@ -182,12 +198,103 @@ fn received(stream: &mut TcpStream) -> io::Result<(u32, u32, u32, Vec<u8>)> {
 
 /// A stand-in Android device, reached by a server as a device attached by
 /// `adb connect` is: it answers the server's `CNXN` with a banner naming its
-/// model, and echoes back what it is sent on every `tcp:` stream it is
-/// opened for. Every other service is closed at once.
+/// model, echoes back what it is sent on every `tcp:` stream it is opened
+/// for, and takes a `reverse:` request as adbd does - holding its answer
+/// while [`Device::hold_reverses`] says so. [`Device::reach`] opens a
+/// connection through a reverse as an app on the device does. Every other
+/// service is closed at once.
 pub struct Device {
     port: u16,
     opened: Arc<Mutex<Vec<String>>>,
     connections: Arc<Mutex<Vec<TcpStream>>>,
+    links: Arc<Mutex<Vec<Arc<Link>>>>,
+    reverses: Arc<Reverses>,
+}
+
+/// The device's reverses, each device side to the host side the server
+/// reaches for it, and whether the device's answers wait.
+#[derive(Default)]
+struct Reverses {
+    held: Mutex<BTreeMap<String, String>>,
+    holding: Mutex<bool>,
+    released: Condvar,
+    /// A file whose presence each `reverse:` request is noted with, as it
+    /// arrives.
+    witness: Mutex<Option<PathBuf>>,
+    witnessed: Mutex<Vec<(String, bool)>>,
+}
+
+impl Reverses {
+    fn note(&self, name: &str) {
+        let present = self
+            .witness
+            .lock()
+            .ok()
+            .and_then(|witness| witness.as_ref().map(|path| path.exists()));
+        if let (Some(present), Ok(mut witnessed)) = (present, self.witnessed.lock()) {
+            witnessed.push((name.to_owned(), present));
+        }
+    }
+
+    fn wait_released(&self) {
+        let Ok(mut holding) = self.holding.lock() else {
+            return;
+        };
+        while *holding {
+            let Ok(waited) = self.released.wait(holding) else {
+                return;
+            };
+            holding = waited;
+        }
+    }
+
+    /// adbd's answer to a reverse (`handle_forward_request`, on the device),
+    /// the reverse taken where it is one.
+    fn answer(&self, name: &str) -> Vec<u8> {
+        let refused = |words: &str| {
+            let mut answer = format!("FAIL{:04x}", words.len()).into_bytes();
+            answer.extend_from_slice(words.as_bytes());
+            answer
+        };
+        let Ok(mut held) = self.held.lock() else {
+            return refused("the stand-in device failed");
+        };
+        let request = name.strip_prefix("reverse:").unwrap_or(name);
+        if request == "killforward-all" {
+            held.clear();
+            return b"OKAY".to_vec();
+        }
+        if request == "list-forward" {
+            let mut listing = String::new();
+            for (local, host) in held.iter() {
+                let _ = writeln!(listing, "host-1 {local} {host}");
+            }
+            let mut answer = format!("OKAY{:04x}", listing.len()).into_bytes();
+            answer.extend_from_slice(listing.as_bytes());
+            return answer;
+        }
+        if let Some(local) = request.strip_prefix("killforward:") {
+            return if held.remove(local).is_some() {
+                b"OKAY".to_vec()
+            } else {
+                refused(&format!("listener '{local}' not found"))
+            };
+        }
+        let Some(forward) = request.strip_prefix("forward:") else {
+            return refused("not a reverse forwarding command");
+        };
+        let (norebind, body) = forward
+            .strip_prefix("norebind:")
+            .map_or((false, forward), |body| (true, body));
+        let Some((local, host)) = body.split_once(';') else {
+            return refused(&format!("bad forward: {body}"));
+        };
+        if norebind && held.contains_key(local) {
+            return refused("cannot rebind existing socket");
+        }
+        held.insert(local.to_owned(), host.to_owned());
+        b"OKAY".to_vec()
+    }
 }
 
 impl Device {
@@ -202,21 +309,41 @@ impl Device {
         );
         let opened: Arc<Mutex<Vec<String>>> = Arc::default();
         let connections: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
-        let (kept, held) = (Arc::clone(&opened), Arc::clone(&connections));
+        let links: Arc<Mutex<Vec<Arc<Link>>>> = Arc::default();
+        let reverses: Arc<Reverses> = Arc::default();
+        let (kept, held, linked, taken) = (
+            Arc::clone(&opened),
+            Arc::clone(&connections),
+            Arc::clone(&links),
+            Arc::clone(&reverses),
+        );
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
-                if let (Ok(clone), Ok(mut held)) = (stream.try_clone(), held.lock()) {
+                let (Ok(clone), Ok(out)) = (stream.try_clone(), stream.try_clone()) else {
+                    continue;
+                };
+                if let Ok(mut held) = held.lock() {
                     held.push(clone);
                 }
-                let (banner, kept) = (banner.clone(), Arc::clone(&kept));
-                thread::spawn(move || serve(stream, &banner, &kept));
+                let link = Arc::new(Link {
+                    out: Mutex::new(out),
+                    streams: Mutex::default(),
+                    changed: Condvar::new(),
+                });
+                if let Ok(mut linked) = linked.lock() {
+                    linked.push(Arc::clone(&link));
+                }
+                let (banner, kept, taken) = (banner.clone(), Arc::clone(&kept), Arc::clone(&taken));
+                thread::spawn(move || serve(stream, &link, &banner, &kept, &taken));
             }
         });
         Ok(Device {
             port,
             opened,
             connections,
+            links,
+            reverses,
         })
     }
 
@@ -246,81 +373,294 @@ impl Device {
             }
         }
     }
+
+    /// Each `reverse:` request from here is noted with whether `path` exists
+    /// as it arrives, before the device takes it or answers.
+    pub fn witness(&self, path: PathBuf) {
+        if let Ok(mut witness) = self.reverses.witness.lock() {
+            *witness = Some(path);
+        }
+    }
+
+    /// Each `reverse:` request noted since [`Device::witness`], with whether
+    /// the file was there as it arrived.
+    pub fn witnessed(&self) -> Vec<(String, bool)> {
+        self.reverses
+            .witnessed
+            .lock()
+            .map(|witnessed| witnessed.clone())
+            .unwrap_or_default()
+    }
+
+    /// While `holding`, the device takes no reverse and answers none until
+    /// this is called again without it.
+    pub fn hold_reverses(&self, holding: bool) {
+        if let Ok(mut held) = self.reverses.holding.lock() {
+            *held = holding;
+        }
+        self.reverses.released.notify_all();
+    }
+
+    /// Opens a connection at the device's side of the reverse at `local`, as
+    /// an app on the device does: the device asks the server for the host
+    /// side the reverse names, sends `sent`, and gives back as many bytes as
+    /// came back, or what came before the server closed the connection -
+    /// nothing where the device holds no such reverse.
+    pub fn reach(&self, local: &str, sent: &[u8]) -> Vec<u8> {
+        let host = self
+            .reverses
+            .held
+            .lock()
+            .ok()
+            .and_then(|held| held.get(local).cloned());
+        let link = self
+            .links
+            .lock()
+            .ok()
+            .and_then(|links| links.last().cloned());
+        let (Some(host), Some(link)) = (host, link) else {
+            return Vec::new();
+        };
+        let ours = link.open(
+            0,
+            Role::Reaching {
+                got: Vec::new(),
+                closed: false,
+            },
+        );
+        let mut name = host.into_bytes();
+        name.push(0);
+        let theirs = link
+            .put(OPEN, ours, 0, &name)
+            .then(|| {
+                link.until(ours, |opened| match &opened.role {
+                    Role::Reaching { closed: true, .. } => Some(None),
+                    _ if opened.theirs != 0 => Some(Some(opened.theirs)),
+                    _ => None,
+                })
+            })
+            .flatten()
+            .flatten();
+        let got = theirs
+            .filter(|theirs| link.put(WRTE, ours, *theirs, sent))
+            .and_then(|_| {
+                link.until(ours, |opened| match &opened.role {
+                    Role::Reaching { got, closed } if *closed || got.len() >= sent.len() => {
+                        Some(got.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        if let Some(theirs) = theirs {
+            let _ = link.put(CLSE, ours, theirs, &[]);
+        }
+        link.forget(ours);
+        got
+    }
 }
 
-/// One stream a server opened on the device: the server's id for it, whether
-/// a write of ours waits for its `OKAY`, and what waits behind that.
+/// One server's connection to the device: where packets to it are written,
+/// and each stream open on it, by the device's id for it.
+struct Link {
+    out: Mutex<TcpStream>,
+    streams: Mutex<Streams>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Streams {
+    last: u32,
+    open: BTreeMap<u32, Opened>,
+}
+
+/// One stream on a link: the server's id for it, 0 until the server took
+/// one the device opened; whether a write of ours waits for its `OKAY`, and
+/// what waits behind that; and what the stream is.
 struct Opened {
     theirs: u32,
     waiting: bool,
     queued: VecDeque<Vec<u8>>,
+    role: Role,
 }
 
-fn serve(mut stream: TcpStream, banner: &str, opened: &Mutex<Vec<String>>) {
-    let Ok(mut out) = stream.try_clone() else {
-        return;
-    };
-    let mut streams: BTreeMap<u32, Opened> = BTreeMap::new();
-    let mut next = 1u32;
-    let mut put = |command: u32, first: u32, second: u32, data: &[u8]| {
-        out.write_all(&packet(command, first, second, data)).is_ok()
-    };
+enum Role {
+    /// Opened by the server for a `tcp:` socket: what it is sent comes back.
+    Echo,
+    /// Opened by the server for a `reverse:`: closed once its answer is
+    /// taken.
+    Answering,
+    /// Opened by the device through a reverse: what came back, and whether
+    /// the server closed it.
+    Reaching { got: Vec<u8>, closed: bool },
+}
+
+impl Link {
+    fn put(&self, command: u32, first: u32, second: u32, data: &[u8]) -> bool {
+        self.out
+            .lock()
+            .is_ok_and(|mut out| out.write_all(&packet(command, first, second, data)).is_ok())
+    }
+
+    fn open(&self, theirs: u32, role: Role) -> u32 {
+        let Ok(mut streams) = self.streams.lock() else {
+            return 0;
+        };
+        streams.last += 1;
+        let ours = streams.last;
+        streams.open.insert(
+            ours,
+            Opened {
+                theirs,
+                waiting: false,
+                queued: VecDeque::new(),
+                role,
+            },
+        );
+        ours
+    }
+
+    fn forget(&self, ours: u32) {
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.open.remove(&ours);
+        }
+    }
+
+    /// The server wrote on stream `second`.
+    fn wrote(&self, first: u32, second: u32, data: &[u8]) -> bool {
+        let Ok(mut streams) = self.streams.lock() else {
+            return false;
+        };
+        let Some(opened) = streams.open.get_mut(&second) else {
+            return self.put(CLSE, 0, first, &[]);
+        };
+        let theirs = opened.theirs;
+        let acked = self.put(OKAY, second, theirs, &[]);
+        match &mut opened.role {
+            Role::Echo if opened.waiting => {
+                opened.queued.push_back(data.to_vec());
+                acked
+            }
+            Role::Echo => {
+                opened.waiting = true;
+                acked && self.put(WRTE, second, theirs, data)
+            }
+            Role::Reaching { got, .. } => {
+                got.extend_from_slice(data);
+                self.changed.notify_all();
+                acked
+            }
+            Role::Answering => acked,
+        }
+    }
+
+    /// The server's `OKAY` on stream `second`: its answer to a stream the
+    /// device opened, or its taking of what the device wrote.
+    fn okayed(&self, first: u32, second: u32) -> bool {
+        let Ok(mut streams) = self.streams.lock() else {
+            return false;
+        };
+        let Some(opened) = streams.open.get_mut(&second) else {
+            return true;
+        };
+        if opened.theirs == 0 {
+            opened.theirs = first;
+            self.changed.notify_all();
+            return true;
+        }
+        let theirs = opened.theirs;
+        if matches!(opened.role, Role::Answering) {
+            streams.open.remove(&second);
+            return self.put(CLSE, second, theirs, &[]);
+        }
+        if let Some(data) = opened.queued.pop_front() {
+            return self.put(WRTE, second, theirs, &data);
+        }
+        opened.waiting = false;
+        true
+    }
+
+    fn closed(&self, second: u32) {
+        if let Ok(mut streams) = self.streams.lock() {
+            match streams.open.get_mut(&second) {
+                Some(Opened {
+                    role: Role::Reaching { closed, .. },
+                    ..
+                }) => *closed = true,
+                _ => {
+                    streams.open.remove(&second);
+                }
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    /// The server's connection ended, and every stream with it.
+    fn lost(&self) {
+        if let Ok(mut streams) = self.streams.lock() {
+            for opened in streams.open.values_mut() {
+                if let Role::Reaching { closed, .. } = &mut opened.role {
+                    *closed = true;
+                }
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    /// What `found` makes of stream `ours` once it makes anything of it,
+    /// waiting up to twenty seconds.
+    fn until<T>(&self, ours: u32, found: impl Fn(&Opened) -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut streams = self.streams.lock().ok()?;
+        loop {
+            if let Some(made) = streams.open.get(&ours).and_then(&found) {
+                return Some(made);
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            streams = self.changed.wait_timeout(streams, left).ok()?.0;
+        }
+    }
+}
+
+fn serve(
+    mut stream: TcpStream,
+    link: &Arc<Link>,
+    banner: &str,
+    opened: &Mutex<Vec<String>>,
+    reverses: &Arc<Reverses>,
+) {
     while let Ok((command, first, second, data)) = received(&mut stream) {
         let sent = match command {
-            CNXN => put(CNXN, VERSION, MAX_PAYLOAD, banner.as_bytes()),
+            CNXN => link.put(CNXN, VERSION, MAX_PAYLOAD, banner.as_bytes()),
             OPEN => {
                 let name = String::from_utf8_lossy(&data)
                     .trim_end_matches('\0')
                     .to_owned();
-                let echoes = name.starts_with("tcp:");
                 if let Ok(mut opened) = opened.lock() {
-                    opened.push(name);
+                    opened.push(name.clone());
                 }
-                if echoes {
-                    let ours = next;
-                    next += 1;
-                    streams.insert(
-                        ours,
-                        Opened {
-                            theirs: first,
-                            waiting: false,
-                            queued: VecDeque::new(),
-                        },
-                    );
-                    put(OKAY, ours, first, &[])
-                } else {
-                    put(CLSE, 0, first, &[])
-                }
-            }
-            WRTE => match streams.get_mut(&second) {
-                Some(echoing) => {
-                    let theirs = echoing.theirs;
-                    let acked = put(OKAY, second, theirs, &[]);
-                    if echoing.waiting {
-                        echoing.queued.push_back(data);
-                        acked
-                    } else {
-                        echoing.waiting = true;
-                        acked && put(WRTE, second, theirs, &data)
-                    }
-                }
-                None => put(CLSE, 0, first, &[]),
-            },
-            OKAY => {
-                if let Some(echoing) = streams.get_mut(&second) {
-                    if let Some(data) = echoing.queued.pop_front() {
-                        let theirs = echoing.theirs;
-                        put(WRTE, second, theirs, &data)
-                    } else {
-                        echoing.waiting = false;
-                        true
-                    }
-                } else {
+                if name.starts_with("tcp:") {
+                    let ours = link.open(first, Role::Echo);
+                    link.put(OKAY, ours, first, &[])
+                } else if name.starts_with("reverse:") {
+                    reverses.note(&name);
+                    let ours = link.open(first, Role::Answering);
+                    let (link, reverses) = (Arc::clone(link), Arc::clone(reverses));
+                    thread::spawn(move || {
+                        reverses.wait_released();
+                        let answer = reverses.answer(&name);
+                        let _ = link.put(OKAY, ours, first, &[])
+                            && link.put(WRTE, ours, first, &answer);
+                    });
                     true
+                } else {
+                    link.put(CLSE, 0, first, &[])
                 }
             }
+            WRTE => link.wrote(first, second, &data),
+            OKAY => link.okayed(first, second),
             CLSE => {
-                streams.remove(&second);
+                link.closed(second);
                 true
             }
             _ => true,
@@ -329,6 +669,7 @@ fn serve(mut stream: TcpStream, banner: &str, opened: &Mutex<Vec<String>>) {
             break;
         }
     }
+    link.lost();
     let _ = stream.shutdown(Shutdown::Both);
 }
 

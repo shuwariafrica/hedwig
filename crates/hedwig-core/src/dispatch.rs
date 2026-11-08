@@ -365,14 +365,21 @@ pub enum Effect {
     Refuse { knock: Knock },
     /// Give the reverse the relayed connection holds the endpoint its remote
     /// and capability have for its target, bound now where they have none,
-    /// which the capability's ADB server at `server` reaches it through.
+    /// which the capability's ADB server at `server` reaches it through -
+    /// once the endpoint's carrier stands in `carrier.connection`'s channel,
+    /// started there where none does. Only then is the device asked.
     Endpoint {
         knock: Knock,
         reverse: Reverse,
         server: Service,
+        carrier: Carrier,
     },
-    /// Refuse the reverse the relayed connection holds.
+    /// Refuse the reverse or forward the relayed connection holds.
     Withhold { knock: Knock, withheld: Withheld },
+    /// Tell the relayed connection that nothing can carry the reverse it
+    /// holds, for `why`: one held is never sent to the device; of one the
+    /// device took, its answer is not given.
+    Unhauled { knock: Knock, why: &'static str },
     /// Have the connection's last survey seal Hedwig's private folder on the
     /// remote, now that the channel's forwards are bound there.
     Seal { connection: ConnectionId },
@@ -390,16 +397,20 @@ pub enum Effect {
     },
     /// Stop carrying the relayed connection's callback, and end its carrier.
     Uncall { knock: Knock },
-    /// Carry the endpoint of `reverse` on to its remote: the route's client
-    /// again, in `connection`'s job, with a local forward to its target.
+    /// Have the carrier of `reverse`'s endpoint - the route's client again
+    /// with a local forward to its target - stand in `carrier.connection`'s
+    /// channel: at once where it stands there, started there where none does.
+    /// The relayed connection at `knock` is then given the device's answer to
+    /// it, or told that it cannot stand: why no carrier can be started, where
+    /// `carrier` says so.
     Haul {
-        connection: ConnectionId,
+        knock: Option<Knock>,
         reverse: Reverse,
-        client: Client,
-        address: Address,
-        asking: Asking,
-        keepalive: Keepalive,
+        carrier: Result<Carrier, &'static str>,
     },
+    /// End the carrier of `reverse`, which neither a recorded reverse nor a
+    /// held one uses.
+    Unhaul { reverse: Reverse },
     /// Place the forward the relayed connection holds on the remote at
     /// `port`, 0 for one the remote's server chooses: the route's client
     /// again, in `carrier.connection`'s job, with a remote forward to an
@@ -669,6 +680,10 @@ struct Streamed {
     used_card: bool,
     /// For an ADB connection: what its grant lent when it was last told.
     lending: Option<crate::adb::Lending>,
+    /// For an ADB connection: the reverse it holds that the device has not
+    /// taken, whose place among its remote's [`crate::adb::CARRIED`] is given
+    /// back where the connection ends holding it.
+    reversing: Option<Reverse>,
     /// For a serial connection: the port its capability names, the opening
     /// once it is settled, and whether the port was opened for it.
     port: Option<Taking>,
@@ -2187,6 +2202,7 @@ impl Core {
                 asking_card: false,
                 used_card: false,
                 lending,
+                reversing: None,
                 port,
                 served: None,
             },
@@ -2325,8 +2341,8 @@ impl Core {
             | Relayed::Browsed(_)
             | Relayed::Called
             | Relayed::Expired) => self.browsing(step, now, knock, &streamed, remote, browsing),
-            Relayed::Reversed { target, endpoint } => {
-                self.reversed(step, now, &streamed, target, endpoint);
+            Relayed::Reversed { endpoint, .. } => {
+                self.reversed(step, now, knock, &streamed, endpoint);
             }
             asking @ (Relayed::Misasked(_)
             | Relayed::Erased(_)
@@ -2360,6 +2376,9 @@ impl Core {
             }
             Relayed::Ended => {
                 let ended = self.streams.remove(&knock);
+                if let Some(reverse) = ended.as_ref().and_then(|ended| ended.reversing.clone()) {
+                    self.unreverse(step, reverse);
+                }
                 if let Some(ended) = ended.as_ref().filter(|ended| {
                     ended.used_card && self.cards_stale.contains_key(&ended.capability)
                 }) {
@@ -2452,8 +2471,9 @@ impl Core {
     }
 
     /// A reverse a relayed ADB connection holds: given the endpoint its
-    /// remote has for the target, or one bound now, unless the remote has as
-    /// many as it may.
+    /// remote has for the target, or one bound now, once its carrier stands
+    /// in the connection's channel - unless the remote has as many as it may,
+    /// or nothing can carry it.
     fn reverse(
         &mut self,
         step: &mut Step,
@@ -2467,12 +2487,18 @@ impl Core {
             .link(streamed.connection)
             .map(|link| link.remote.clone())
         else {
+            let why = "the remote's channel is down";
+            step.effects.push(Effect::Unhauled { knock, why });
             return;
         };
-        let Some(Relaying::Adb {
-            service: server, ..
-        }) = self.relaying(streamed.connection, &streamed.capability)
-        else {
+        let Some(server) = self.server(&streamed.capability) else {
+            let why = "its capability no longer names an ADB server";
+            step.effects.push(Effect::Unhauled { knock, why });
+            return;
+        };
+        let Some(carrier) = self.carrier(streamed.connection, &remote) else {
+            let why = "the remote's route is no longer defined";
+            step.effects.push(Effect::Unhauled { knock, why });
             return;
         };
         let asked = (streamed.capability.clone(), Slot::Reverse(target.clone()));
@@ -2483,16 +2509,47 @@ impl Core {
             .entry(remote.clone())
             .or_default()
             .insert(asked);
-        let capability = streamed.capability.clone();
+        let reverse = Reverse {
+            remote,
+            capability: streamed.capability.clone(),
+            target,
+        };
+        if let Some(held) = self.streams.get_mut(&knock) {
+            held.reversing = Some(reverse.clone());
+        }
         step.effects.push(Effect::Endpoint {
             knock,
-            reverse: Reverse {
-                remote,
-                capability,
-                target,
-            },
+            reverse,
             server,
+            carrier,
         });
+    }
+
+    /// A reverse nothing records, held by a connection that ended: its place
+    /// among its remote's [`crate::adb::CARRIED`] is given back and
+    /// its carrier ends, where no recorded reverse and no other held one uses
+    /// the target. Its endpoint stays, as the server may still name it.
+    fn unreverse(&mut self, step: &mut Step, reverse: Reverse) {
+        let recorded = self
+            .state
+            .carried(&reverse.remote, &reverse.capability)
+            .is_some_and(|carried| {
+                carried.contains_key(&Carriage::Reverse(reverse.target.clone()))
+            });
+        let held = self
+            .streams
+            .values()
+            .any(|streamed| streamed.reversing.as_ref() == Some(&reverse));
+        if recorded || held {
+            return;
+        }
+        if let Some(carrying) = self.carrying.get_mut(&reverse.remote) {
+            carrying.remove(&(
+                reverse.capability.clone(),
+                Slot::Reverse(reverse.target.clone()),
+            ));
+        }
+        step.effects.push(Effect::Unhaul { reverse });
     }
 
     /// What the credential relay says of a connection.
@@ -2769,44 +2826,71 @@ impl Core {
         step.effects.push(Effect::Uncall { knock });
     }
 
-    /// The device took a reverse: recorded where it is new, and carried on
-    /// to the remote through its channel.
+    /// The device took the reverse the connection holds: recorded where it is
+    /// new, and the device's answer released to the remote once the record is
+    /// written and the reverse's carrier stands in the remote's live channel,
+    /// started again there where it is gone. Where the remote has no live
+    /// channel to record it by, the remote is told only that nothing carries
+    /// it, and its place is given back as its connection ends
+    /// ([`Self::unreverse`]); where the core holds no record of asking for it,
+    /// the remote is told the same.
     fn reversed(
         &mut self,
         step: &mut Step,
         now: Now,
+        knock: Knock,
         streamed: &Streamed,
-        target: Target,
         endpoint: Port,
     ) {
-        let Some(remote) = self
-            .state
-            .link(streamed.connection)
-            .map(|link| link.remote.clone())
-        else {
+        let Some(reverse) = streamed.reversing.clone() else {
+            let why = "Hedwig holds no record of asking the device for it";
+            step.effects.push(Effect::Unhauled { knock, why });
             return;
         };
-        let carriage = Carriage::Reverse(target.clone());
+        let live = self
+            .state
+            .connection(&reverse.remote)
+            .map(|(connection, _)| connection);
+        // The asking connection's, while its channel is up; else the one that
+        // took its place.
+        let recording = self
+            .state
+            .link(streamed.connection)
+            .map(|_| streamed.connection)
+            .or(live);
+        let (Some(connection), Some(live)) = (recording, live) else {
+            // No connection to record it by, and nothing to carry it.
+            let why = "the remote's channel is down";
+            step.effects.push(Effect::Unhauled { knock, why });
+            return;
+        };
+        let carriage = Carriage::Reverse(reverse.target.clone());
         let known = self
             .state
-            .carried(&remote, &streamed.capability)
+            .carried(&reverse.remote, &reverse.capability)
             .and_then(|carried| carried.get(&carriage))
             == Some(&endpoint);
         if !known {
             let carried = Event::Carried {
-                connection: streamed.connection,
-                capability: streamed.capability.clone(),
+                connection,
+                capability: reverse.capability.clone(),
                 carriage,
                 endpoint,
             };
             self.record(step, now, carried);
         }
-        let reverse = Reverse {
-            remote,
-            capability: streamed.capability.clone(),
-            target,
-        };
-        self.haul(step, streamed.connection, reverse);
+        // Taken: its place is the record's from here.
+        if let Some(held) = self.streams.get_mut(&knock) {
+            held.reversing = None;
+        }
+        let carrier = self
+            .carrier(live, &reverse.remote)
+            .ok_or("the remote's route is no longer defined");
+        step.effects.push(Effect::Haul {
+            knock: Some(knock),
+            reverse,
+            carrier,
+        });
     }
 
     /// Whether `asked` would carry more on to `remote` than it may have:
@@ -3349,27 +3433,6 @@ impl Core {
             let view = self.viewed.get(&capability).cloned();
             self.consoles(step, now, &capability, view.as_ref());
         }
-    }
-
-    /// Has `connection`'s channel carry the endpoint of `reverse` on to its
-    /// remote.
-    fn haul(&self, step: &mut Step, connection: ConnectionId, reverse: Reverse) {
-        let Ok(client) = self
-            .configuration
-            .route(&self.catalogue, &reverse.remote.route)
-            .map(|route| route.client.clone())
-        else {
-            return;
-        };
-        let (asking, keepalive) = self.asking(&reverse.remote);
-        step.effects.push(Effect::Haul {
-            connection,
-            address: reverse.remote.address.clone(),
-            reverse,
-            client,
-            asking,
-            keepalive,
-        });
     }
 
     fn asked_event(streamed: &Streamed, operation: Operation, key: Option<KeyId>) -> Event {
@@ -4121,8 +4184,14 @@ impl Core {
                     })
             })
             .collect();
-        for reverse in reverses {
-            self.haul(step, connection, reverse);
+        if let Some(carrier) = self.carrier(connection, &remote) {
+            for reverse in reverses {
+                step.effects.push(Effect::Haul {
+                    knock: None,
+                    reverse,
+                    carrier: Ok(carrier.clone()),
+                });
+            }
         }
         self.replace(step, now, connection, &remote, &serving);
     }

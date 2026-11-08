@@ -200,15 +200,28 @@ pub enum Heard {
     /// The client would not go on without the person confirming the host's
     /// key.
     Unverified,
+    /// The client entered its session, every local forward it could bind
+    /// listening: said only by a client made to, as a carrier with a local
+    /// forward is ([`CARRIER_SAYS`]).
+    Entered,
+    /// The client cannot listen at this workstation port for a local forward.
+    Unlistened {
+        port: u16,
+    },
     Other,
 }
 
 /// What marks a line the client was made to say about a forward's answer.
 const ANSWERS: &str = ":ssh_confirm_remote_forward():";
 
+/// What marks a line the client was made to say from its session's loop.
+const ENTERED: &str = ":client_loop():";
+
 /// Reads one line. The words are OpenSSH's own and are not translated
-/// (`ssh.c:1839`, `sshconnect.c:1675` and `:1680`, `sshconnect2.c:109` at
-/// v9.5.0.0; the same at v10.0.0.0).
+/// (`ssh.c:1839`, `sshconnect.c:1675` and `:1680`, `sshconnect2.c:109`,
+/// `clientloop.c:1460`, `channels.c:3892` at v9.5.0.0; `ssh.c:1965`,
+/// `sshconnect.c:1716` and `:1721`, `sshconnect2.c:107`, `clientloop.c:1463`,
+/// `channels.c:3954` at v10.0.0.0).
 pub fn heard(line: &str) -> Heard {
     let answered = |word: &str| {
         let (said, port) = line.rsplit_once(", connect 127.0.0.1:")?;
@@ -227,6 +240,13 @@ pub fn heard(line: &str) -> Heard {
         }
     } else if let Some(allocated) = allocated(line) {
         allocated
+    } else if line.contains(ENTERED) && line.ends_with("): Entering interactive session.") {
+        Heard::Entered
+    } else if let Some(port) = line
+        .strip_prefix("channel_setup_fwd_listener_tcpip: cannot listen to port: ")
+        .and_then(|port| port.trim().parse().ok())
+    {
+        Heard::Unlistened { port }
     } else if line.contains("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!") {
         Heard::Changed
     } else if line.starts_with("The fingerprint for the ")
@@ -419,14 +439,23 @@ pub struct Hauling {
     pub keepalive: Keepalive,
 }
 
-/// Everything a carrier is started with between what the route's entry puts
-/// before and after: what a channel is started with, with no forward of the
-/// remote's and one local forward to the target, on the workstation's
-/// loopback. The person's own forwards bind or fail on their own account, as
-/// on the channel.
+/// What a carrier with a local forward - a reverse's, or a sign-in's
+/// callback's - is made to say in place of [`SET`]'s `LogVerbose`: beside the
+/// server's answer for each forward, the line `client_loop()` begins with,
+/// said once `ssh_init_forwarding` has bound every local forward that could
+/// be. That line is the core's knowledge that the carrier listens. A channel
+/// is not made to say it: the same function's lines at the client's end would
+/// become a channel's account of its ending.
+pub const CARRIER_SAYS: &str = "LogVerbose=*:ssh_confirm_remote_forward():*,*:client_loop():*";
+
+/// Everything a carrier with a local forward is started with between what the
+/// route's entry puts before and after: what a channel is started with, made to say
+/// [`CARRIER_SAYS`], with no forward of the remote's and one local forward to
+/// the target, on the workstation's loopback. The person's own forwards bind
+/// or fail on their own account, as on the channel.
 ///
 /// ```
-/// use hedwig_core::channel::haul;
+/// use hedwig_core::channel::{CARRIER_SAYS, haul};
 /// use hedwig_model::setting::Keepalive;
 /// use hedwig_model::text::Port;
 /// use hedwig_model::trail::{Asking, Target};
@@ -434,13 +463,30 @@ pub struct Hauling {
 /// let metro = Target::Loopback(Port::try_from(8081)?);
 /// let options = haul(&metro, Port::try_from(50140)?, Asking::Nobody, Keepalive::SHIPS);
 /// assert_eq!(options.first().map(String::as_str), Some("-N"));
+/// let said: Vec<&String> = options.iter().filter(|option| option.starts_with("LogVerbose=")).collect();
+/// assert_eq!(said, [CARRIER_SAYS]);
 /// assert!(options.ends_with(&["-L".to_owned(), "127.0.0.1:50140:localhost:8081".to_owned()]));
 /// # Ok::<(), hedwig_model::text::TextError>(())
 /// ```
 pub fn haul(target: &Target, listen: Port, asking: Asking, keepalive: Keepalive) -> Vec<String> {
     let mut options = options(&[], asking, keepalive);
+    for option in &mut options {
+        if option.starts_with("LogVerbose=") {
+            CARRIER_SAYS.clone_into(option);
+        }
+    }
     options.extend(["-L".to_owned(), crate::adb::local_forward(target, listen)]);
     options
+}
+
+/// What a carrier with a local forward says of itself: it listens there, or
+/// it cannot, in OpenSSH's words or the core's; and, where its process ran,
+/// last that it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hauled {
+    Stands,
+    Cannot(String),
+    Ended,
 }
 
 /// What the deciding thread asked a carrier that listens on the remote to be
@@ -497,8 +543,46 @@ struct Live {
 }
 
 /// Each carrier the core can end before its channel ends, by its channel and
-/// the port it listens on.
-type Carriers = Arc<Mutex<BTreeMap<(ConnectionId, Port), Arc<Held>>>>;
+/// the port it listens on; one with a local forward is known from before its
+/// thread starts.
+type Carriers = Arc<Mutex<BTreeMap<(ConnectionId, Port), Carrying>>>;
+
+/// A carrier's process: still being made, and whether it is to be ended once
+/// it is; or running.
+enum Carrying {
+    Starting { ended: bool },
+    Running(Arc<Held>),
+}
+
+/// `key` is a carrier whose process is being made.
+fn starting(carriers: &Carriers, key: (ConnectionId, Port)) {
+    if let Ok(mut carriers) = carriers.lock() {
+        carriers.insert(key, Carrying::Starting { ended: false });
+    }
+}
+
+/// `client` is `key`'s process: kept to be ended, or ended now and forgotten
+/// where its end was asked for while it was being made.
+fn running(carriers: &Carriers, key: (ConnectionId, Port), client: &Arc<Held>) {
+    let ended = carriers.lock().is_ok_and(|mut carriers| {
+        if matches!(carriers.get(&key), Some(Carrying::Starting { ended: true })) {
+            carriers.remove(&key);
+            return true;
+        }
+        carriers.insert(key, Carrying::Running(Arc::clone(client)));
+        false
+    });
+    if ended {
+        let _ = client.end(1);
+    }
+}
+
+/// `key` is no carrier's any more.
+fn gone(carriers: &Carriers, key: (ConnectionId, Port)) {
+    if let Ok(mut carriers) = carriers.lock() {
+        carriers.remove(&key);
+    }
+}
 
 /// The channels the core holds.
 pub struct Channels {
@@ -634,18 +718,39 @@ impl Channels {
         thread::spawn(move || exercised(&order, &setting, &job, &messages));
     }
 
-    /// Starts a carrier in the connection's job, where its channel is live;
-    /// it ends with the channel.
-    pub fn haul(&mut self, order: Hauling) {
-        if !self.live.contains_key(&order.connection) {
-            return;
-        }
-        let Some((job, _)) = self.live(order.connection) else {
-            return;
+    /// Starts a carrier with a local forward - a reverse's, or a sign-in's
+    /// callback's - in the connection's job, where its channel is live; it
+    /// ends with the channel. `told` is given whether it stands - once it says
+    /// it listens, or why it cannot - and, where its process ran, last its end.
+    pub fn haul(&mut self, order: Hauling, told: impl Fn(Hauled) + Send + Sync + 'static) {
+        let job = self
+            .live
+            .contains_key(&order.connection)
+            .then(|| self.live(order.connection))
+            .flatten();
+        let Some((job, stop)) = job else {
+            return told(Hauled::Cannot("the remote's channel is down".to_owned()));
         };
+        starting(&self.carriers, (order.connection, order.listen));
         let (setting, messages) = (Arc::clone(&self.setting), self.messages.clone());
         let carriers = Arc::clone(&self.carriers);
-        thread::spawn(move || carrier(&order, &setting, &job, &carriers, &messages));
+        let told: Arc<dyn Fn(Hauled) + Send + Sync> = Arc::new(told);
+        thread::spawn(move || {
+            carrier(&order, &setting, &job, &stop, &carriers, &messages, &told);
+        });
+    }
+
+    /// Whether the carrier of `connection`'s channel that listens at `listen`
+    /// is starting or runs: one whose process ended is gone, though its end
+    /// may not have been told yet.
+    pub fn hauls(&self, connection: ConnectionId, listen: Port) -> bool {
+        self.carriers
+            .lock()
+            .is_ok_and(|carriers| match carriers.get(&(connection, listen)) {
+                Some(Carrying::Running(held)) => !held.finished(),
+                Some(Carrying::Starting { .. }) => true,
+                None => false,
+            })
     }
 
     /// Starts a carrier that listens on the remote in the connection's job,
@@ -673,15 +778,22 @@ impl Channels {
     }
 
     /// Ends the carrier of `connection`'s channel that listens at `listen`,
-    /// and nothing else in its job.
+    /// and nothing else in its job: at once where it runs, once its process
+    /// is made where it is starting.
     pub fn unhaul(&mut self, connection: ConnectionId, listen: Port) {
-        let held = self
-            .carriers
-            .lock()
-            .ok()
-            .and_then(|mut carriers| carriers.remove(&(connection, listen)));
-        if let Some(held) = held {
-            let _ = held.end(1);
+        let key = (connection, listen);
+        let client = self.carriers.lock().ok().and_then(|mut carriers| {
+            if let Some(Carrying::Starting { ended }) = carriers.get_mut(&key) {
+                *ended = true;
+                return None;
+            }
+            match carriers.remove(&key)? {
+                Carrying::Running(held) => Some(held),
+                Carrying::Starting { .. } => None,
+            }
+        });
+        if let Some(client) = client {
+            let _ = client.end(1);
         }
     }
 
@@ -694,12 +806,18 @@ impl Channels {
             sealers.remove(&connection);
         }
         if let Some(live) = self.live.remove(&connection) {
-            // The signal first: a client started after the job was emptied
-            // is ended by the thread that started it.
-            let _ = live.stop.raise();
-            let _ = live.job.end();
+            end_job(&live.job, &live.stop);
         }
     }
+}
+
+/// Ends a channel's job, its stop raised first: a carrier whose client joins
+/// the job once it is emptied finds the stop raised and ends that client
+/// itself ([`carrier`]). Both ends of a channel - the end asked for and its
+/// client's own - go through here.
+fn end_job(job: &Job, stop: &Signal) {
+    let _ = stop.raise();
+    let _ = job.end();
 }
 
 /// Waits at one forward's end. Each connection is handed to the deciding
@@ -814,7 +932,7 @@ fn run_script(
     let reading = {
         let messages = messages.clone();
         let names = BTreeMap::new();
-        thread::spawn(move || listen(connection, errors, &names, &messages, None))
+        thread::spawn(move || listen(connection, errors, &names, &messages, None, None))
     };
     let (begun, begins) = mpsc::channel::<()>();
     let (ended, report) = mpsc::channel::<String>();
@@ -984,17 +1102,26 @@ fn unaccounted() -> Words {
         .unwrap_or_else(|| unreachable!("fixed words are valid words"))
 }
 
-/// Holds one carrier until it ends. Its prompts are its connection's, and
-/// what it says is read as a channel's client's is.
+/// Holds one carrier with a local forward until it ends, telling `told`
+/// whether it stands and, where its process ran, last its end. A carrier that
+/// cannot listen carries nothing and is ended, as is one made once its
+/// channel has ended. Its prompts are its connection's, and what it says is
+/// read as a channel's client's is.
 fn carrier(
     order: &Hauling,
     setting: &Setting,
     job: &Arc<Job>,
+    stop: &Signal,
     carriers: &Carriers,
     messages: &Sender<Message>,
+    told: &Arc<dyn Fn(Hauled) + Send + Sync>,
 ) {
+    let key = (order.connection, order.listen);
     let Ok((program, _)) = found(&order.client, setting) else {
-        return;
+        gone(carriers, key);
+        return told(Hauled::Cannot(
+            "no folder on the search path holds the route's client".to_owned(),
+        ));
     };
     let arguments: Vec<OsString> = order
         .client
@@ -1006,23 +1133,53 @@ fn carrier(
         .map(OsString::from)
         .collect();
     let Ok((client, errors)) = held(&program, &arguments, &setting.environment, job) else {
-        return;
+        gone(carriers, key);
+        return told(Hauled::Cannot(
+            "the route's client could not be started".to_owned(),
+        ));
     };
     let client = Arc::new(client);
-    let key = (order.connection, order.listen);
-    if let Ok(mut carriers) = carriers.lock() {
-        carriers.insert(key, Arc::clone(&client));
+    running(carriers, key, &client);
+    // The channel has ended, and its end may have emptied the job before this
+    // client joined it: the job is ended again, with whatever the client
+    // started.
+    if stop.raised() {
+        let _ = job.end();
+        let _ = client.wait();
+        gone(carriers, key);
+        told(Hauled::Cannot("the remote's channel is down".to_owned()));
+        return told(Hauled::Ended);
     }
+    let stand = {
+        let (told, ending) = (Arc::clone(told), Arc::clone(&client));
+        Stand {
+            listen: order.listen.number(),
+            told: Box::new(move |hauled: Hauled| {
+                if matches!(hauled, Hauled::Cannot(_)) {
+                    let _ = ending.end(1);
+                }
+                told(hauled);
+            }),
+        }
+    };
     let reading = {
         let messages = messages.clone();
         let connection = order.connection;
-        thread::spawn(move || listen(connection, errors, &BTreeMap::new(), &messages, None))
+        thread::spawn(move || {
+            listen(
+                connection,
+                errors,
+                &BTreeMap::new(),
+                &messages,
+                None,
+                Some(stand),
+            )
+        })
     };
     let _ = client.wait();
-    if let Ok(mut carriers) = carriers.lock() {
-        carriers.remove(&key);
-    }
+    gone(carriers, key);
     let _ = reading.join();
+    told(Hauled::Ended);
 }
 
 /// Holds one carrier that listens on the remote until it ends, giving
@@ -1054,9 +1211,7 @@ fn placer(
     };
     let client = Arc::new(client);
     let key = (order.connection, order.listen);
-    if let Ok(mut carriers) = carriers.lock() {
-        carriers.insert(key, Arc::clone(&client));
-    }
+    running(carriers, key, &client);
     let endpoint = order.listen.number();
     let mut placed = Some(placed);
     let mut reader = BufReader::new(errors);
@@ -1098,9 +1253,7 @@ fn placer(
         ));
     }
     let _ = client.wait();
-    if let Ok(mut carriers) = carriers.lock() {
-        carriers.remove(&key);
-    }
+    gone(carriers, key);
 }
 
 /// Holds one channel from its start to its client's end.
@@ -1179,15 +1332,23 @@ fn hold(
     }
     let reading = {
         let (messages, diagnostics) = (messages.clone(), diagnostics.cloned());
-        thread::spawn(move || listen(connection, errors, &names, &messages, diagnostics.as_ref()))
+        thread::spawn(move || {
+            listen(
+                connection,
+                errors,
+                &names,
+                &messages,
+                diagnostics.as_ref(),
+                None,
+            )
+        })
     };
     let status = client.wait().map_or(-1, u32::cast_signed);
     // Asked to end, the channel's words are not a fault's account.
     let asked = stop.raised();
     // Whatever the client started and left behind ends with it, which also
     // closes the pipe its words are read from.
-    let _ = job.end();
-    let _ = stop.raise();
+    end_job(job, stop);
     let (unverified, last, heard) = reading.join().unwrap_or((false, None, VecDeque::new()));
     if !asked && let Some(diagnostics) = diagnostics {
         let from = format!("channel {} ended with status {status}", connection.0.0);
@@ -1203,15 +1364,26 @@ fn hold(
     say(messages, connection, ended);
 }
 
+/// A carrier not yet heard to listen at its workstation port `listen`, and
+/// what is told once it is, or is heard not to.
+struct Stand {
+    listen: u16,
+    told: Box<dyn FnOnce(Hauled) + Send>,
+}
+
 /// Reads what the client says until it and everything it started have ended.
 /// Returns whether it stopped for want of the person's word on the host's
-/// key, and the last thing it said that was its own to say.
+/// key, and the last thing it said that was its own to say. A carrier's
+/// `stand` is told whether it listens, at the line that says so,
+/// or with OpenSSH's own reason - the port it could not bind, or the last
+/// thing it said before it ended.
 fn listen(
     connection: ConnectionId,
     errors: PipeReader,
     names: &BTreeMap<u16, Name>,
     messages: &Sender<Message>,
     diagnostics: Option<&Diagnostics>,
+    mut stand: Option<Stand>,
 ) -> (bool, Option<Words>, VecDeque<String>) {
     let from = format!("channel {}", connection.0.0);
     let mut account: VecDeque<String> = VecDeque::new();
@@ -1244,6 +1416,24 @@ fn listen(
             // Only a carrier that listens on the remote asks for a port of
             // its server's choosing, and its placer reads what it says.
             Heard::Allocated { .. } => continue,
+            Heard::Entered => {
+                if let Some(stand) = stand.take() {
+                    (stand.told)(Hauled::Stands);
+                }
+                continue;
+            }
+            Heard::Unlistened { port } => {
+                if let Some(refused) = stand.take_if(|stand| stand.listen == port) {
+                    // OpenSSH says why on the line before: the bind refused.
+                    let bind = format!("bind [127.0.0.1]:{port}: ");
+                    let why = last
+                        .as_ref()
+                        .map(Words::as_str)
+                        .filter(|last| last.starts_with(&bind))
+                        .unwrap_or(line);
+                    (refused.told)(Hauled::Cannot(why.to_owned()));
+                }
+            }
             Heard::Changed => changed = true,
             Heard::Presents => presents = true,
             Heard::Unverified => unverified = !changed,
@@ -1261,6 +1451,12 @@ fn listen(
             last = Some(said);
         }
     }
+    if let Some(stand) = stand {
+        let why = last
+            .as_ref()
+            .map_or("the carrier ended before it listened", Words::as_str);
+        (stand.told)(Hauled::Cannot(why.to_owned()));
+    }
     (unverified, last, account)
 }
 
@@ -1274,4 +1470,350 @@ fn now() -> hedwig_model::trail::Timestamp {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     hedwig_model::trail::Timestamp(u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests")]
+
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    use hedwig_model::trail::{ConnectionId, Seq};
+
+    use super::{Hauled, Stand, Words, listen};
+
+    /// A channel's tail as the in-box client says it: its last forward's
+    /// answer, then its own account of its end.
+    const CHANNEL: [&str; 2] = [
+        r"debug1: C:\\__w\\1\\s\\ssh.c:ssh_confirm_remote_forward():1839 (pid=7312): remote forward success for: listen 5037, connect 127.0.0.1:50123",
+        "Connection to build-7.example closed by remote host.",
+    ];
+
+    const ENTERING: &str = r"debug1: C:\\__w\\1\\s\\clientloop.c:client_loop():1460 (pid=7312): Entering interactive session.";
+
+    /// Reads `said` as a client's whole standard error: its last words and
+    /// the account kept.
+    fn read(said: &[&str], stand: Option<Stand>) -> (Option<String>, Vec<String>) {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        for line in said {
+            write!(writer, "{line}\r\n").unwrap();
+        }
+        drop(writer);
+        let (messages, _kept) = mpsc::channel();
+        let connection = ConnectionId(Seq(1));
+        let (_, last, account) =
+            listen(connection, reader, &BTreeMap::new(), &messages, None, stand);
+        (
+            last.as_ref().map(Words::as_str).map(str::to_owned),
+            account.into_iter().collect(),
+        )
+    }
+
+    /// A carrier listening at 50140, and what it was told.
+    fn carrier() -> (Stand, Arc<Mutex<Vec<Hauled>>>) {
+        let told: Arc<Mutex<Vec<Hauled>>> = Arc::default();
+        let kept = Arc::clone(&told);
+        let stand = Stand {
+            listen: 50140,
+            told: Box::new(move |hauled| kept.lock().unwrap().push(hauled)),
+        };
+        (stand, told)
+    }
+
+    /// A channel's ending is told by its own last words, and its whole tail
+    /// is kept for a fault's account.
+    #[test]
+    fn an_ending_is_told_by_the_clients_own_last_words() {
+        let (last, account) = read(&CHANNEL, None);
+        assert_eq!(last.as_deref(), Some(CHANNEL[1]));
+        assert_eq!(account, CHANNEL);
+    }
+
+    /// Where its channel is not live a carrier cannot stand, said at once;
+    /// where its route's client is nowhere on the search path, said by its
+    /// thread; it is not left registered to be ended once its caller is told.
+    #[test]
+    fn a_carrier_with_no_channel_or_no_client_cannot_stand() {
+        use hedwig_model::remote::{Argument, Client};
+        use hedwig_model::setting::Keepalive;
+        use hedwig_model::text::{Address, Port, Program};
+        use hedwig_model::trail::{Asking, Target};
+        use hedwig_win::start::Environment;
+
+        use super::{Channels, Hauling, Setting};
+
+        let (messages, _kept) = mpsc::channel();
+        let setting = Setting {
+            search: std::ffi::OsString::new(),
+            environment: Environment::own(),
+        };
+        let mut channels = Channels::new(setting, messages);
+        let connection = ConnectionId(Seq(3));
+        let order = Hauling {
+            connection,
+            client: Client {
+                program: Program::try_from("hedwig-no-such-client").unwrap(),
+                before: Vec::new(),
+                after: vec![Argument::Address],
+            },
+            address: Address::try_from("dev@build-7.example").unwrap(),
+            target: Target::Loopback(Port::try_from(8081).unwrap()),
+            listen: Port::try_from(50140).unwrap(),
+            asking: Asking::Nobody,
+            keepalive: Keepalive::SHIPS,
+        };
+        let (tell, told) = mpsc::channel();
+        let teller = Mutex::new(tell.clone());
+        channels.haul(order.clone(), move |hauled| {
+            let _ = teller.lock().unwrap().send(hauled);
+        });
+        assert_eq!(
+            told.recv().unwrap(),
+            Hauled::Cannot("the remote's channel is down".to_owned())
+        );
+        assert!(channels.live(connection).is_some());
+        let teller = Mutex::new(tell);
+        channels.haul(order.clone(), move |hauled| {
+            let _ = teller.lock().unwrap().send(hauled);
+        });
+        assert_eq!(
+            told.recv().unwrap(),
+            Hauled::Cannot("no folder on the search path holds the route's client".to_owned())
+        );
+        assert!(!channels.hauls(connection, order.listen));
+        channels.end(connection);
+    }
+
+    /// A carrier asked to end while its process is still being made is ended
+    /// as soon as it is, and is gone; one asked to end once it runs, at once.
+    #[test]
+    fn a_carrier_ended_while_it_starts_is_ended_once_its_process_is_made() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+
+        use hedwig_model::text::Port;
+        use hedwig_win::start::{Environment, held};
+
+        use super::{Channels, Setting, running, starting};
+
+        let (messages, _kept) = mpsc::channel();
+        let setting = Setting {
+            search: OsString::new(),
+            environment: Environment::own(),
+        };
+        let mut channels = Channels::new(setting, messages);
+        let connection = ConnectionId(Seq(4));
+        let (job, _) = channels.live(connection).unwrap();
+        let program =
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\PING.EXE");
+        // A loopback ping succeeds, so status 1 is only the end asked for.
+        let arguments = ["-n", "6", "127.0.0.1"].map(OsString::from);
+        let start = || {
+            Arc::new(
+                held(&program, &arguments, &Environment::own(), &job)
+                    .unwrap()
+                    .0,
+            )
+        };
+
+        let early = Port::try_from(50141).unwrap();
+        starting(&channels.carriers, (connection, early));
+        channels.unhaul(connection, early);
+        let client = start();
+        running(&channels.carriers, (connection, early), &client);
+        assert_eq!(client.wait().unwrap(), 1, "ended as it was made");
+        assert!(!channels.hauls(connection, early));
+
+        let later = Port::try_from(50142).unwrap();
+        starting(&channels.carriers, (connection, later));
+        let client = start();
+        running(&channels.carriers, (connection, later), &client);
+        assert!(channels.hauls(connection, later));
+        channels.unhaul(connection, later);
+        assert_eq!(client.wait().unwrap(), 1, "ended once it ran");
+        assert!(!channels.hauls(connection, later));
+        channels.end(connection);
+    }
+
+    /// How soon a carrier or placer whose channel ended, or whose caller
+    /// withdrew it, comes to its end: far short of the half minute
+    /// [`outlasting`]'s client runs.
+    const ENDED_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A route's client that runs half a minute whatever it is given, and
+    /// starts nothing of its own: Windows PowerShell sleeps, the options and
+    /// the address after `#` its comment. A child would inherit the pipe a
+    /// carrier reads and hold it open past the client's end.
+    fn outlasting() -> (super::Setting, hedwig_model::remote::Client) {
+        use std::path::PathBuf;
+
+        use hedwig_model::remote::{Argument, Client};
+        use hedwig_model::text::{Program, Verbatim};
+        use hedwig_win::start::Environment;
+
+        let folder = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\WindowsPowerShell\v1.0");
+        let setting = super::Setting {
+            search: folder.into_os_string(),
+            environment: Environment::own(),
+        };
+        let before = [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep",
+            "30",
+            "#",
+        ]
+        .map(|text| Argument::Literal(Verbatim::try_from(text).unwrap()));
+        let client = Client {
+            program: Program::try_from("powershell").unwrap(),
+            before: before.to_vec(),
+            after: vec![Argument::Address],
+        };
+        (setting, client)
+    }
+
+    /// A carrier with a local forward, made only once its channel has ended,
+    /// is ended by the thread that made it, and cannot stand. The channel is
+    /// ended as the request returns; its thread makes the client after that,
+    /// a process taking far longer to make than the call to end.
+    #[test]
+    fn a_carrier_made_once_its_channel_ended_is_ended() {
+        use hedwig_model::setting::Keepalive;
+        use hedwig_model::text::{Address, Port};
+        use hedwig_model::trail::{Asking, Target};
+
+        use super::{Channels, Hauling};
+
+        let (setting, client) = outlasting();
+        let (messages, _kept) = mpsc::channel();
+        let mut channels = Channels::new(setting, messages);
+        let connection = ConnectionId(Seq(6));
+        channels.live(connection).unwrap();
+        let order = Hauling {
+            connection,
+            client,
+            address: Address::try_from("dev@build-7.example").unwrap(),
+            target: Target::Loopback(Port::try_from(8081).unwrap()),
+            listen: Port::try_from(50146).unwrap(),
+            asking: Asking::Nobody,
+            keepalive: Keepalive::SHIPS,
+        };
+        let (tell, told) = mpsc::channel();
+        let teller = Mutex::new(tell);
+        channels.haul(order, move |hauled| {
+            let _ = teller.lock().unwrap().send(hauled);
+        });
+        channels.end(connection);
+        let told = told.recv_timeout(ENDED_WITHIN);
+        assert!(matches!(told, Ok(Hauled::Cannot(_))), "{told:?}");
+    }
+
+    /// A carrier is known, to be ended, from the moment it is asked for, not
+    /// from when its thread has made its process. The client runs half a
+    /// minute, so once known it stays so until the channel ends: the check
+    /// holds whatever the thread has done.
+    #[test]
+    fn a_carrier_is_known_as_it_is_asked_for() {
+        use hedwig_model::setting::Keepalive;
+        use hedwig_model::text::{Address, Port};
+        use hedwig_model::trail::{Asking, Target};
+
+        use super::{Channels, Hauling};
+
+        let (setting, client) = outlasting();
+        let (messages, _kept) = mpsc::channel();
+        let mut channels = Channels::new(setting, messages);
+        let connection = ConnectionId(Seq(8));
+        channels.live(connection).unwrap();
+        let hauling = Port::try_from(50148).unwrap();
+        let (tell, told) = mpsc::channel();
+        let teller = Mutex::new(tell);
+        channels.haul(
+            Hauling {
+                connection,
+                client,
+                address: Address::try_from("dev@build-7.example").unwrap(),
+                target: Target::Loopback(Port::try_from(8081).unwrap()),
+                listen: hauling,
+                asking: Asking::Nobody,
+                keepalive: Keepalive::SHIPS,
+            },
+            move |hauled| {
+                let _ = teller.lock().unwrap().send(hauled);
+            },
+        );
+        assert!(channels.hauls(connection, hauling), "hauling");
+        channels.end(connection);
+        let told = told.recv_timeout(ENDED_WITHIN);
+        assert!(matches!(told, Ok(Hauled::Cannot(_))), "{told:?}");
+    }
+
+    /// A carrier stands at the line its session's loop begins with, not
+    /// before; a local forward of another port refused - one of the person's
+    /// own - decides nothing about it.
+    #[test]
+    fn a_carrier_stands_once_it_says_its_session_began() {
+        let (stand, told) = carrier();
+        read(
+            &[
+                "bind [127.0.0.1]:8000: Permission denied",
+                "channel_setup_fwd_listener_tcpip: cannot listen to port: 8000",
+                ENTERING,
+            ],
+            Some(stand),
+        );
+        assert_eq!(*told.lock().unwrap(), [Hauled::Stands]);
+    }
+
+    /// A carrier that cannot listen at its port is told so with OpenSSH's own
+    /// reason, the bind refused, and its later line decides nothing more.
+    #[test]
+    fn a_carrier_refused_its_port_cannot_stand_and_says_why() {
+        let (stand, told) = carrier();
+        read(
+            &[
+                "bind [127.0.0.1]:50140: Permission denied",
+                "channel_setup_fwd_listener_tcpip: cannot listen to port: 50140",
+                "Could not request local forwarding.",
+                ENTERING,
+            ],
+            Some(stand),
+        );
+        assert_eq!(
+            *told.lock().unwrap(),
+            [Hauled::Cannot(
+                "bind [127.0.0.1]:50140: Permission denied".to_owned()
+            )]
+        );
+    }
+
+    /// A carrier that ends before it listens cannot stand, in its own last
+    /// words, or the core's where it said none.
+    #[test]
+    fn a_carrier_that_ends_first_cannot_stand() {
+        let (stand, told) = carrier();
+        read(
+            &["dev@build-7.example: Permission denied (publickey)."],
+            Some(stand),
+        );
+        let (stand, silent) = carrier();
+        read(&[], Some(stand));
+        assert_eq!(
+            *told.lock().unwrap(),
+            [Hauled::Cannot(
+                "dev@build-7.example: Permission denied (publickey).".to_owned()
+            )]
+        );
+        assert_eq!(
+            *silent.lock().unwrap(),
+            [Hauled::Cannot(
+                "the carrier ended before it listened".to_owned()
+            )]
+        );
+    }
 }

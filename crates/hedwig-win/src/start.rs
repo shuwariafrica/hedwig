@@ -353,7 +353,8 @@ impl Held {
         Ok(())
     }
 
-    fn finished(&self) -> bool {
+    /// Whether the process has ended, asked without waiting for it.
+    pub fn finished(&self) -> bool {
         // SAFETY: the handle is the process this value owns; a zero wait
         // only asks whether it is signalled.
         unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) == WAIT_OBJECT_0 }

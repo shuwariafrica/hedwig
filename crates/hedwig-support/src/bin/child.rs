@@ -25,7 +25,8 @@
 //! `child stand-in <dir> <arguments>` stands in for a route's client: it
 //! writes what it was given to `<dir>/given` and does what the first line of
 //! `<dir>/plan` says, in an OpenSSH client's own words; `carry` makes it a
-//! whole route to this workstation as a remote. `child knock <port>`
+//! whole route to this workstation as a remote, a reverse's carrier
+//! included. `child knock <port>`
 //! connects to that loopback port and stays.
 //!
 //! `child device <model>` is a stand-in device a server attaches by `adb
@@ -649,8 +650,14 @@ const REMOTE_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 /// that shell on the script; anything else holds each remote forward for
 /// real, listening at [`REMOTE_LOOPBACK`] and carrying every connection on to
 /// the workstation's end, and appends `<port> <endpoint>` for each to
-/// `<dir>/carried`, the port the one it listens at.
-fn carry(folder: &Path, given: &[String], forwards: &[(&str, u16)]) -> ExitCode {
+/// `<dir>/carried`, the port the one it listens at; and holds each local
+/// forward as [`haul`] says.
+fn carry(
+    folder: &Path,
+    given: &[String],
+    forwards: &[(&str, u16)],
+    locals: &[(u16, String)],
+) -> ExitCode {
     if given.iter().any(|argument| argument == "-G") {
         return ExitCode::SUCCESS;
     }
@@ -694,7 +701,118 @@ fn carry(folder: &Path, given: &[String], forwards: &[(&str, u16)]) -> ExitCode 
             }
         });
     }
-    forever()
+    if locals.is_empty() {
+        forever()
+    }
+    haul(folder, given, locals)
+}
+
+/// Holds each local forward as the in-box client does once it has
+/// authenticated - a reverse's carrier has one - listening at the
+/// workstation's loopback and carrying every connection on to the remote's
+/// side, `localhost` being [`REMOTE_LOOPBACK`]. While `<dir>/hold` is there
+/// it first waits, having written `<dir>/holding`; where `<dir>/unbindable`
+/// is there it says what the client says of a port it cannot listen at. It
+/// then says the line `client_loop()` begins with, where its first
+/// `LogVerbose` names that function, as OpenSSH keeps only the first; appends
+/// `<listen> <process> <created>` to `<dir>/hauled` for each it listens at;
+/// and ends as a client whose server closed once `<dir>/end-<listen>` is
+/// there.
+fn haul(folder: &Path, given: &[String], locals: &[(u16, String)]) -> ExitCode {
+    let hold = folder.join("hold");
+    if hold.exists() {
+        let _ = fs::write(folder.join("holding"), "");
+        while hold.exists() {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let unbindable = folder.join("unbindable").exists();
+    let (process, created) = hedwig_win::process::own().unwrap_or_default();
+    let mut listening = 0;
+    for (listen, to) in locals {
+        let bound = if unbindable {
+            None
+        } else {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, *listen)).ok()
+        };
+        let Some(bound) = bound else {
+            utter(&format!("bind [127.0.0.1]:{listen}: Permission denied"));
+            utter(&format!(
+                "channel_setup_fwd_listener_tcpip: cannot listen to port: {listen}"
+            ));
+            continue;
+        };
+        listening += 1;
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(folder.join("hauled"))
+        {
+            let _ = writeln!(file, "{listen} {process} {created}");
+        }
+        let to = to.clone();
+        thread::spawn(move || {
+            for near in bound.incoming() {
+                let Ok(near) = near else { return };
+                let to = to.clone();
+                thread::spawn(move || {
+                    if let Some(far) = remote_side(&to) {
+                        splice(&near, &far);
+                    }
+                });
+            }
+        });
+    }
+    if listening == 0 {
+        utter("Could not request local forwarding.");
+    }
+    let first = given.windows(2).find_map(|pair| match pair {
+        [flag, option] if flag == "-o" => option.strip_prefix("LogVerbose="),
+        _ => None,
+    });
+    if first.is_some_and(|patterns| patterns.contains(":client_loop():")) {
+        utter(&format!(
+            r"debug1: C:\\__w\\1\\s\\clientloop.c:client_loop():1460 (pid={}): Entering interactive session.",
+            std::process::id()
+        ));
+    }
+    loop {
+        let ended = locals
+            .iter()
+            .any(|(listen, _)| folder.join(format!("end-{listen}")).exists());
+        if ended {
+            utter("Connection to standin.example closed by remote host.");
+            return ExitCode::from(255);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Each `-L` the client was given: the workstation port, and the remote's
+/// side as the core writes it.
+fn local_forwards(given: &[String]) -> Vec<(u16, String)> {
+    given
+        .windows(2)
+        .filter_map(|pair| match pair {
+            [flag, forward] if flag == "-L" => {
+                let (listen, to) = forward.strip_prefix("127.0.0.1:")?.split_once(':')?;
+                Some((listen.parse().ok()?, to.to_owned()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The remote's side of a local forward, `<host>:<port>` as the core writes
+/// it, the remote's loopback being [`REMOTE_LOOPBACK`].
+fn remote_side(to: &str) -> Option<TcpStream> {
+    let (host, port) = to.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    if host == "localhost" {
+        return TcpStream::connect((REMOTE_LOOPBACK, port)).ok();
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    TcpStream::connect((host, port)).ok()
 }
 
 /// Copies both ways until each end has closed.
@@ -790,6 +908,7 @@ fn stand_in(folder: &Path, given: impl Iterator<Item = OsString>) -> ExitCode {
             _ => None,
         })
         .collect();
+    let locals = local_forwards(&given);
     let answers = |bound: &dyn Fn(usize) -> bool| {
         for (index, (listen, endpoint)) in forwards.iter().enumerate() {
             answer(listen, *endpoint, bound(index));
@@ -854,7 +973,7 @@ fn stand_in(folder: &Path, given: impl Iterator<Item = OsString>) -> ExitCode {
             }
             forever()
         }
-        "carry" => carry(folder, &given, &forwards),
+        "carry" => carry(folder, &given, &forwards, &locals),
         "idle" => forever(),
         other if other.starts_with("probe:") => {
             // A program of the channel's that opens the control pipe, as a

@@ -534,7 +534,10 @@ pub(crate) enum Event {
 #[derive(Debug)]
 pub struct Settle {
     word: Mutex<Option<Result<(), Refusal>>>,
-    endpoint: Mutex<Option<Result<Port, Option<Withheld>>>>,
+    endpoint: Mutex<Option<Result<Port, crate::adb::Unsent>>>,
+    /// Whether the reverse the device took was recorded and its carrier
+    /// stands in the remote's live channel, or the words for why it cannot.
+    standing: Mutex<Option<Result<(), String>>>,
     /// A held forward's port on the remote, or the words for why none was
     /// bound there.
     placed: Mutex<Option<Result<Port, String>>>,
@@ -558,6 +561,7 @@ impl Settle {
         Settle {
             word: Mutex::new(None),
             endpoint: Mutex::new(None),
+            standing: Mutex::new(None),
             placed: Mutex::new(None),
             listening: Mutex::new(None),
             lending: Mutex::new(None),
@@ -610,16 +614,36 @@ impl Settle {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    /// Gives a held reverse the endpoint it lands on, or refuses it, with
-    /// `None` where the workstation could bind none. Never waits, as
-    /// [`Settle::settle`].
-    pub fn carry(&self, verdict: Result<Port, Option<Withheld>>) {
+    /// Gives a held reverse the endpoint it lands on, once its carrier
+    /// stands, or why nothing carries it: one held is sent to no device, and
+    /// of one the device took the answer is not given. Refuses a held
+    /// forward. Never waits, as [`Settle::settle`].
+    pub fn carry(&self, verdict: Result<Port, crate::adb::Unsent>) {
         if let Ok(mut endpoint) = self.endpoint.lock() {
             *endpoint = Some(verdict);
         }
         match self.wake.try_send(Event::Settled) {
             Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
         }
+    }
+
+    /// Tells a reverse the device took that the core recorded it and its
+    /// carrier stands in the remote's live channel, or the words for why it
+    /// cannot. Never waits.
+    pub fn stand(&self, standing: Result<(), String>) {
+        if let Ok(mut held) = self.standing.lock() {
+            *held = Some(standing);
+        }
+        match self.wake.try_send(Event::Settled) {
+            Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    pub(crate) fn take_standing(&self) -> Option<Result<(), String>> {
+        self.standing
+            .lock()
+            .ok()
+            .and_then(|mut standing| standing.take())
     }
 
     /// Gives a held forward its port on the remote, or the words for why
@@ -673,7 +697,7 @@ impl Settle {
             .and_then(|mut lending| lending.take())
     }
 
-    pub(crate) fn take_endpoint(&self) -> Option<Result<Port, Option<Withheld>>> {
+    pub(crate) fn take_endpoint(&self) -> Option<Result<Port, crate::adb::Unsent>> {
         self.endpoint
             .lock()
             .ok()

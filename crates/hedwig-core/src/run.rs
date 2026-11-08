@@ -33,12 +33,14 @@ use hedwig_win::token::Token;
 use hedwig_model::trail::Network;
 use hedwig_win::start::Environment;
 
-use crate::adb::{Carriage, Forwarding, Forwards, Reverse, Watch};
+use crate::adb::{Awaiting, Carriage, Forwarding, Forwards, Reverse, Unsent, Watch};
 use crate::assuan::Nonce;
 use crate::channel::{
-    Askpass, Channels, Exercising, Hauling, Order as Started, Placing, Setting, Surveying,
+    Askpass, Channels, Exercising, Hauled, Hauling, Order as Started, Placing, Setting, Surveying,
 };
-use crate::dispatch::{Core, Effect, Input, Keep, Knock, Link, Now, Step, Then, Told, Turn};
+use crate::dispatch::{
+    Carrier, Core, Effect, Input, Keep, Knock, Link, Now, Step, Then, Told, Turn,
+};
 use crate::listing::Listings;
 use crate::peer::placed;
 use crate::relay::{Agents, Gnupg, Relayed, Relaying, Settle};
@@ -498,7 +500,9 @@ impl Desk {
                     } => self.read_cards(connection, sources),
                     reversing @ (Effect::Endpoint { .. }
                     | Effect::Withhold { .. }
-                    | Effect::Haul { .. }) => self.reversing(reversing),
+                    | Effect::Unhauled { .. }
+                    | Effect::Haul { .. }
+                    | Effect::Unhaul { .. }) => self.reversing(reversing),
                     calling @ (Effect::Call { .. } | Effect::Uncall { .. }) => {
                         self.calling(calling);
                     }
@@ -713,52 +717,81 @@ impl Desk {
         self.relays.insert(knock, settle);
     }
 
-    /// What carries a reverse a remote asked for: its endpoint, its refusal,
-    /// or its carrier.
+    /// What carries a reverse a remote asked for: its endpoint once its
+    /// carrier stands, its refusal, its carrier standing for the device's
+    /// answer or a returning channel, or its carrier's end.
     fn reversing(&mut self, effect: Effect) {
         match effect {
             Effect::Endpoint {
                 knock,
                 reverse,
                 server,
+                carrier,
             } => {
+                let Some(relay) = self.relays.get(&knock).cloned() else {
+                    return;
+                };
                 let jobs = self.channels.jobs();
-                let endpoint = self.carriage.endpoint(reverse, server, &jobs);
-                if let Some(relay) = self.relays.get(&knock) {
-                    relay.carry(endpoint.map_err(|_| None));
-                }
+                let Ok(endpoint) = self.carriage.endpoint(reverse.clone(), server, &jobs) else {
+                    let why = "the workstation could not bind an endpoint for it".to_owned();
+                    return relay.carry(Err(Unsent::Unhauled(why)));
+                };
+                let then: Awaiting = Box::new(move |standing: Result<(), String>| {
+                    relay.carry(standing.map(|()| endpoint).map_err(Unsent::Unhauled));
+                });
+                self.stand(reverse, carrier, then);
             }
             Effect::Withhold { knock, withheld } => {
                 if let Some(relay) = self.relays.get(&knock) {
-                    relay.carry(Err(Some(withheld)));
+                    relay.carry(Err(Unsent::Withheld(withheld)));
+                }
+            }
+            Effect::Unhauled { knock, why } => {
+                if let Some(relay) = self.relays.get(&knock) {
+                    relay.carry(Err(Unsent::Unhauled(why.to_owned())));
                 }
             }
             Effect::Haul {
-                connection,
+                knock,
                 reverse,
-                client,
-                address,
-                asking,
-                keepalive,
-            } => self.haul(connection, reverse, client, address, asking, keepalive),
+                carrier,
+            } => {
+                let relay = knock.and_then(|knock| self.relays.get(&knock).cloned());
+                let then: Awaiting = Box::new(move |standing: Result<(), String>| {
+                    if let Some(relay) = relay {
+                        relay.stand(standing);
+                    }
+                });
+                match carrier {
+                    Ok(carrier) => self.stand(reverse, carrier, then),
+                    Err(why) => then(Err(why.to_owned())),
+                }
+            }
+            Effect::Unhaul { reverse } => {
+                if let Some((connection, listen)) = self.carriage.withdraw(&reverse) {
+                    self.channels.unhaul(connection, listen);
+                }
+            }
             _ => {}
         }
     }
 
-    /// Starts the carrier of the endpoint of `reverse` in `connection`'s
-    /// channel, unless it is there already, on a workstation port drawn now.
-    fn haul(
-        &mut self,
-        connection: ConnectionId,
-        reverse: Reverse,
-        client: Client,
-        address: Address,
-        asking: Asking,
-        keepalive: Keepalive,
-    ) {
-        if self.carriage.hauled(&reverse, connection) {
-            return;
+    /// Has the carrier of `reverse` stand in `carrier`'s channel - at once
+    /// where it stands there and its process runs, once it is heard where it
+    /// is starting there, started now on a workstation port drawn now where
+    /// neither - and tells `then` whether it stands.
+    fn stand(&mut self, reverse: Reverse, carrier: Carrier, then: Awaiting) {
+        // One whose process has ended is gone, though its end may not have
+        // been told yet.
+        if let Some((connection, listen)) = self.carriage.standing(&reverse)
+            && !self.channels.hauls(connection, listen)
+        {
+            self.carriage
+                .told(&reverse, connection, listen, Hauled::Ended);
         }
+        let Some(then) = self.carriage.stand(&reverse, carrier.connection, then) else {
+            return;
+        };
         // The port is the system's choice, released for the carrier to bind;
         // a process that took it meanwhile is never let carry, as the
         // endpoint admits only a listener in the channel's job.
@@ -766,18 +799,26 @@ impl Desk {
             .ok()
             .and_then(|drawn| Port::try_from(drawn.port()).ok())
         else {
-            return;
+            return then(Err(
+                "the workstation could not draw a port for its carrier".to_owned()
+            ));
         };
-        self.carriage.haul(&reverse, connection, listen);
-        self.channels.haul(Hauling {
-            connection,
-            client,
-            address,
-            target: reverse.target,
-            listen,
-            asking,
-            keepalive,
-        });
+        let connection = carrier.connection;
+        self.carriage.start(&reverse, connection, listen, then);
+        let carriage = Arc::clone(&self.carriage);
+        let target = reverse.target.clone();
+        self.channels.haul(
+            Hauling {
+                connection,
+                client: carrier.client,
+                address: carrier.address,
+                target,
+                listen,
+                asking: carrier.asking,
+                keepalive: carrier.keepalive,
+            },
+            move |hauled| carriage.told(&reverse, connection, listen, hauled),
+        );
     }
 
     /// The watch of `capability`'s server, made now where it has none; each
@@ -1049,15 +1090,18 @@ impl Desk {
             return;
         };
         self.calls.insert(order.knock, (order.connection, listen));
-        self.channels.haul(Hauling {
-            connection: order.connection,
-            client: order.client,
-            address: order.address,
-            target: order.target,
-            listen,
-            asking: order.asking,
-            keepalive: order.keepalive,
-        });
+        self.channels.haul(
+            Hauling {
+                connection: order.connection,
+                client: order.client,
+                address: order.address,
+                target: order.target,
+                listen,
+                asking: order.asking,
+                keepalive: order.keepalive,
+            },
+            |_| {},
+        );
         if let Some(relay) = self.relays.get(&order.knock) {
             relay.call(order.connection, listen);
         }

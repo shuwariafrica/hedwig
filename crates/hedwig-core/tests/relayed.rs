@@ -1134,16 +1134,27 @@ fn a_withheld_request_and_each_breach_are_recorded_against_who_made_them() {
     );
 }
 
-/// A reverse is given an endpoint for its remote and target; once the device
-/// takes it, it is recorded and carried on to the remote through the channel.
-/// The same target again is given the same endpoint and recorded once.
+/// A reverse is given an endpoint for its remote and target once its carrier
+/// stands in the asking connection's channel; once the device takes it, it is
+/// recorded, and the device's answer is released in the same step - after
+/// the record is written - once the carrier stands in the remote's live
+/// channel. The same target again is given the same endpoint and recorded
+/// once.
 #[test]
 fn a_reverse_is_given_an_endpoint_recorded_once_taken_and_carried_on() {
     let mut scene = adb();
     scene.knock_on(1, "adb");
     scene.relayed(1, Relayed::Reached(Ok(())));
     let step = scene.relayed(1, Relayed::Reverse(metro()));
-    let [Effect::Endpoint { knock, reverse, .. }] = acts(&step).as_slice() else {
+    let [
+        Effect::Endpoint {
+            knock,
+            reverse,
+            carrier,
+            ..
+        },
+    ] = acts(&step).as_slice()
+    else {
         panic!("{step:?}");
     };
     let adb = Reverse {
@@ -1152,6 +1163,7 @@ fn a_reverse_is_given_an_endpoint_recorded_once_taken_and_carried_on() {
         target: metro(),
     };
     assert_eq!((*knock, reverse), (Knock(1), &adb));
+    assert_eq!(carrier.connection, scene.connection);
     let endpoint = Port::try_from(50131).unwrap();
     let step = scene.relayed(
         1,
@@ -1171,8 +1183,8 @@ fn a_reverse_is_given_an_endpoint_recorded_once_taken_and_carried_on() {
     );
     assert!(matches!(
         acts(&step).as_slice(),
-        [Effect::Haul { connection, reverse, .. }]
-            if *connection == scene.connection && *reverse == adb
+        [Effect::Haul { knock: Some(Knock(1)), reverse, carrier: Ok(carrier) }]
+            if carrier.connection == scene.connection && *reverse == adb
     ));
     assert_eq!(
         scene
@@ -1196,6 +1208,7 @@ fn a_reverse_is_given_an_endpoint_recorded_once_taken_and_carried_on() {
     };
     assert_eq!(carried.reverses, vec![(endpoint, metro())]);
     scene.relayed(2, Relayed::Reached(Ok(())));
+    scene.relayed(2, Relayed::Reverse(metro()));
     let step = scene.relayed(
         2,
         Relayed::Reversed {
@@ -1204,6 +1217,135 @@ fn a_reverse_is_given_an_endpoint_recorded_once_taken_and_carried_on() {
         },
     );
     assert_eq!(events(&step), Vec::<Event>::new());
+    assert!(matches!(
+        acts(&step).as_slice(),
+        [Effect::Haul {
+            knock: Some(Knock(2)),
+            ..
+        }]
+    ));
+}
+
+/// A connection that ends holding a reverse the device did not take ends
+/// its carrier - but not while another connection holds a reverse to the
+/// same target, and never for a target the remote's record holds.
+#[test]
+fn a_reverse_not_taken_ends_its_carrier_unless_another_uses_the_target() {
+    let mut scene = adb();
+    let ask = |scene: &mut Scene, knock: u64, target: Target| {
+        scene.knock_on(knock, "adb");
+        scene.relayed(knock, Relayed::Reached(Ok(())));
+        scene.relayed(knock, Relayed::Reverse(target));
+    };
+    let unhauled = |step: &Step| -> Vec<Target> {
+        acts(step)
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Unhaul { reverse } => Some(reverse.target.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    ask(&mut scene, 1, metro());
+    ask(&mut scene, 2, metro());
+    let step = scene.relayed(1, Relayed::Ended);
+    assert_eq!(unhauled(&step), Vec::new(), "connection 2 holds it");
+    let step = scene.relayed(2, Relayed::Ended);
+    assert_eq!(unhauled(&step), [metro()]);
+
+    let taken = Target::Loopback(Port::try_from(9000).unwrap());
+    ask(&mut scene, 3, taken.clone());
+    scene.relayed(
+        3,
+        Relayed::Reversed {
+            target: taken.clone(),
+            endpoint: Port::try_from(50132).unwrap(),
+        },
+    );
+    let step = scene.relayed(3, Relayed::Ended);
+    assert_eq!(unhauled(&step), Vec::new(), "taken and recorded");
+    ask(&mut scene, 4, taken);
+    let step = scene.relayed(4, Relayed::Ended);
+    assert_eq!(unhauled(&step), Vec::new(), "the record holds the target");
+}
+
+/// A reverse nothing can carry - the asking connection's channel gone - is
+/// told so, never left waiting; a reverse the device took once no channel is
+/// live is told the same, nothing recording it.
+#[test]
+fn a_reverse_nothing_can_carry_is_told_so() {
+    let mut scene = adb();
+    scene.knock_on(1, "adb");
+    scene.relayed(1, Relayed::Reached(Ok(())));
+    scene.knock_on(2, "adb");
+    scene.relayed(2, Relayed::Reached(Ok(())));
+    scene.relayed(2, Relayed::Reverse(metro()));
+    scene.step(Input::Channel {
+        connection: scene.connection,
+        told: hedwig_core::dispatch::Told::Ended {
+            status: 255,
+            unverified: false,
+            last: None,
+        },
+    });
+    let step = scene.relayed(1, Relayed::Reverse(metro()));
+    assert_eq!(
+        acts(&step),
+        [&Effect::Unhauled {
+            knock: Knock(1),
+            why: "the remote's channel is down",
+        }]
+    );
+    let step = scene.relayed(
+        2,
+        Relayed::Reversed {
+            target: metro(),
+            endpoint: Port::try_from(50131).unwrap(),
+        },
+    );
+    assert_eq!(
+        acts(&step),
+        [&Effect::Unhauled {
+            knock: Knock(2),
+            why: "the remote's channel is down",
+        }]
+    );
+    assert_eq!(
+        events(&step),
+        Vec::<Event>::new(),
+        "no link to record it by"
+    );
+}
+
+/// A reverse asked on an ADB capability the person has since made another
+/// kind of service is told so, and the device is never asked.
+#[test]
+fn a_reverse_whose_capability_no_longer_names_an_adb_server_is_told_so() {
+    use hedwig_model::capability::{Capability, Offer, ServiceHost, ServicePort, Source, Stream};
+
+    let mut scene = two_adb_servers();
+    scene.knock_on(1, "adb-emulator");
+    scene.relayed(1, Relayed::Reached(Ok(())));
+    let port = Port::try_from(5038).unwrap();
+    let opaque = Capability {
+        id: name("adb-emulator"),
+        source: Source::Service {
+            host: ServiceHost::Workstation,
+            port: ServicePort::Fixed(port),
+            stream: Stream::Opaque,
+            remote: vec![Offer::Port(ServicePort::Fixed(port))],
+        },
+    };
+    let step = scene.ask(TERMINAL, Request::Change(Change::Define(opaque)));
+    assert_eq!(Scene::refused(&step, TERMINAL), None);
+    let step = scene.relayed(1, Relayed::Reverse(metro()));
+    assert_eq!(
+        acts(&step),
+        [&Effect::Unhauled {
+            knock: Knock(1),
+            why: "its capability no longer names an ADB server",
+        }]
+    );
 }
 
 /// `adb` and an emulator host's own ADB server, `adb-emulator`, both granted
@@ -1377,6 +1519,37 @@ fn a_remote_has_reverses_carried_to_at_most_carried_targets() {
     assert!(matches!(acts(&step).as_slice(), [Effect::Endpoint { .. }]));
 }
 
+/// A reverse the device did not take - refused, or its remote gone before
+/// the answer - gives its place among the remote's `CARRIED` back once its
+/// connection ends: a target asked for after `CARRIED` such reverses is given
+/// its endpoint, never refused as crowded.
+#[test]
+fn a_reverse_not_taken_gives_its_place_back_once_its_connection_ends() {
+    let mut scene = adb();
+    let targets: Vec<Target> = (9000..)
+        .take(hedwig_core::adb::CARRIED + 1)
+        .map(|number| Target::Loopback(Port::try_from(number).unwrap()))
+        .collect();
+    let (refused, later) = targets.split_at(hedwig_core::adb::CARRIED);
+    for (knock, target) in (1..).zip(refused) {
+        scene.knock_on(knock, "adb");
+        scene.relayed(knock, Relayed::Reached(Ok(())));
+        let step = scene.relayed(knock, Relayed::Reverse(target.clone()));
+        assert!(
+            matches!(acts(&step).as_slice(), [Effect::Endpoint { .. }]),
+            "{step:?}"
+        );
+        scene.relayed(knock, Relayed::Ended);
+    }
+    scene.knock_on(100, "adb");
+    scene.relayed(100, Relayed::Reached(Ok(())));
+    let step = scene.relayed(100, Relayed::Reverse(later.first().unwrap().clone()));
+    assert!(
+        matches!(acts(&step).as_slice(), [Effect::Endpoint { .. }]),
+        "{step:?}"
+    );
+}
+
 /// When the remote's channel comes back, each reverse it carried in this run
 /// is carried on to it again through the new channel, with nothing asked.
 #[test]
@@ -1384,6 +1557,7 @@ fn a_returning_channel_carries_the_remotes_reverses_again() {
     let mut scene = adb();
     scene.knock_on(1, "adb");
     scene.relayed(1, Relayed::Reached(Ok(())));
+    scene.relayed(1, Relayed::Reverse(metro()));
     let endpoint = Port::try_from(50131).unwrap();
     scene.relayed(
         1,
@@ -1436,10 +1610,10 @@ fn a_returning_channel_carries_the_remotes_reverses_again() {
         acts(&step).as_slice(),
         [
             Effect::Seal { connection: sealed },
-            Effect::Haul { connection, reverse, .. },
+            Effect::Haul { knock: None, reverse, carrier: Ok(carrier) },
             Effect::Watch { capability, .. },
         ]
-            if *sealed == second && *connection == second && reverse.target == metro()
+            if *sealed == second && carrier.connection == second && reverse.target == metro()
                 && reverse.remote == remote() && reverse.capability == name("adb")
                 && *capability == name("adb")
     ));
