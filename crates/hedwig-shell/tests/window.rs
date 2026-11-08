@@ -56,13 +56,12 @@ fn a_held_claim_is_not_taken_and_a_released_one_is() {
     assert!(matches!(claim(&folder).unwrap(), Claim::Held(_)));
 }
 
+/// Noon UTC on 1 July 2026 falls in 2026 in every zone, and in a Gregorian
+/// calendar no part of it but the year reads 26.
 #[test]
 fn a_moment_is_written_as_this_persons_windows_writes_one() {
-    let written = clock::written(0);
-    assert!(
-        written.contains("1970") || written.contains("70"),
-        "{written}"
-    );
+    let written = clock::written(1_782_907_200_000);
+    assert!(written.contains("26"), "{written}");
     assert_ne!(clock::written(1_790_000_000_000), written);
 }
 
