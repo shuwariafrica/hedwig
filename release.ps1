@@ -72,8 +72,8 @@ function Invoke-Git {
 function Get-ManifestVersion {
     <#
     .SYNOPSIS
-        Reads the package version from Cargo.toml: the first top-level
-        `version = "..."` line, which is the [package] table's.
+        Reads the version from Cargo.toml: the first top-level
+        `version = "..."` line, which is the [workspace.package] table's.
     #>
     [CmdletBinding()]
     [OutputType([string])]
