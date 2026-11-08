@@ -26,10 +26,10 @@ use hedwig_model::protocol::{
 use hedwig_model::refusal::Refusal;
 use hedwig_model::remote::{Granted, RemoteId, Remotes, Sets};
 use hedwig_model::setting::{Autostart, Burst, Diagnostics, Said, Settled, Span, Threshold};
-use hedwig_model::text::{Address, Name, Secret, Words};
+use hedwig_model::text::{Address, Commit, Name, Secret, Words};
 use hedwig_model::trail::{
     Breakdown, ClientId, ClientKind, ConnectionId, Entry, Event, Integrity, Item, Origin, PromptId,
-    RequestId, Seq, Store, Tick, Timestamp,
+    RequestId, Seq, State, Store, Tick, Timestamp,
 };
 use hedwig_model::wire::{line, read};
 
@@ -876,4 +876,51 @@ fn a_sleep_and_a_wake_are_recorded_and_the_run_goes_on() {
         address: Address::try_from("build").unwrap(),
     };
     assert!(core.state().paused(&host, &Sets::NONE));
+}
+
+/// A supporter's bundle names the commit the running build was made from
+/// beside its version; the greeting names the version alone, which setup
+/// compares with the version it placed.
+#[test]
+fn a_bundle_names_the_builds_commit_and_the_greeting_its_version_alone() {
+    let mut core = Core::resume(
+        Catalogue::shipped().unwrap(),
+        Configuration::default(),
+        State::default(),
+        Vec::new(),
+        "0.2.0-alpha.1".to_owned(),
+        Commit::try_from("0123456789ab, modified").unwrap(),
+    );
+    core.begin(DESKTOP, None, Vec::new(), NOW);
+    let link = Link(1);
+    core.step(
+        Input::Arrived {
+            link,
+            peer: Some(DESKTOP.into()),
+        },
+        NOW,
+    );
+    let hello = Request::Hello {
+        protocol: PROTOCOL,
+        kind: ClientKind::Terminal,
+        attends: Remotes::Every,
+    };
+    let step = ask(&mut core, link, 1, hello);
+    let (_, Ok(Reply::Welcome { version, .. }), _) = reply(&step, link) else {
+        unreachable!("{step:?}")
+    };
+    assert_eq!(version, "0.2.0-alpha.1");
+    written(&mut core, link, 1);
+
+    let step = ask(&mut core, link, 2, Request::Bundle);
+    let bundle = step
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Bundle { bundle, .. } => Some(bundle),
+            _ => None,
+        })
+        .expect("the bundle is completed off the deciding thread");
+    assert_eq!(bundle.version, "0.2.0-alpha.1");
+    assert_eq!(bundle.commit.as_str(), "0123456789ab, modified");
 }

@@ -6,6 +6,11 @@ members = [
     "crates/hedwig-core",
     "crates/hedwig-client",
     "crates/hedwig",
+    "crates/hedwig-view",
+    "crates/hedwig-shell",
+    "crates/hedwig-interface",
+    "crates/hedwig-window",
+    "crates/hedwig-setup",
     "crates/hedwig-support",
 ]
 
@@ -23,7 +28,11 @@ hedwig-model = { path = "crates/hedwig-model", version = "0.1.0" }
 hedwig-win = { path = "crates/hedwig-win", version = "0.1.0" }
 hedwig-core = { path = "crates/hedwig-core", version = "0.1.0" }
 hedwig-client = { path = "crates/hedwig-client", version = "0.1.0" }
+hedwig-view = { path = "crates/hedwig-view", version = "0.1.0" }
+hedwig-shell = { path = "crates/hedwig-shell", version = "0.1.0" }
 serde_json = "1.0.151"
+windows-reactor = "0.100.0"
+windows-reactor-setup = "0.100.0"
 windows-sys = "0.61"
 zeroize = "1.9"
 

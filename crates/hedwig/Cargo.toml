@@ -16,5 +16,10 @@ hedwig-win.workspace = true
 hedwig-core.workspace = true
 hedwig-client.workspace = true
 
+# The executable's icon and version information, written at build by the
+# interface's own function; nothing of it is linked but the resource.
+[build-dependencies]
+hedwig-view.workspace = true
+
 [lints]
 workspace = true

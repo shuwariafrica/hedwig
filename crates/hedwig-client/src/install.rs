@@ -137,7 +137,7 @@ impl fmt::Display for SetupError {
             SetupError::Pack(pack) => pack.fmt(f),
             SetupError::Files(error) => write!(f, "Hedwig's files could not be placed: {error}"),
             SetupError::Held(holders) => {
-                f.write_str("these still use Hedwig's files; close them and run setup again:")?;
+                f.write_str("these still use Hedwig's files; close them and try again:")?;
                 for holder in holders {
                     write!(f, " {} ({})", holder.name, holder.process)?;
                 }
@@ -208,6 +208,9 @@ pub struct Installed {
 ///
 /// [`SetupError`], naming the step that failed.
 pub fn install(framed: &[u8], place: &Place, choices: Choices) -> Result<Installed, SetupError> {
+    if framed.is_empty() {
+        return Err(SetupError::Pack(PackError::Empty));
+    }
     elevated()?;
     let folder = place.program.to_str().ok_or_else(|| {
         SetupError::Files(io::Error::other("the programs folder's path is not text"))
@@ -750,5 +753,24 @@ mod tests {
         );
         let theirs = Path::new(r"D:\work\hedwig-data");
         assert_eq!(vendor(&place(program, Some(theirs)), theirs), None);
+    }
+
+    /// A setup program built with nothing to install says so, whatever runs
+    /// it, and writes nothing.
+    #[test]
+    fn a_setup_built_with_nothing_to_install_says_so_and_writes_nothing() {
+        let program =
+            std::env::temp_dir().join(format!("hedwig-client-empty-{}", std::process::id()));
+        let data = program.join("data");
+        let place = place(&program, Some(&data));
+
+        let refused = install(&[], &place, Choices { at_logon: false });
+
+        assert!(
+            matches!(refused, Err(SetupError::Pack(PackError::Empty))),
+            "{refused:?}"
+        );
+        assert_eq!(refused.expect_err("refused").status(), 12);
+        assert!(!program.exists(), "nothing is written");
     }
 }

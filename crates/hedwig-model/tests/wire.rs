@@ -87,7 +87,7 @@ fn the_written_form_is_pinned() {
 #[test]
 fn a_session_reads_as_it_is_specified() {
     let hello: ToCore =
-        read(r#"{"id":1,"request":{"hello":{"protocol":3,"kind":"terminal","attends":"every"}}}"#)
+        read(r#"{"id":1,"request":{"hello":{"protocol":4,"kind":"terminal","attends":"every"}}}"#)
             .expect("the greeting");
     assert_eq!(&hello, corpus::to_core().first().expect("a frame"));
     assert_eq!(

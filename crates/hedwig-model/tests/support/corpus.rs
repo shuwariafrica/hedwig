@@ -46,7 +46,7 @@ use hedwig_model::setting::{
 };
 use hedwig_model::site::{Site, Unopenable};
 use hedwig_model::text::{
-    AgentPipe, DeviceSerial, DeviceSocket, Fingerprint, Folder, Grip, Host, Kernel, KeyId,
+    AgentPipe, Commit, DeviceSerial, DeviceSocket, Fingerprint, Folder, Grip, Host, Kernel, KeyId,
     Location, Mark, PipeName, Port, PortName, Program, Remark, RemotePath, Secret, Serial,
     ServiceName, SshKey, Template, Variable, Verbatim, Words,
 };
@@ -2722,7 +2722,8 @@ pub(crate) fn withdrew() -> Withdrew {
 /// A supporter's bundle with a part of every kind.
 pub(crate) fn bundle() -> Bundle {
     Bundle {
-        version: "0.2.0 (v0.2.0)".to_owned(),
+        version: "0.2.0".to_owned(),
+        commit: Commit::try_from("0123456789ab, modified").unwrap(),
         program: "C:\\Users\\dev\\AppData\\Local\\Programs\\ShuwariAfrica\\Hedwig".to_owned(),
         windows: "10.0.26100.6584".to_owned(),
         status: status(),

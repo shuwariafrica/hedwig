@@ -24,12 +24,14 @@ use hedwig_core::store::Places;
 use hedwig_core::supervise::{Found, Pace, Supervisor, Watch};
 use hedwig_model::process::{CoreState, Exit};
 use hedwig_model::protocol::{Answer, Hint, Reply, Request};
-use hedwig_model::text::PipeName;
+use hedwig_model::text::{Commit, PipeName};
 use hedwig_model::trail::ClientKind;
 use hedwig_model::wire::line;
 use hedwig_win::token::Token;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The commit this build was made from, as its build script named it.
+const COMMIT: &str = env!("HEDWIG_COMMIT");
 
 fn main() -> ExitCode {
     // Whatever this process starts, it does not hand on the handles it was
@@ -60,7 +62,11 @@ fn main() -> ExitCode {
     };
     let exit = match role.as_deref() {
         Some("supervise") => supervise(&places, folder),
-        Some("core") => hedwig_core::run::run(places, VERSION),
+        Some("core") => hedwig_core::run::run(
+            places,
+            VERSION,
+            &Commit::try_from(COMMIT).unwrap_or_else(|_| Commit::unknown()),
+        ),
         Some("remove") => return remove(folder),
         _ => Exit::Usage,
     };

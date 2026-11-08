@@ -490,6 +490,7 @@ fn bench(role: &str, folder: PathBuf, wiring: &str) -> ExitCode {
         let exit = hedwig_core::run::run_on(
             places,
             env!("CARGO_PKG_VERSION"),
+            &hedwig_model::text::Commit::unknown(),
             std::sync::Arc::new(bench),
         );
         return ExitCode::from(exit.status());

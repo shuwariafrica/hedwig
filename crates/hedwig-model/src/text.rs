@@ -40,6 +40,8 @@ pub enum TextError {
     },
     /// Not a public key as OpenSSH writes one.
     Key,
+    /// Not a commit as a build names it.
+    Commit,
 }
 
 impl fmt::Display for TextError {
@@ -64,6 +66,9 @@ impl fmt::Display for TextError {
             }
             TextError::Key => f.write_str(
                 "it is not a public key as OpenSSH writes one: its type, a space and the key in base64",
+            ),
+            TextError::Commit => f.write_str(
+                "it is not a commit's first twelve hexadecimal digits, with \", modified\" after them, nor \"unknown\"",
             ),
         }
     }
@@ -286,6 +291,45 @@ fn digits(text: &str, lengths: &[usize]) -> Result<(), TextError> {
         Ok(())
     } else {
         Err(TextError::Digits { length: text.len() })
+    }
+}
+
+/// What a build made with no repository names in place of its commit.
+const UNKNOWN: &str = "unknown";
+
+/// What follows the commit of a build whose tree differed from it.
+const MODIFIED: &str = ", modified";
+
+fn commit(text: &str) -> Result<(), TextError> {
+    if text.is_empty() {
+        return Err(TextError::Empty);
+    }
+    let id = text.strip_suffix(MODIFIED).unwrap_or(text);
+    let digits = id.len() == 12
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if text == UNKNOWN || digits {
+        Ok(())
+    } else {
+        Err(TextError::Commit)
+    }
+}
+
+text_type!(
+    /// The commit a build was made from, as everything that shows a build's
+    /// version shows it beside the version: the commit's first twelve
+    /// lower-case hexadecimal digits, `, modified` after them where the
+    /// build's tree differed from it, or `unknown` for a build made with no
+    /// repository. Versions are compared alone; a commit never is.
+    Commit,
+    commit
+);
+
+impl Commit {
+    /// The commit of a build made with no repository.
+    pub fn unknown() -> Commit {
+        Commit(UNKNOWN.to_owned())
     }
 }
 

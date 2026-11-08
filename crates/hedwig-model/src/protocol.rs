@@ -23,7 +23,7 @@ use crate::setting::{
     Returns, Routes, Settled, Span, Threshold, Volume, Workstation as Here,
 };
 use crate::text::{
-    DeviceSerial, KeyId, Name, Port, PortName, Remark, RemotePath, Secret, SshKey, Words,
+    Commit, DeviceSerial, KeyId, Name, Port, PortName, Remark, RemotePath, Secret, SshKey, Words,
 };
 use crate::trail::{
     Binding, Breakdown, Card, Carriage, ChannelEnd, ClientId, ClientKind, ConnectionId, Entry,
@@ -34,7 +34,7 @@ use crate::trail::{
 /// The version both ends must speak. A client of another version is refused
 /// at the greeting with both numbers. Invariant: a protocol fact a script
 /// reads.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// What the person decides about a held request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,6 +892,8 @@ pub enum Reply {
 pub struct Bundle {
     /// The release of the core that assembled it.
     pub version: String,
+    /// The commit that core was built from.
+    pub commit: Commit,
     /// The folder it runs from.
     pub program: String,
     /// Windows' own version, as the core read it.

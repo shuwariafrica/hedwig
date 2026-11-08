@@ -31,7 +31,7 @@ use hedwig_model::remote::{Client, Lister, Listing, RemoteId};
 use hedwig_model::setting::Keepalive;
 use hedwig_model::site::{Opening, Site};
 use hedwig_model::text::{
-    Address, DeviceSerial, Fingerprint, Grip, KeyId, Location, Mark, Name, Port, PortName,
+    Address, Commit, DeviceSerial, Fingerprint, Grip, KeyId, Location, Mark, Name, Port, PortName,
     RemotePath, SshKey, Words,
 };
 use hedwig_model::trail::{
@@ -732,6 +732,8 @@ pub struct Core {
     trail: Vec<Entry>,
     state: State,
     version: String,
+    /// The commit the build running this core was made from.
+    commit: Commit,
     /// The level diagnostics were last said to be written at.
     diagnosed: Option<hedwig_model::setting::Diagnostics>,
     /// What was last said Windows starts at sign-in: Hedwig, and its icon.
@@ -806,24 +808,32 @@ pub struct Core {
 
 impl Core {
     /// A core over a trail never compacted and the configuration read at
-    /// start.
+    /// start, of a build that names no commit.
     pub fn new(
         catalogue: Catalogue,
         configuration: Configuration,
         trail: Vec<Entry>,
         version: String,
     ) -> Core {
-        Core::resume(catalogue, configuration, State::default(), trail, version)
+        Core::resume(
+            catalogue,
+            configuration,
+            State::default(),
+            trail,
+            version,
+            Commit::unknown(),
+        )
     }
 
     /// A core over the trail read at start - its head and its entries - and
-    /// the configuration.
+    /// the configuration, of the build of `version` made from `commit`.
     pub fn resume(
         catalogue: Catalogue,
         configuration: Configuration,
         head: State,
         trail: Vec<Entry>,
         version: String,
+        commit: Commit,
     ) -> Core {
         Core {
             state: State::after(head.clone(), &trail),
@@ -832,6 +842,7 @@ impl Core {
             configuration,
             trail,
             version,
+            commit,
             diagnosed: None,
             starting: None,
             links: BTreeMap::new(),
@@ -952,6 +963,7 @@ impl Core {
         activity.reverse();
         Some(hedwig_model::protocol::Bundle {
             version: self.version.clone(),
+            commit: self.commit.clone(),
             program: String::new(),
             windows: String::new(),
             status,

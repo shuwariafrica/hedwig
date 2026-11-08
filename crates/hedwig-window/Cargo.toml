@@ -1,0 +1,43 @@
+[package]
+name = "hedwig-window"
+description = "Hedwig's window, where a person sets up and reviews what of theirs is reachable from where"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+
+# What the window shows is `hedwig-view`'s; WinUI draws it. The window is a
+# client of the core's pipe like the icon, and calls Windows itself only
+# through `hedwig-shell`.
+[dependencies]
+hedwig-model.workspace = true
+hedwig-win.workspace = true
+hedwig-client.workspace = true
+hedwig-view.workspace = true
+hedwig-shell.workspace = true
+windows-reactor.workspace = true
+
+[build-dependencies]
+windows-reactor-setup.workspace = true
+hedwig-view.workspace = true
+
+# What Windows reads of the built executable: its name and its icon.
+[dev-dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_RestartManager",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[lints]
+workspace = true

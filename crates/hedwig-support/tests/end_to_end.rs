@@ -817,7 +817,9 @@ fn a_start_that_fails_says_how() {
 /// This workspace's build shape, as its manifests and crate roots state it:
 /// of the crates `hedwig.exe` is built from, `hedwig-win` alone may contain
 /// `unsafe`; the stand-in interface is built from the client and the model
-/// and never the core; the executable is built without any interface.
+/// and never the core; the command line links no interface, and runs the
+/// view at build alone, for its version resource; setup links the view and
+/// the shell, whose `unsafe` reaches it as it reaches the interface's own.
 #[test]
 fn of_the_command_lines_crates_only_hedwig_win_may_contain_unsafe() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -827,20 +829,13 @@ fn of_the_command_lines_crates_only_hedwig_win_may_contain_unsafe() {
         "hedwig-core/src/lib.rs",
         "hedwig-client/src/lib.rs",
         "hedwig/src/main.rs",
+        "hedwig-setup/src/main.rs",
         "hedwig-support/src/bin/interface.rs",
     ] {
         assert!(text(root).contains("\n#![forbid(unsafe_code)]\n"), "{root}");
     }
     assert!(text("hedwig-win/src/pipe.rs").contains("unsafe {"));
 
-    let depends = |manifest: &str| -> Vec<String> {
-        text(manifest)
-            .lines()
-            .filter_map(|written| written.strip_suffix(".workspace = true"))
-            .filter(|name| name.starts_with("hedwig-"))
-            .map(str::to_owned)
-            .collect()
-    };
     let interface = text("hedwig-support/src/bin/interface.rs");
     let interface: Vec<&str> = interface
         .lines()
@@ -852,18 +847,133 @@ fn of_the_command_lines_crates_only_hedwig_win_may_contain_unsafe() {
         .collect();
     assert_eq!(interface, ["hedwig_client", "hedwig_model"]);
     assert_eq!(
-        depends("hedwig-client/Cargo.toml"),
+        linked(&text("hedwig-client/Cargo.toml")),
         ["hedwig-model", "hedwig-win"]
     );
     assert_eq!(
-        depends("hedwig/Cargo.toml"),
+        linked(&text("hedwig/Cargo.toml")),
         ["hedwig-model", "hedwig-win", "hedwig-core", "hedwig-client"]
     );
+    assert_eq!(built_with(&text("hedwig/Cargo.toml")), ["hedwig-view"]);
     assert_eq!(
-        depends("hedwig-core/Cargo.toml"),
+        linked(&text("hedwig-core/Cargo.toml")),
         ["hedwig-model", "hedwig-win"]
     );
-    assert_eq!(depends("hedwig-win/Cargo.toml"), Vec::<String>::new());
+    assert_eq!(linked(&text("hedwig-win/Cargo.toml")), Vec::<String>::new());
+    // Setup places, starts and removes through the client, and asks its
+    // question through the interface's shell; it never links the core: the
+    // core it starts is the `hedwig.exe` it carries.
+    assert_eq!(
+        linked(&text("hedwig-setup/Cargo.toml")),
+        [
+            "hedwig-model",
+            "hedwig-client",
+            "hedwig-win",
+            "hedwig-view",
+            "hedwig-shell"
+        ]
+    );
+    assert_eq!(
+        built_with(&text("hedwig-setup/Cargo.toml")),
+        ["hedwig-model", "hedwig-win", "hedwig-view"]
+    );
+}
+
+/// The Hedwig crates a manifest's `[dependencies]` names, in order: what
+/// links into what is built, never what only a suite uses.
+fn linked(manifest: &str) -> Vec<String> {
+    named_in(manifest, "[dependencies]")
+}
+
+/// The Hedwig crates a manifest's `[build-dependencies]` names: code run at
+/// build, never in the binary.
+fn built_with(manifest: &str) -> Vec<String> {
+    named_in(manifest, "[build-dependencies]")
+}
+
+fn named_in(manifest: &str, wanted: &str) -> Vec<String> {
+    let mut section = "";
+    let mut found = Vec::new();
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line;
+        } else if section == wanted
+            && let Some(name) = line.strip_suffix(".workspace = true")
+            && name.starts_with("hedwig-")
+        {
+            found.push(name.to_owned());
+        }
+    }
+    found
+}
+
+/// The interface's crates, as their manifests and crate roots state them:
+/// two executables and two libraries, `unsafe` in the shell alone, the core
+/// linked by none of them, the Windows Runtime's activation imported from
+/// `combase.dll` by name, and Direct2D and DirectWrite loaded from the
+/// system folder when first drawn, never imported.
+#[test]
+fn the_interface_confines_unsafe_to_its_shell_and_never_links_the_core() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let text = |relative: &str| fs::read_to_string(crates.join(relative)).unwrap();
+    let workspace = text("../Cargo.toml");
+    for member in [
+        "crates/hedwig-view",
+        "crates/hedwig-shell",
+        "crates/hedwig-interface",
+        "crates/hedwig-window",
+    ] {
+        assert!(workspace.contains(&format!("\"{member}\",")), "{member}");
+    }
+    for root in [
+        "hedwig-view/src/lib.rs",
+        "hedwig-interface/src/main.rs",
+        "hedwig-window/src/main.rs",
+    ] {
+        assert!(text(root).contains("\n#![forbid(unsafe_code)]\n"), "{root}");
+    }
+    assert!(!text("hedwig-shell/src/lib.rs").contains("forbid(unsafe_code)"));
+
+    assert_eq!(
+        linked(&text("hedwig-view/Cargo.toml")),
+        ["hedwig-model", "hedwig-client"]
+    );
+    assert_eq!(linked(&text("hedwig-shell/Cargo.toml")), ["hedwig-view"]);
+    let executable = [
+        "hedwig-model",
+        "hedwig-win",
+        "hedwig-client",
+        "hedwig-view",
+        "hedwig-shell",
+    ];
+    assert_eq!(linked(&text("hedwig-interface/Cargo.toml")), executable);
+    assert_eq!(linked(&text("hedwig-window/Cargo.toml")), executable);
+    for manifest in [
+        "hedwig-view/Cargo.toml",
+        "hedwig-shell/Cargo.toml",
+        "hedwig-interface/Cargo.toml",
+        "hedwig-window/Cargo.toml",
+    ] {
+        assert!(!text(manifest).contains("hedwig-core"), "{manifest}");
+    }
+    assert!(text("hedwig-window/Cargo.toml").contains("windows-reactor.workspace = true"));
+    assert!(!text("hedwig-interface/Cargo.toml").contains("windows-reactor"));
+
+    let settings = text("hedwig-shell/src/settings.rs");
+    assert!(
+        settings.contains(
+            r#"#[link(name = "combase.dll", kind = "raw-dylib", modifiers = "+verbatim")]"#
+        )
+    );
+    let write = text("hedwig-shell/src/write.rs");
+    assert!(write.contains("LOAD_LIBRARY_SEARCH_SYSTEM32"));
+    assert!(write.contains(r#"entry("d2d1.dll", b"D2D1CreateFactory\0")"#));
+    assert!(write.contains(r#"entry("dwrite.dll", b"DWriteCreateFactory\0")"#));
+    for source in fs::read_dir(crates.join("hedwig-shell/src")).unwrap() {
+        let source = fs::read_to_string(source.unwrap().path()).unwrap();
+        assert!(!source.contains(r#"#[link(name = "d2d1"#));
+        assert!(!source.contains(r#"#[link(name = "dwrite"#));
+    }
 }
 
 /// Windows' version as its own `kernel32.dll` states it, read by PowerShell

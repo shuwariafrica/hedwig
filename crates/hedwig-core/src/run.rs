@@ -21,7 +21,7 @@ use hedwig_model::process::{Exit, Order, Report};
 use hedwig_model::protocol::FromCore;
 use hedwig_model::remote::{Client, RemoteId};
 use hedwig_model::setting::Keepalive;
-use hedwig_model::text::{Address, Name, PipeName, Port};
+use hedwig_model::text::{Address, Commit, Name, PipeName, Port};
 use hedwig_model::trail::{
     Asking, Breakdown, ConnectionId, Entry, Origin, Peer, Store, Target, Tick, Timestamp,
 };
@@ -1143,14 +1143,19 @@ impl Desk {
     }
 }
 
-/// Runs the core until it is stopped or cannot go on, on the workstation's
-/// own serial ports.
-pub fn run(places: Places, version: &str) -> Exit {
-    run_on(places, version, Arc::new(crate::serial::Windows))
+/// Runs the core of the build of `version` made from `commit` until it is
+/// stopped or cannot go on, on the workstation's own serial ports.
+pub fn run(places: Places, version: &str, commit: &Commit) -> Exit {
+    run_on(places, version, commit, Arc::new(crate::serial::Windows))
 }
 
 /// Runs the core on the serial ports `lines` gives.
-pub fn run_on(places: Places, version: &str, lines: Arc<dyn crate::serial::Lines>) -> Exit {
+pub fn run_on(
+    places: Places,
+    version: &str,
+    commit: &Commit,
+    lines: Arc<dyn crate::serial::Lines>,
+) -> Exit {
     hedwig_win::process::quieten();
     hedwig_win::process::seal();
     let clock = Clock {
@@ -1214,7 +1219,7 @@ pub fn run_on(places: Places, version: &str, lines: Arc<dyn crate::serial::Lines
         thread::spawn(move || keeper(&kept, at, queued, &messages));
     }
     serve(
-        &inbox, &messages, catalogue, &clock, &jobs, after, version, lines, places, early,
+        &inbox, &messages, catalogue, &clock, &jobs, after, version, commit, lines, places, early,
     )
 }
 
@@ -1270,6 +1275,7 @@ fn serve(
     jobs: &Sender<Job>,
     after: Option<Breakdown>,
     version: &str,
+    commit: &Commit,
     lines: Arc<dyn crate::serial::Lines>,
     places: Places,
     early: Vec<Early>,
@@ -1304,6 +1310,7 @@ fn serve(
         loaded.head,
         loaded.entries,
         version.to_owned(),
+        commit.clone(),
     );
     let (mut desk, pipe) = match Desk::new(core, clock, jobs, messages, lines, places, early) {
         Ok(made) => made,

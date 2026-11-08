@@ -246,6 +246,8 @@ pub struct Packed {
 /// Why a setup program's payload cannot be placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackError {
+    /// It was built with nothing to install.
+    Empty,
     /// It ends before what it says it holds.
     Short,
     /// Its index is not one.
@@ -261,6 +263,9 @@ pub enum PackError {
 impl fmt::Display for PackError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PackError::Empty => f.write_str(
+                "this setup program carries no Hedwig: it was built with nothing to install",
+            ),
             PackError::Short => f.write_str("the setup program is cut short"),
             PackError::Index(account) => {
                 write!(f, "the setup program's index cannot be read: {account}")

@@ -1,0 +1,40 @@
+[package]
+name = "hedwig-interface"
+description = "Hedwig's notification-area icon, its menu and its cards, and removal from Settings: a client of the core's control pipe"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+
+# The client, the model and what draws: never the core. The interface asks
+# the core over its pipe as any client does.
+[dependencies]
+hedwig-model.workspace = true
+hedwig-win.workspace = true
+hedwig-client.workspace = true
+hedwig-view.workspace = true
+hedwig-shell.workspace = true
+zeroize.workspace = true
+
+# The executable's icon and version information, drawn and written at build.
+[build-dependencies]
+hedwig-view.workspace = true
+
+# What Windows reads of the built executable: its name and its icon.
+[dev-dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_RestartManager",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[lints]
+workspace = true

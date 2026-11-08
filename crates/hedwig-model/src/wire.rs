@@ -55,9 +55,10 @@ use crate::setting::{
 };
 use crate::site::{Site, SiteError, Unopenable};
 use crate::text::{
-    Address, AgentPipe, DeviceSerial, DeviceSocket, Fingerprint, Folder, Grip, Host, Kernel, KeyId,
-    Location, Mark, Name, Pattern, PipeName, Port, PortName, Program, Remark, RemotePath, Secret,
-    Serial, ServiceName, SshKey, Template, TextError, Variable, Verbatim, Words,
+    Address, AgentPipe, Commit, DeviceSerial, DeviceSocket, Fingerprint, Folder, Grip, Host,
+    Kernel, KeyId, Location, Mark, Name, Pattern, PipeName, Port, PortName, Program, Remark,
+    RemotePath, Secret, Serial, ServiceName, SshKey, Template, TextError, Variable, Verbatim,
+    Words,
 };
 use crate::trail::{
     Ask, Asking, Binding, Breakdown, Card, Carriage, Carry, ChannelEnd, ClientId, ClientKind,
@@ -446,6 +447,7 @@ macro_rules! text {
 
 text!(
     Name,
+    Commit,
     Address,
     Host,
     Variable,
@@ -1616,6 +1618,7 @@ record!(Withdrawal {
 record!(SetAside { name, bytes, at });
 record!(Bundle {
     version,
+    commit,
     program,
     windows,
     status,

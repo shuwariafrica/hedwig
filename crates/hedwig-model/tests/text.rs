@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 
 use hedwig_model::text::{
-    Address, Fingerprint, Folder, Grip, Host, Mark, Name, Pattern, PipeName, Port, Program,
+    Address, Commit, Fingerprint, Folder, Grip, Host, Mark, Name, Pattern, PipeName, Port, Program,
     RemotePath, Secret, Serial, Template, TextError, Variable, Verbatim, Words,
 };
 
@@ -234,6 +234,7 @@ fn every_text_refusal_says_what_was_wrong() {
         TextError::Placeholder,
         TextError::ZeroPort,
         TextError::PipeName,
+        TextError::Commit,
     ]
     .iter()
     .map(ToString::to_string)
@@ -305,4 +306,27 @@ fn a_keygrip_a_fingerprint_and_a_serial_number_are_each_their_own_form() {
         Serial::try_from("D276+0001"),
         Err(TextError::Character { found: '+', at: 4 })
     );
+}
+
+/// A build's commit is twelve lower-case hexadecimal digits, marked where
+/// the build's tree differed from it, or unknown where it had no repository;
+/// it reads back as it was written.
+#[test]
+fn a_commit_is_twelve_digits_marked_where_modified_or_unknown() {
+    for text in ["0123456789ab", "0123456789ab, modified", "unknown"] {
+        assert_eq!(Commit::try_from(text).unwrap().as_str(), text);
+    }
+    assert_eq!(Commit::unknown().as_str(), "unknown");
+    assert_eq!(Commit::try_from(""), Err(TextError::Empty));
+    for text in [
+        "0123456789a",
+        "0123456789abc",
+        "0123456789AB",
+        "0123456789ab,modified",
+        "0123456789ab, changed",
+        ", modified",
+        "unknown, modified",
+    ] {
+        assert_eq!(Commit::try_from(text), Err(TextError::Commit), "{text}");
+    }
 }
