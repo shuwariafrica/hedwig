@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fmt::Debug;
 
 use hedwig_model::capability::{Lends, Source};
@@ -64,15 +65,30 @@ fn every_frame_entry_and_document_survives_both_directions() {
     assert!(all_lines().len() > 200);
 }
 
+/// Whether a run is asked to write the pinned file. An empty value asks
+/// nothing: PowerShell's `[Environment]::SetEnvironmentVariable(name, $null)`
+/// leaves the variable defined and empty, and a pin it set would pass against
+/// any corpus.
+fn pinning(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+#[test]
+fn only_a_pin_variable_with_a_value_rewrites_the_corpus() {
+    assert!(!pinning(None));
+    assert!(!pinning(Some(OsStr::new(""))));
+    assert!(pinning(Some(OsStr::new("1"))));
+}
+
 /// Known answers: the bytes are part of the contract a script reads, so a
 /// change to any of them is a change to the protocol and shows here. Set
-/// `HEDWIG_MODEL_PIN` to write the file after a deliberate change.
+/// `HEDWIG_MODEL_PIN` to a value to write the file after a deliberate change.
 #[test]
 fn the_written_form_is_pinned() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus.jsonl");
     let mut written = all_lines().join("\n");
     written.push('\n');
-    if std::env::var_os("HEDWIG_MODEL_PIN").is_some() {
+    if pinning(std::env::var_os("HEDWIG_MODEL_PIN").as_deref()) {
         std::fs::write(path, &written).expect("the corpus is written");
     }
     let pinned = std::fs::read_to_string(path).expect("tests/corpus.jsonl exists");
