@@ -28,6 +28,27 @@ fn escapes(path: &str) -> Result<Index, PackError> {
     Err(PackError::Escapes(path.to_owned()))
 }
 
+fn misnamed(path: &str) -> Result<Index, PackError> {
+    Err(PackError::Misnamed(path.to_owned()))
+}
+
+/// Every device name Windows reserves: the four named, then COM and LPT each
+/// with one to nine and the superscript one, two and three.
+fn devices() -> Vec<String> {
+    let numbered = ["COM", "LPT"].into_iter().flat_map(|prefix| {
+        [
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "\u{b9}", "\u{b2}", "\u{b3}",
+        ]
+        .into_iter()
+        .map(move |digit| format!("{prefix}{digit}"))
+    });
+    ["CON", "PRN", "AUX", "NUL"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(numbered)
+        .collect()
+}
+
 #[test]
 fn a_frame_gives_back_the_index_and_the_stream_it_was_made_from() {
     let paths = [
@@ -166,6 +187,75 @@ fn a_path_through_a_parent_folder_part_is_refused() {
 }
 
 #[test]
+fn a_part_ending_in_a_period_is_refused() {
+    for path in [
+        r"a.\hedwig.exe",
+        "hedwig.exe.",
+        r"bin\...\hedwig.exe",
+        "...",
+    ] {
+        assert_eq!(after_one(path), misnamed(path));
+    }
+}
+
+#[test]
+fn a_part_ending_in_a_space_is_refused() {
+    for path in [
+        r"a \hedwig.exe",
+        "hedwig.exe ",
+        r"bin\ \hedwig.exe",
+        r". \x",
+    ] {
+        assert_eq!(after_one(path), misnamed(path));
+    }
+}
+
+#[test]
+fn a_part_naming_a_device_is_refused_alone_or_before_an_extension() {
+    let mut named = 0;
+    for device in devices() {
+        for path in [
+            device.clone(),
+            device.to_lowercase(),
+            format!("{device}.txt"),
+            format!("{device}.tar.gz"),
+            format!(r"{device}\hedwig.exe"),
+            format!(r"bin\{}.dll", device.to_lowercase()),
+        ] {
+            assert_eq!(after_one(&path), misnamed(&path));
+            named += 1;
+        }
+    }
+    assert_eq!(named, 28 * 6);
+}
+
+#[test]
+fn a_part_only_resembling_a_device_is_kept() {
+    let resembling = index(&[
+        ("NULx", 1),
+        ("xNUL", 1),
+        ("CONSOLE.txt", 1),
+        ("AUXILIARY", 1),
+        ("NUL x.txt", 1),
+        (r"PRN-notes\a.txt", 1),
+        ("COM10", 1),
+        ("LPT10.log", 1),
+        ("COM0", 1),
+        ("LPT0", 1),
+        ("COM\u{2074}", 1),
+    ]);
+    assert_eq!(resembling.clone().checked(), Ok(resembling));
+}
+
+#[test]
+fn a_part_holding_a_character_windows_refuses_is_refused() {
+    for character in ['<', '>', '"', '|', '?', '*', '\0', '\u{1}', '\t', '\u{1f}'] {
+        let path = format!(r"bin\a{character}b.txt");
+        assert_eq!(after_one(&path), misnamed(&path), "{character:?}");
+    }
+}
+
+#[test]
 fn a_path_listed_twice_is_refused_in_any_case() {
     let twice = index(&[("hedwig.exe", 1), (r"runtime\a.dll", 1), ("hedwig.exe", 2)]);
     assert_eq!(
@@ -187,6 +277,8 @@ fn an_index_of_paths_inside_the_folder_is_kept_as_it_is() {
             (r"runtime\Microsoft.WindowsAppRuntime.Bootstrap.dll", 2),
             (r"a b\..config", 3),
             ("a..b.txt", 4),
+            (".temp", 5),
+            ("a!b~1 \u{7f}c.txt", 6),
             (r"x\y\z", 0),
         ]),
         index(&[]),

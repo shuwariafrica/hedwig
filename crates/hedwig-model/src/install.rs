@@ -254,6 +254,9 @@ pub enum PackError {
     Index(String),
     /// A path that is not relative to the program folder, or leaves it.
     Escapes(String),
+    /// A path Windows would not keep as written: a part ending in a period or
+    /// a space, naming a device, or holding a character Windows refuses.
+    Misnamed(String),
     /// A path listed twice.
     Repeated(String),
     /// The files' lengths do not add up to what the stream holds.
@@ -276,6 +279,10 @@ impl fmt::Display for PackError {
                     "the setup program would place {path} outside Hedwig's folder"
                 )
             }
+            PackError::Misnamed(path) => write!(
+                f,
+                "the setup program names {path}, which Windows does not keep as written"
+            ),
             PackError::Repeated(path) => write!(f, "the setup program lists {path} twice"),
             PackError::Lengths => f.write_str("the setup program's files do not add up"),
         }
@@ -286,25 +293,31 @@ impl std::error::Error for PackError {}
 
 impl Index {
     /// Refuses an index whose files could land outside the program folder,
-    /// or one listing a file twice.
+    /// one naming a file Windows would not keep as written, or one listing a
+    /// file twice. What Windows keeps as written is what [Naming Files, Paths,
+    /// and Namespaces](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)
+    /// allows in a name.
     ///
     /// # Errors
     ///
-    /// [`PackError::Escapes`], [`PackError::Repeated`].
+    /// [`PackError::Escapes`], [`PackError::Misnamed`],
+    /// [`PackError::Repeated`].
     pub fn checked(self) -> Result<Index, PackError> {
         let mut seen = std::collections::BTreeSet::new();
         for packed in &self.files {
-            let parts: Vec<&str> = packed.path.split('\\').collect();
-            let escapes = packed.path.is_empty()
-                || packed.path.contains(['/', ':'])
-                || parts
-                    .iter()
-                    .any(|part| part.is_empty() || *part == "." || *part == "..");
-            if escapes {
-                return Err(PackError::Escapes(packed.path.clone()));
+            let path = &packed.path;
+            if path.contains(['/', ':'])
+                || path
+                    .split('\\')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(PackError::Escapes(path.clone()));
             }
-            if !seen.insert(packed.path.to_lowercase()) {
-                return Err(PackError::Repeated(packed.path.clone()));
+            if path.split('\\').any(misnamed) {
+                return Err(PackError::Misnamed(path.clone()));
+            }
+            if !seen.insert(path.to_lowercase()) {
+                return Err(PackError::Repeated(path.clone()));
             }
         }
         Ok(self)
@@ -314,6 +327,47 @@ impl Index {
     pub fn length(&self) -> u64 {
         self.files.iter().map(|packed| packed.bytes).sum()
     }
+}
+
+/// The devices whose names Windows reserves in every folder, alone or before
+/// an extension.
+const DEVICES: &[&str] = &["CON", "PRN", "AUX", "NUL"];
+
+/// The numbered devices: each prefix is reserved with one digit after it,
+/// one to nine or the superscript one, two or three.
+const NUMBERED: &[&str] = &["COM", "LPT"];
+
+const DIGITS: &[char] = &[
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '\u{b9}', '\u{b2}', '\u{b3}',
+];
+
+/// Whether Windows would keep `part` other than as written: it ends in a
+/// period or a space, names a device, or holds a character Windows refuses.
+fn misnamed(part: &str) -> bool {
+    part.ends_with(['.', ' ']) || part.contains(forbidden) || device(part)
+}
+
+/// The characters Windows refuses in a name beyond `\`, `/` and `:`, which
+/// lead out of the folder.
+fn forbidden(character: char) -> bool {
+    matches!(character, '<' | '>' | '"' | '|' | '?' | '*' | '\0'..='\x1f')
+}
+
+/// Whether `part`, before its first period, is a device's name.
+fn device(part: &str) -> bool {
+    let stem = part.split_once('.').map_or(part, |(stem, _)| stem);
+    DEVICES.iter().any(|name| stem.eq_ignore_ascii_case(name))
+        || NUMBERED.iter().any(|prefix| {
+            stem.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                && stem.get(prefix.len()..).is_some_and(|rest| {
+                    let mut characters = rest.chars();
+                    characters
+                        .next()
+                        .is_some_and(|digit| DIGITS.contains(&digit))
+                        && characters.next().is_none()
+                })
+        })
 }
 
 /// The payload's frame: the index's length, the index in the written form,
