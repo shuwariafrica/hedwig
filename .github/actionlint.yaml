@@ -1,0 +1,7 @@
+# GitHub-hosted labels actionlint 1.7.12 does not know yet, declared as its
+# documented way to accept a label; remove each once a release knows it
+# (rhysd/actionlint#723, #743 for ubuntu-26.04).
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - windows-11-vs2026-arm

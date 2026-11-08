@@ -1,0 +1,438 @@
+name: ci
+
+# No paths filter: a workflow a filter skips leaves its required check pending,
+# so every change, a Markdown-only one included, runs and reports gate.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      retention-days:
+        description: Days the packaged downloads are kept.
+        type: number
+        default: 1
+
+permissions: {}
+
+# The prefix is literal because a called workflow's github.workflow is its
+# caller's, and one group in both would cancel the caller. A newer push to a
+# pull request supersedes its run; a run on main or a tag is that commit's
+# record and is never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: rust / ${{ matrix.arch }} / test
+    strategy:
+      fail-fast: false
+      matrix: &windows
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2025-vs2026
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            runner: windows-11-vs2026-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - &checkout
+        name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - &matcher
+        name: Annotate the compiler's diagnostics
+        shell: bash
+        run: printf '::add-matcher::.github/rustc-matcher.json\n'
+
+      - name: Fetch the suites' programs
+        run: |
+          Set-StrictMode -Version Latest
+          ./scripts/fetch-test-tools.ps1 | ForEach-Object { "$($_.Name)=$($_.Value)" } |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # --target pins the MSVC ABI, which the image's default host would
+      # otherwise choose. The suites run the executables built here.
+      - name: Build
+        id: build
+        run: cargo build --workspace --release --locked --target $env:TARGET
+
+      # Every test binary runs, so one failing suite cannot hide another's.
+      - name: Test
+        id: test
+        run: |
+          Set-StrictMode -Version Latest
+          $log = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'test.log'
+          cargo test --workspace --release --locked --target $env:TARGET --no-fail-fast 2>&1 |
+              Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed (exit code $LASTEXITCODE)" }
+
+      - name: Summarise the suites
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          Set-StrictMode -Version Latest
+          $log = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'test.log'
+          $rows = [Collections.Generic.List[string]]::new()
+          $suite = ''
+          $counts = '^test result: \w+\. (?<passed>\d+) passed; (?<failed>\d+) failed; (?<ignored>\d+) ignored'
+          foreach ($line in Get-Content -LiteralPath $log) {
+              if ($line -match '^\s+Running .*[\\/]deps[\\/](?<binary>[^\\/]+)-[0-9a-f]+\.exe\)') {
+                  $suite = $Matches.binary
+              } elseif ($line -match '^\s+Doc-tests (?<crate>\S+)') {
+                  $suite = "$($Matches.crate) (doc)"
+              } elseif ($line -match $counts) {
+                  $rows.Add("| $suite | $($Matches.passed) | $($Matches.failed) | $($Matches.ignored) |")
+              }
+          }
+          $head = "### rust / $env:ARCH / test", '', '| Suite | Passed | Failed | Ignored |', '| --- | ---: | ---: | ---: |'
+          $table = @($head) + $rows
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $table -Encoding utf8
+        env:
+          ARCH: ${{ matrix.arch }}
+
+      # Of the tests ignored for what they need, a hosted runner provides an
+      # elevated session and a listener on every address with no firewall
+      # prompt; the rest need an SSH server on loopback, a registered GnuPG for
+      # Windows, a COM port, a TPM, a session at medium integrity or the
+      # desktop's foreground.
+      - name: Test what a hosted runner provides
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          Set-StrictMode -Version Latest
+          $provided = @(
+              [pscustomobject] @{
+                  Package = 'hedwig-support'
+                  Suite   = 'end_to_end'
+                  Test    = 'a_pipe_that_belongs_to_someone_else_is_sent_nothing'
+              }
+              [pscustomobject] @{
+                  Package = 'hedwig-win'
+                  Suite   = 'endpoint'
+                  Test    = 'no_other_socket_takes_what_is_sent_to_the_endpoint'
+              }
+          )
+          foreach ($one in $provided) {
+              cargo test --release --locked --target $env:TARGET -p $one.Package --test $one.Suite -- --ignored --exact $one.Test
+              if ($LASTEXITCODE -ne 0) { throw "$($one.Test) failed (exit code $LASTEXITCODE)" }
+          }
+
+      - name: Lay out setup's payload
+        run: |
+          Set-StrictMode -Version Latest
+          $payload = @{
+              Build       = Join-Path -Path 'target' -ChildPath $env:TARGET -AdditionalChildPath 'release'
+              Destination = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'payload'
+          }
+          ./scripts/stage-payload.ps1 @payload
+
+      - name: Build setup
+        env:
+          HEDWIG_PAYLOAD: ${{ runner.temp }}/payload
+        run: cargo build -p hedwig-setup --release --locked --target $env:TARGET
+
+      - name: Name the downloads
+        run: |
+          Set-StrictMode -Version Latest
+          $built = Join-Path -Path 'target' -ChildPath $env:TARGET -AdditionalChildPath 'release'
+          $dist = New-Item -ItemType Directory -Force -Path 'dist'
+          foreach ($program in 'hedwig-setup', 'hedwig') {
+              $download = Join-Path -Path $dist -ChildPath "$program-$env:ARCH.exe"
+              Copy-Item -LiteralPath (Join-Path -Path $built -ChildPath "$program.exe") -Destination $download
+          }
+        env:
+          ARCH: ${{ matrix.arch }}
+
+      - name: Upload setup
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: dist/hedwig-setup-${{ matrix.arch }}.exe
+          archive: false
+          retention-days: ${{ inputs.retention-days || 7 }}
+          if-no-files-found: error
+
+      - name: Upload the command line
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: dist/hedwig-${{ matrix.arch }}.exe
+          archive: false
+          retention-days: ${{ inputs.retention-days || 7 }}
+          if-no-files-found: error
+
+  clippy:
+    name: rust / ${{ matrix.arch }} / clippy
+    strategy:
+      fail-fast: false
+      matrix: *windows
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - *checkout
+      - *matcher
+      - name: Lint every target
+        run: cargo clippy --workspace --all-targets --locked --target $env:TARGET -- -D warnings
+        env:
+          TARGET: ${{ matrix.target }}
+
+  rustdoc:
+    name: rust / x64 / rustdoc
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - *checkout
+      - *matcher
+      - name: Build the documentation with warnings denied
+        run: cargo doc --workspace --no-deps --locked --target x86_64-pc-windows-msvc
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  rustfmt:
+    name: rust / rustfmt / check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - *checkout
+      - name: Check the formatting
+        run: cargo fmt --all --check
+
+  deny:
+    name: rust / cargo-deny / check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - *checkout
+      - name: Check advisories, bans, licences and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+
+  psscriptanalyzer:
+    name: powershell / psscriptanalyzer / lint
+    # Windows: the analyser checks aliases against its own session, and
+    # PowerShell defines ls, cat, sort and others on Windows alone.
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - *checkout
+      - &gate-tools
+        name: Fetch the gate tools
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          foreach ($folder in ./scripts/fetch-tools.ps1 -Set gate) {
+              if ($folder.Name -eq 'Path') {
+                  $folder.Value | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+              } else {
+                  "PSModulePath=$($folder.Value)$([IO.Path]::PathSeparator)$env:PSModulePath" |
+                      Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              }
+          }
+      - &run-blocks
+        name: Write out the workflows' run blocks
+        shell: pwsh
+        run: ./scripts/export-run-blocks.ps1 -Destination target/run-blocks | Format-Table -Property Workflow, Job, Step, Shell
+      - name: Analyse every script and run block
+        run: ./scripts/lint-powershell.ps1 -Path target/run-blocks | Format-Table -Property Path, Attempts
+
+  pester:
+    name: powershell / pester / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            runner: windows-2025-vs2026
+          - os: linux
+            runner: ubuntu-26.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - *checkout
+      - *gate-tools
+      - name: Run the scripts' tests
+        run: |
+          Set-StrictMode -Version Latest
+          $pins = (Get-Content -LiteralPath scripts/tools.json -Raw | ConvertFrom-Json).tools
+          Import-Module -Name Pester -RequiredVersion ($pins | Where-Object { $_.tool -eq 'Pester' }).version
+          $configuration = New-PesterConfiguration
+          $configuration.Run.Path = @(git ls-files '*.Tests.ps1')
+          $configuration.Run.PassThru = $true
+          $configuration.Output.Verbosity = 'Detailed'
+          $result = Invoke-Pester -Configuration $configuration
+          $summary = @(
+              "### powershell / pester / $env:OS_NAME", ''
+              '| Passed | Failed | Skipped | Not run |', '| ---: | ---: | ---: | ---: |'
+              "| $($result.PassedCount) | $($result.FailedCount) | $($result.SkippedCount) | $($result.NotRunCount) |"
+          )
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
+          # A run that discovers no tests still reports Passed.
+          if ($result.Result -ne 'Passed' -or $result.PassedCount -eq 0) {
+              throw "Pester: $($result.PassedCount) passed, $($result.FailedCount) failed, $($result.NotRunCount) not run."
+          }
+        env:
+          OS_NAME: ${{ matrix.os }}
+
+  shellcheck:
+    name: bash / shellcheck / lint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - *checkout
+      - *gate-tools
+      - *run-blocks
+      - name: Lint every script and run block
+        run: |
+          shellcheck --version
+          tracked=$(git ls-files '*.sh')
+          scripts=()
+          if [[ -n "${tracked}" ]]; then
+            mapfile -t scripts <<<"${tracked}"
+          fi
+          scripts+=(target/run-blocks/*.sh)
+          shellcheck --severity=style --format=json1 "${scripts[@]}" >"${RUNNER_TEMP:?}/shellcheck.json" || status=$?
+          jq --raw-output '.comments[] | "::error file=\(.file),line=\(.line),col=\(.column),title=SC\(.code)::\(.message)"' \
+            "${RUNNER_TEMP}/shellcheck.json"
+          exit "${status:-0}"
+
+  shfmt:
+    name: bash / shfmt / check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - *checkout
+      - *gate-tools
+      - *run-blocks
+      - name: Check every script's and run block's formatting
+        run: |
+          shfmt --version
+          tracked=$(git ls-files '*.sh')
+          scripts=()
+          if [[ -n "${tracked}" ]]; then
+            mapfile -t scripts <<<"${tracked}"
+          fi
+          scripts+=(target/run-blocks/*.sh)
+          shfmt --diff "${scripts[@]}"
+
+  actionlint:
+    name: workflows / actionlint / lint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - *checkout
+      - *gate-tools
+      # ShellCheck runs over the exported run blocks in its own job, with the
+      # repository's .shellcheckrc.
+      - name: Lint the workflows
+        run: |
+          actionlint -version
+          # shellcheck disable=SC2016 # A template actionlint expands, not the shell.
+          actionlint -shellcheck= -pyflakes= \
+            -format '{{range $e := .}}::error file={{$e.Filepath}},line={{$e.Line}},col={{$e.Column}},title=actionlint {{$e.Kind}}::{{$e.Message}}{{"\n"}}{{end}}'
+
+  zizmor:
+    name: workflows / zizmor / audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - *checkout
+      - *gate-tools
+      # The token lets zizmor check that each pinned commit belongs to the
+      # action it names.
+      - name: Audit the workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zizmor --version
+          zizmor --format=github .github
+
+  # The one check main's ruleset requires. A skipped required check counts as
+  # passing, so this runs whatever became of the jobs it needs, a cancelled run
+  # included, and fails unless every one of them succeeded.
+  gate:
+    name: gate
+    if: ${{ always() }}
+    needs: [test, clippy, rustdoc, rustfmt, deny, psscriptanalyzer, pester, shellcheck, shfmt, actionlint, zizmor]
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require every job to have succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          : "${NEEDS:?}" "${GITHUB_STEP_SUMMARY:?}"
+          {
+            printf '| Job | Result |\n| --- | --- |\n'
+            jq --raw-output 'to_entries[] | "| \(.key) | \(.value.result) |"' <<<"${NEEDS}"
+          } >>"${GITHUB_STEP_SUMMARY}"
+          failed=$(jq --raw-output '[to_entries[] | select(.value.result != "success") | .key] | join(", ")' <<<"${NEEDS}")
+          if [[ -n "${failed}" ]]; then
+            printf '::error title=gate::These jobs did not succeed: %s\n' "${failed}"
+            exit 1
+          fi

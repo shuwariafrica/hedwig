@@ -1,4 +1,15 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["local>shuwariafrica/.github"]
+  "extends": ["local>shuwariafrica/.github"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tools scripts/tools.json pins by version and SHA-256. A GitHub release asset's SHA-256 moves with its version; a module's does not, and fetch-tools.ps1 names the new one.",
+      "managerFilePatterns": ["/^scripts/tools\\.json$/"],
+      "matchStrings": [
+        "\"datasource\": \"(?<datasource>[^\"]+)\", \"package\": \"(?<depName>[^\"]+)\", (?:\"registry\": \"(?<registryUrl>[^\"]+)\", )?\"version\": \"(?<currentValue>[^\"]+)\", \"file\": \"[^\"]*\", (?:\"member\": \"[^\"]*\", )?\"sha256\": \"(?<currentDigest>[0-9a-f]{64})\""
+      ],
+      "versioningTemplate": "loose"
+    }
+  ]
 }
