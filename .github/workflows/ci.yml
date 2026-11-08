@@ -385,7 +385,7 @@ jobs:
           actionlint -version
           # shellcheck disable=SC2016 # A template actionlint expands, not the shell.
           actionlint -shellcheck= -pyflakes= \
-            -format '{{range $e := .}}::error file={{$e.Filepath}},line={{$e.Line}},col={{$e.Column}},title=actionlint {{$e.Kind}}::{{$e.Message}}{{"\n"}}{{end}}'
+            -format '{{range $e := .}}::error file={{$e.Filepath}},line={{$e.Line}},col={{$e.Column}},title=actionlint {{$e.Kind}}::{{$e.Message}}\n{{end}}'
 
   zizmor:
     name: workflows / zizmor / audit
