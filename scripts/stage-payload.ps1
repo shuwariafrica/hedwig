@@ -30,8 +30,8 @@
     when not given.
 
 .PARAMETER Cache
-    The folder windows-reactor-setup downloads into, which it takes from
-    LOCALAPPDATA.
+    The folder windows-reactor-setup downloads into. Taken from LOCALAPPDATA,
+    as the crate takes it, when not given.
 
 .EXAMPLE
     ./scripts/stage-payload.ps1 -Build target/x86_64-pc-windows-msvc/release -Destination target/payload-x64
@@ -50,7 +50,7 @@ param(
 
     [string] $ReactorSetup,
 
-    [string] $Cache = (Join-Path -Path ([string] $env:LOCALAPPDATA) -ChildPath 'windows-reactor-setup' 'temp'),
+    [string] $Cache,
 
     [string] $Manifest = (Join-Path -Path $PSScriptRoot -ChildPath 'tools.json')
 )
@@ -77,6 +77,25 @@ function Find-ReactorSetup {
         throw "Cargo.lock locks $($packages.Count) windows-reactor-setup packages; expected one."
     }
     Split-Path -Path $packages[0].manifest_path -Parent
+}
+
+function Get-ReactorCache {
+    <#
+    .SYNOPSIS
+        Emits the folder windows-reactor-setup downloads into under the given
+        LOCALAPPDATA, and throws where there is none.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $LocalAppData
+    )
+
+    if (-not $LocalAppData) {
+        throw 'LOCALAPPDATA is not set, so the folder windows-reactor-setup downloads into is unknown: give -Cache.'
+    }
+    Join-Path -Path $LocalAppData -ChildPath 'windows-reactor-setup' 'temp'
 }
 
 function Get-RuntimeVersion {
@@ -237,7 +256,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         Build        = [IO.Path]::GetFullPath($Build)
         Destination  = [IO.Path]::GetFullPath($Destination)
         ReactorSetup = if ($ReactorSetup) { [IO.Path]::GetFullPath($ReactorSetup) } else { Find-ReactorSetup }
-        Cache        = $Cache
+        Cache        = if ($Cache) { $Cache } else { Get-ReactorCache -LocalAppData $env:LOCALAPPDATA }
         Manifest     = $Manifest
     }
     Publish-Payload @payload

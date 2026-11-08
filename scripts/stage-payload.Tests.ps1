@@ -124,3 +124,16 @@ const WEBVIEW2_VER: &str = "1.0.1";
         Test-Path -LiteralPath $payload.Destination | Should -BeFalse
     }
 }
+
+Describe 'Get-ReactorCache' {
+    It 'names the folder the crate downloads into under LOCALAPPDATA' {
+        $local = Join-Path -Path $TestDrive -ChildPath 'Local App Data'
+        $expected = Join-Path -Path $local -ChildPath 'windows-reactor-setup' 'temp'
+
+        Get-ReactorCache -LocalAppData $local | Should -BeExactly $expected
+    }
+
+    It 'asks for -Cache where LOCALAPPDATA is not set' {
+        { Get-ReactorCache -LocalAppData '' } | Should -Throw '*LOCALAPPDATA is not set*give -Cache.'
+    }
+}
