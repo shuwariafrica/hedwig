@@ -105,12 +105,16 @@ Describe 'Write-AnalyserReport' {
     }
 
     It 'annotates each finding on its line and each file not analysed, and summarises both' {
+        # The run's own values go back afterwards: on a runner the step that
+        # summarises the tests writes to its GITHUB_STEP_SUMMARY.
+        $kept = @{ Actions = $env:GITHUB_ACTIONS; Summary = $env:GITHUB_STEP_SUMMARY }
         $env:GITHUB_ACTIONS = 'true'
         $env:GITHUB_STEP_SUMMARY = $summary
         try {
             $lines = $verdicts | Write-AnalyserReport -Root $root
         } finally {
-            Remove-Item -Path Env:GITHUB_ACTIONS, Env:GITHUB_STEP_SUMMARY
+            $env:GITHUB_ACTIONS = $kept.Actions
+            $env:GITHUB_STEP_SUMMARY = $kept.Summary
         }
 
         $lines[0] | Should -BeExactly '::error file=scripts/a.ps1,line=4,col=2,title=PSAvoidUsingWriteHost::m'
