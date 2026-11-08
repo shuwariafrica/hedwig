@@ -204,15 +204,31 @@ impl Drop for Retired {
 }
 
 /// The folder holding Git for Windows' own `git` and `curl`, as its shell
-/// names it: `/clangarm64/bin` from the ARM64 installer, `/mingw64/bin` from
-/// the x64 one.
+/// names it: `/ucrt64/bin` from the x64 installer from 2.56 on,
+/// `/clangarm64/bin` from the ARM64 one, `/mingw64/bin` from an x64 one
+/// before 2.56.
+///
+/// # Panics
+///
+/// Where Git for Windows keeps its `git` in none of them.
 #[must_use]
+#[allow(clippy::panic, reason = "test scaffolding")]
 pub fn git_tools() -> &'static str {
-    if Path::new(r"C:\Program Files\Git\clangarm64\bin").is_dir() {
-        "/clangarm64/bin"
-    } else {
-        "/mingw64/bin"
-    }
+    const FOLDERS: [(&str, &str); 3] = [
+        (r"C:\Program Files\Git\ucrt64\bin\git.exe", "/ucrt64/bin"),
+        (
+            r"C:\Program Files\Git\clangarm64\bin\git.exe",
+            "/clangarm64/bin",
+        ),
+        (r"C:\Program Files\Git\mingw64\bin\git.exe", "/mingw64/bin"),
+    ];
+    let Some((_, folder)) = FOLDERS
+        .into_iter()
+        .find(|(git, _)| Path::new(git).is_file())
+    else {
+        panic!("needs Git for Windows' own git, at one of {FOLDERS:?}");
+    };
+    folder
 }
 
 /// A folder under the temporary directory, removed when dropped.
