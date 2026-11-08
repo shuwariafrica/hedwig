@@ -301,11 +301,12 @@ mod tests {
     /// same icon is refused. The refusal takes it away, so the next add is
     /// made, and is the one icon there.
     #[test]
+    #[ignore = "needs the desktop's foreground"]
     fn an_icon_the_shell_kept_after_refusing_its_add_is_taken_away() {
-        if !crate::desk::interactive() || !super::taskbar() {
-            println!("no taskbar here; nothing to add to");
-            return;
-        }
+        assert!(
+            crate::desk::interactive() && super::taskbar(),
+            "needs the desktop's foreground"
+        );
         let host = Host::new().unwrap();
         let picture = Emblem {
             owl: Owl::Dozing,
