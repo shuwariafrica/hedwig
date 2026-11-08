@@ -768,13 +768,13 @@ impl Channels {
             .contains_key(&order.connection)
             .then(|| self.live(order.connection))
             .flatten();
-        let Some((job, _)) = job else {
+        let Some((job, stop)) = job else {
             placed(Err("the remote's channel is down".to_owned()));
             return;
         };
         let setting = Arc::clone(&self.setting);
         let carriers = Arc::clone(&self.carriers);
-        thread::spawn(move || placer(&order, &setting, &job, &carriers, placed));
+        thread::spawn(move || placer(&order, &setting, &job, &stop, &carriers, placed));
     }
 
     /// Ends the carrier of `connection`'s channel that listens at `listen`,
@@ -811,10 +811,10 @@ impl Channels {
     }
 }
 
-/// Ends a channel's job, its stop raised first: a carrier whose client joins
-/// the job once it is emptied finds the stop raised and ends that client
-/// itself ([`carrier`]). Both ends of a channel - the end asked for and its
-/// client's own - go through here.
+/// Ends a channel's job, its stop raised first: a carrier or placer whose
+/// client joins the job once it is emptied finds the stop raised and ends that
+/// client itself ([`carrier`], [`placer`]). Both ends of a channel - the end
+/// asked for and its client's own - go through here.
 fn end_job(job: &Job, stop: &Signal) {
     let _ = stop.raise();
     let _ = job.end();
@@ -1183,11 +1183,13 @@ fn carrier(
 }
 
 /// Holds one carrier that listens on the remote until it ends, giving
-/// `placed` what its server answered for the forward.
+/// `placed` what its server answered for the forward. One made once its
+/// channel has ended is ended.
 fn placer(
     order: &Placing,
     setting: &Setting,
     job: &Arc<Job>,
+    stop: &Signal,
     carriers: &Carriers,
     placed: impl FnOnce(Result<Port, String>),
 ) {
@@ -1212,6 +1214,15 @@ fn placer(
     let client = Arc::new(client);
     let key = (order.connection, order.listen);
     running(carriers, key, &client);
+    // The channel has ended, and its end may have emptied the job before this
+    // client joined it: the job is ended again, with whatever the client
+    // started.
+    if stop.raised() {
+        let _ = job.end();
+        let _ = client.wait();
+        gone(carriers, key);
+        return placed(Err("the remote's channel is down".to_owned()));
+    }
     let endpoint = order.listen.number();
     let mut placed = Some(placed);
     let mut reader = BufReader::new(errors);
@@ -1677,10 +1688,45 @@ mod tests {
         (setting, client)
     }
 
+    /// A carrier that listens on the remote, made only once its channel has
+    /// ended, is ended by the thread that made it: it never outlives the
+    /// channel. The channel is ended as the request returns; its thread makes
+    /// the client after that, a process taking far longer to make than the
+    /// call to end.
+    #[test]
+    fn a_placer_made_once_its_channel_ended_is_ended() {
+        use hedwig_model::setting::Keepalive;
+        use hedwig_model::text::{Address, Port};
+        use hedwig_model::trail::Asking;
+
+        use super::{Channels, Placing};
+
+        let (setting, client) = outlasting();
+        let (messages, _kept) = mpsc::channel();
+        let mut channels = Channels::new(setting, messages);
+        let connection = ConnectionId(Seq(5));
+        channels.live(connection).unwrap();
+        let order = Placing {
+            connection,
+            client,
+            address: Address::try_from("dev@build-7.example").unwrap(),
+            port: 0,
+            listen: Port::try_from(50145).unwrap(),
+            asking: Asking::Nobody,
+            keepalive: Keepalive::SHIPS,
+        };
+        let (place, placed) = mpsc::channel();
+        channels.place(order, move |result| {
+            let _ = place.send(result);
+        });
+        channels.end(connection);
+        let placed = placed.recv_timeout(ENDED_WITHIN);
+        assert!(matches!(placed, Ok(Err(_))), "{placed:?}");
+    }
+
     /// A carrier with a local forward, made only once its channel has ended,
     /// is ended by the thread that made it, and cannot stand. The channel is
-    /// ended as the request returns; its thread makes the client after that,
-    /// a process taking far longer to make than the call to end.
+    /// ended as the request returns, as for a placer.
     #[test]
     fn a_carrier_made_once_its_channel_ended_is_ended() {
         use hedwig_model::setting::Keepalive;
