@@ -524,21 +524,27 @@ fn a_remote_process_without_the_issued_bytes_is_closed_unanswered() {
     assert_eq!(heard(&told), [Relayed::Unpresented, Relayed::Ended]);
 }
 
-/// Grants `folder` and what is in it to the person's account alone, nothing
-/// inherited, so a token reads them only through the account: Administrators,
+/// Leaves `folder` and everything in it granted to the person's account
+/// alone, so a token reads them only through the account: Administrators,
 /// enabled in a full administrator's token, would read them too otherwise.
+/// Every entry goes first, those a file was made with included, which no
+/// change to its folder's list takes from the file.
 fn the_account_alone(folder: &Path) {
     let account = Token::own().unwrap().user().unwrap().to_text().unwrap();
-    let set = Command::new(r"C:\Windows\System32\icacls.exe")
-        .arg(folder)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            &format!("*{account}:(OI)(CI)F"),
-        ])
-        .output()
-        .unwrap();
-    assert!(set.status.success(), "{set:?}");
+    let icacls = |arguments: &[&str]| {
+        let set = Command::new(r"C:\Windows\System32\icacls.exe")
+            .arg(folder)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(set.status.success(), "{set:?}");
+    };
+    icacls(&["/reset", "/T"]);
+    icacls(&[
+        "/inheritance:r",
+        "/grant:r",
+        &format!("*{account}:(OI)(CI)F"),
+    ]);
 }
 
 /// The listener is given the file's bytes only where its own token would be
