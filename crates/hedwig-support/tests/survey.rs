@@ -49,6 +49,11 @@ fn msys(path: &Path) -> String {
     format!("/{}{rest}", drive.to_ascii_lowercase())
 }
 
+/// `text` as one word of a POSIX shell line, whatever it holds.
+fn quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 /// Git for Windows' POSIX shell, with its own tools beside it.
 fn posix_shell() -> PathBuf {
     let sh = Path::new(GIT).join(r"usr\bin\sh.exe");
@@ -455,8 +460,8 @@ fn an_openers_variables_name_the_remotes_own_curl_at_the_socket() {
     let runtime = remote.home.join("run time");
     fs::create_dir_all(&runtime).unwrap();
     let script = format!(
-        "XDG_RUNTIME_DIR='{}'\nexport XDG_RUNTIME_DIR\n{}",
-        msys(&runtime),
+        "XDG_RUNTIME_DIR={}\nexport XDG_RUNTIME_DIR\n{}",
+        quoted(&msys(&runtime)),
         posix(&plan, NONCE)
     );
     let output = remote.sh(&script);
@@ -1184,7 +1189,7 @@ fn a_public_key_is_imported_and_taken_back() {
     let remote = Remote::new(sh, "writes-key");
     readerless(&remote.gnupg()).unwrap();
     readerless(&remote.home.join("other")).unwrap();
-    let other = msys(&remote.home.join("other"));
+    let other = quoted(&msys(&remote.home.join("other")));
     let made = remote.sh(&format!(
         "mkdir -p {other} && export GNUPGHOME={other} && \
          gpg --batch --passphrase '' --quick-gen-key 'hedwig test <test@hedwig.example>' ed25519 sign never >/dev/null 2>&1 && \
@@ -1558,7 +1563,7 @@ fn service_manager(remote: &mut Remote, listening: &str) -> PathBuf {
         bin.join("systemctl"),
         format!(
             r#"#!/bin/sh
-s='{state}'
+s={state}
 [ "$1" = --user ] && shift
 v=$1; shift
 echo "$v $*" >> "$s/log"
@@ -1576,7 +1581,7 @@ case $v in
   stop) ;;
 esac
 "#,
-            state = msys(&state),
+            state = quoted(&msys(&state)),
         ),
     )
     .unwrap();
@@ -1623,7 +1628,10 @@ fn a_unit_at_gnupgs_path_is_named_masked_with_consent_and_taken_back_exactly() {
     );
     assert_eq!(at(&report), Some(&At::Free));
     // The shell's own reading of the link, as the reversal reads it.
-    let link = remote.sh(&format!("[ -L '{0}' ] && readlink -- '{0}'", msys(&unit)));
+    let link = remote.sh(&format!(
+        "[ -L {0} ] && readlink -- {0}",
+        quoted(&msys(&unit))
+    ));
     assert_eq!(link.trim(), "/dev/null");
 
     let again = remote.survey(&consented);
@@ -1856,7 +1864,7 @@ fn contents(folder: &Path) -> BTreeMap<String, (usize, u64)> {
 /// fingerprint and its public half, armoured.
 fn throwaway_key(remote: &Remote, home: &str, who: &str) -> (Fingerprint, String) {
     readerless(&remote.home.join(home)).unwrap();
-    let other = msys(&remote.home.join(home));
+    let other = quoted(&msys(&remote.home.join(home)));
     let made = remote.sh(&format!(
         "export GNUPGHOME={other} && \
          gpg --batch --passphrase '' --quick-gen-key '{who} <{who}@hedwig.example>' ed25519 sign never >/dev/null 2>&1 && \
@@ -1947,7 +1955,7 @@ fn a_keyring_the_person_has_used_since_keeps_their_keys() {
     fs::write(&half, their_half).unwrap();
     remote.sh(&format!(
         "gpg --batch --import {} >/dev/null 2>&1",
-        msys(&half)
+        quoted(&msys(&half))
     ));
 
     let undo = Plan {
@@ -2145,7 +2153,7 @@ fn an_exercise_signs_where_the_home_has_a_keyring() {
     fs::write(&half, armoured).unwrap();
     remote.sh(&format!(
         "gpg --batch --no-tty --trust-model always --no-auto-check-trustdb --import {} >/dev/null 2>&1",
-        msys(&half)
+        quoted(&msys(&half))
     ));
     assert!(remote.gnupg().join("pubring.kbx").exists());
     let output = remote.sh(&exercise(
