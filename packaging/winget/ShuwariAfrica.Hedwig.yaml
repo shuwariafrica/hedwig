@@ -1,6 +1,8 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json
+# PackageVersion is written by .github/workflows/winget.yml for the release it
+# submits.
 PackageIdentifier: ShuwariAfrica.Hedwig
-PackageVersion: 0.1.0
+PackageVersion: 0.0.0
 DefaultLocale: en-US
 ManifestType: version
 ManifestVersion: 1.12.0

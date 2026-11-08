@@ -1,28 +1,33 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+# PackageVersion is written by .github/workflows/winget.yml for the release it
+# submits.
 PackageIdentifier: ShuwariAfrica.Hedwig
-PackageVersion: 0.1.0
+PackageVersion: 0.0.0
 PackageLocale: en-US
 Publisher: Shuwari Africa
 PublisherUrl: https://github.com/shuwariafrica
 PublisherSupportUrl: https://github.com/shuwariafrica/hedwig/issues
-PackageName: hedwig
+PackageName: Hedwig
 PackageUrl: https://github.com/shuwariafrica/hedwig
 License: MIT
 LicenseUrl: https://github.com/shuwariafrica/hedwig/blob/main/LICENSE
-ShortDescription: Forward the Windows gpg-agent to Linux hosts over ssh -R
+ShortDescription: Lends a Windows workstation's GnuPG, SSH agent and Android devices to a remote over SSH
 Description: |-
-  A loopback relay that makes gpg-agent on Windows forwardable with plain
-  OpenSSH, so git commits on remote Linux hosts (VMs, servers, Coder
-  workspaces) can be signed with an OpenPGP key held on a YubiKey plugged into
-  the Windows machine. Speaks GnuPG's Windows socket emulation (port file plus
-  nonce handshake), verifies both peers' identity at the OS level, and relays
-  the restricted agent socket by default.
+  Hedwig runs for the person signed in to a Windows workstation and lends what
+  it holds - GnuPG and the keys on its smart cards, the SSH agent, Android
+  devices through ADB - to a remote reached over a channel that already
+  reaches it, such as SSH, with nothing of Hedwig's installed on the remote.
+  Each remote is granted what it may use; a request the person has not
+  settled is put to them by Hedwig's icon in the notification area, and its
+  window shows what is reachable from where.
 Moniker: hedwig
 Tags:
   - gpg
   - gnupg
   - gpg-agent
   - ssh
+  - ssh-agent
+  - adb
   - yubikey
   - signing
   - git
