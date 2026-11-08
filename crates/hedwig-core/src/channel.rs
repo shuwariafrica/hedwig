@@ -543,8 +543,7 @@ struct Live {
 }
 
 /// Each carrier the core can end before its channel ends, by its channel and
-/// the port it listens on; one with a local forward is known from before its
-/// thread starts.
+/// the port it listens on, known from before its thread starts.
 type Carriers = Arc<Mutex<BTreeMap<(ConnectionId, Port), Carrying>>>;
 
 /// A carrier's process: still being made, and whether it is to be ended once
@@ -575,6 +574,17 @@ fn running(carriers: &Carriers, key: (ConnectionId, Port), client: &Arc<Held>) {
     if ended {
         let _ = client.end(1);
     }
+}
+
+/// Whether `key` was asked to end: no longer registered, or to be ended once
+/// its process is made.
+fn withdrawn(carriers: &Carriers, key: (ConnectionId, Port)) -> bool {
+    carriers.lock().is_ok_and(|carriers| {
+        matches!(
+            carriers.get(&key),
+            None | Some(Carrying::Starting { ended: true })
+        )
+    })
 }
 
 /// `key` is no carrier's any more.
@@ -772,6 +782,7 @@ impl Channels {
             placed(Err("the remote's channel is down".to_owned()));
             return;
         };
+        starting(&self.carriers, (order.connection, order.listen));
         let setting = Arc::clone(&self.setting);
         let carriers = Arc::clone(&self.carriers);
         thread::spawn(move || placer(&order, &setting, &job, &stop, &carriers, placed));
@@ -1184,20 +1195,43 @@ fn carrier(
 
 /// Holds one carrier that listens on the remote until it ends, giving
 /// `placed` what its server answered for the forward. One made once its
-/// channel has ended is ended.
-fn placer(
+/// channel has ended is ended. One its caller withdrew with
+/// [`Channels::unhaul`] before it answered tells it nothing: the caller has
+/// let the forward go, and another may hold its port by then.
+fn placer<P: FnOnce(Result<Port, String>)>(
     order: &Placing,
     setting: &Setting,
     job: &Arc<Job>,
     stop: &Signal,
     carriers: &Carriers,
-    placed: impl FnOnce(Result<Port, String>),
+    placed: P,
 ) {
     let refused = |port: u16| format!("the remote's ssh server would not listen at port {port}");
+    let key = (order.connection, order.listen);
+    let mut placed = Some(placed);
+    // Where the placer ends as it tells - unfound, unstarted, or made once its
+    // channel ended - `leave` reads the withdrawal before unregistering and
+    // tells after, so a caller that looks at once (`Channels::hauls`) finds it
+    // gone; elsewhere `tell` answers before the placer unregisters.
+    let tell = |placed: &mut Option<P>, answered: Result<Port, String>| {
+        if let Some(placed) = placed.take()
+            && !withdrawn(carriers, key)
+        {
+            placed(answered);
+        }
+    };
+    let leave = |placed: &mut Option<P>, answered: Result<Port, String>| {
+        let quiet = withdrawn(carriers, key);
+        gone(carriers, key);
+        if let Some(placed) = placed.take()
+            && !quiet
+        {
+            placed(answered);
+        }
+    };
     let Ok((program, _)) = found(&order.client, setting) else {
-        return placed(Err(
-            "no folder on the search path holds the route's client".to_owned()
-        ));
+        let absent = "no folder on the search path holds the route's client";
+        return leave(&mut placed, Err(absent.to_owned()));
     };
     let arguments: Vec<OsString> = order
         .client
@@ -1209,10 +1243,10 @@ fn placer(
         .map(OsString::from)
         .collect();
     let Ok((client, errors)) = held(&program, &arguments, &setting.environment, job) else {
-        return placed(Err("the route's client could not be started".to_owned()));
+        let unstarted = "the route's client could not be started";
+        return leave(&mut placed, Err(unstarted.to_owned()));
     };
     let client = Arc::new(client);
-    let key = (order.connection, order.listen);
     running(carriers, key, &client);
     // The channel has ended, and its end may have emptied the job before this
     // client joined it: the job is ended again, with whatever the client
@@ -1220,11 +1254,9 @@ fn placer(
     if stop.raised() {
         let _ = job.end();
         let _ = client.wait();
-        gone(carriers, key);
-        return placed(Err("the remote's channel is down".to_owned()));
+        return leave(&mut placed, Err("the remote's channel is down".to_owned()));
     }
     let endpoint = order.listen.number();
-    let mut placed = Some(placed);
     let mut reader = BufReader::new(errors);
     let mut bytes = Vec::new();
     loop {
@@ -1251,18 +1283,13 @@ fn placer(
             _ => continue,
         };
         let failed = answered.is_err();
-        if let Some(placed) = placed.take() {
-            placed(answered);
-        }
+        tell(&mut placed, answered);
         if failed {
             let _ = client.end(1);
         }
     }
-    if let Some(placed) = placed.take() {
-        placed(Err(
-            "the carrier ended before the remote's server answered".to_owned()
-        ));
-    }
+    let unanswered = "the carrier ended before the remote's server answered";
+    tell(&mut placed, Err(unanswered.to_owned()));
     let _ = client.wait();
     gone(carriers, key);
 }
@@ -1545,7 +1572,8 @@ mod tests {
 
     /// Where its channel is not live a carrier cannot stand, said at once;
     /// where its route's client is nowhere on the search path, said by its
-    /// thread; it is not left registered to be ended once its caller is told.
+    /// thread, a placer's as a carrier's; neither is left registered to be
+    /// ended once its caller is told.
     #[test]
     fn a_carrier_with_no_channel_or_no_client_cannot_stand() {
         use hedwig_model::remote::{Argument, Client};
@@ -1554,7 +1582,7 @@ mod tests {
         use hedwig_model::trail::{Asking, Target};
         use hedwig_win::start::Environment;
 
-        use super::{Channels, Hauling, Setting};
+        use super::{Channels, Hauling, Placing, Setting};
 
         let (messages, _kept) = mpsc::channel();
         let setting = Setting {
@@ -1595,6 +1623,26 @@ mod tests {
             Hauled::Cannot("no folder on the search path holds the route's client".to_owned())
         );
         assert!(!channels.hauls(connection, order.listen));
+
+        let placing = Placing {
+            connection,
+            client: order.client.clone(),
+            address: order.address.clone(),
+            port: 0,
+            listen: Port::try_from(50144).unwrap(),
+            asking: Asking::Nobody,
+            keepalive: Keepalive::SHIPS,
+        };
+        let listen = placing.listen;
+        let (place, placed) = mpsc::channel();
+        channels.place(placing, move |result| {
+            let _ = place.send(result);
+        });
+        assert_eq!(
+            placed.recv().unwrap(),
+            Err("no folder on the search path holds the route's client".to_owned())
+        );
+        assert!(!channels.hauls(connection, listen));
         channels.end(connection);
     }
 
@@ -1724,6 +1772,86 @@ mod tests {
         assert!(matches!(placed, Ok(Err(_))), "{placed:?}");
     }
 
+    /// A carrier that listens on the remote, withdrawn by its caller as it is
+    /// asked for, is ended and never tells its caller: what it would have
+    /// told it with is dropped unused, well within its client's half minute,
+    /// whether the withdrawal came before its process was made or after.
+    #[test]
+    fn a_placer_withdrawn_as_it_starts_is_ended_and_tells_nothing() {
+        use hedwig_model::setting::Keepalive;
+        use hedwig_model::text::{Address, Port};
+        use hedwig_model::trail::Asking;
+
+        use super::{Channels, Placing};
+
+        let (setting, client) = outlasting();
+        let (messages, _kept) = mpsc::channel();
+        let mut channels = Channels::new(setting, messages);
+        let connection = ConnectionId(Seq(7));
+        channels.live(connection).unwrap();
+        let listen = Port::try_from(50147).unwrap();
+        let order = Placing {
+            connection,
+            client,
+            address: Address::try_from("dev@build-7.example").unwrap(),
+            port: 0,
+            listen,
+            asking: Asking::Nobody,
+            keepalive: Keepalive::SHIPS,
+        };
+        let (place, placed) = mpsc::channel();
+        channels.place(order, move |result| {
+            let _ = place.send(result);
+        });
+        channels.unhaul(connection, listen);
+        let placed = placed.recv_timeout(ENDED_WITHIN);
+        assert!(
+            matches!(placed, Err(mpsc::RecvTimeoutError::Disconnected)),
+            "{placed:?}"
+        );
+        channels.end(connection);
+    }
+
+    /// A placer withdrawn and then its channel ended, both as it is asked
+    /// for, never tells its caller: whenever its process is made, the
+    /// withdrawal is read before any word of the end or any of its client's
+    /// words.
+    #[test]
+    fn a_placer_withdrawn_then_its_channel_ended_tells_nothing() {
+        use hedwig_model::setting::Keepalive;
+        use hedwig_model::text::{Address, Port};
+        use hedwig_model::trail::Asking;
+
+        use super::{Channels, Placing};
+
+        let (setting, client) = outlasting();
+        let (messages, _kept) = mpsc::channel();
+        let mut channels = Channels::new(setting, messages);
+        let connection = ConnectionId(Seq(9));
+        channels.live(connection).unwrap();
+        let listen = Port::try_from(50150).unwrap();
+        let order = Placing {
+            connection,
+            client,
+            address: Address::try_from("dev@build-7.example").unwrap(),
+            port: 0,
+            listen,
+            asking: Asking::Nobody,
+            keepalive: Keepalive::SHIPS,
+        };
+        let (place, placed) = mpsc::channel();
+        channels.place(order, move |result| {
+            let _ = place.send(result);
+        });
+        channels.unhaul(connection, listen);
+        channels.end(connection);
+        let placed = placed.recv_timeout(ENDED_WITHIN);
+        assert!(
+            matches!(placed, Err(mpsc::RecvTimeoutError::Disconnected)),
+            "{placed:?}"
+        );
+    }
+
     /// A carrier with a local forward, made only once its channel has ended,
     /// is ended by the thread that made it, and cannot stand. The channel is
     /// ended as the request returns, as for a placer.
@@ -1759,31 +1887,35 @@ mod tests {
         assert!(matches!(told, Ok(Hauled::Cannot(_))), "{told:?}");
     }
 
-    /// A carrier is known, to be ended, from the moment it is asked for, not
-    /// from when its thread has made its process. The client runs half a
-    /// minute, so once known it stays so until the channel ends: the check
-    /// holds whatever the thread has done.
+    /// A carrier and a placer are known, to be ended, from the moment they are
+    /// asked for, not from when their threads have made their processes. The
+    /// client runs half a minute, so once known each stays so until the
+    /// channel ends: the check holds whatever the threads have done.
     #[test]
-    fn a_carrier_is_known_as_it_is_asked_for() {
+    fn a_carrier_and_a_placer_are_known_as_they_are_asked_for() {
         use hedwig_model::setting::Keepalive;
         use hedwig_model::text::{Address, Port};
         use hedwig_model::trail::{Asking, Target};
 
-        use super::{Channels, Hauling};
+        use super::{Channels, Hauling, Placing};
 
         let (setting, client) = outlasting();
         let (messages, _kept) = mpsc::channel();
         let mut channels = Channels::new(setting, messages);
         let connection = ConnectionId(Seq(8));
         channels.live(connection).unwrap();
-        let hauling = Port::try_from(50148).unwrap();
+        let address = Address::try_from("dev@build-7.example").unwrap();
+        let (hauling, placing) = (
+            Port::try_from(50148).unwrap(),
+            Port::try_from(50149).unwrap(),
+        );
         let (tell, told) = mpsc::channel();
         let teller = Mutex::new(tell);
         channels.haul(
             Hauling {
                 connection,
-                client,
-                address: Address::try_from("dev@build-7.example").unwrap(),
+                client: client.clone(),
+                address: address.clone(),
                 target: Target::Loopback(Port::try_from(8081).unwrap()),
                 listen: hauling,
                 asking: Asking::Nobody,
@@ -1794,9 +1926,27 @@ mod tests {
             },
         );
         assert!(channels.hauls(connection, hauling), "hauling");
+        let (place, placed) = mpsc::channel();
+        channels.place(
+            Placing {
+                connection,
+                client,
+                address,
+                port: 0,
+                listen: placing,
+                asking: Asking::Nobody,
+                keepalive: Keepalive::SHIPS,
+            },
+            move |result| {
+                let _ = place.send(result);
+            },
+        );
+        assert!(channels.hauls(connection, placing), "placing");
         channels.end(connection);
         let told = told.recv_timeout(ENDED_WITHIN);
         assert!(matches!(told, Ok(Hauled::Cannot(_))), "{told:?}");
+        let placed = placed.recv_timeout(ENDED_WITHIN);
+        assert!(matches!(placed, Ok(Err(_))), "{placed:?}");
     }
 
     /// A carrier stands at the line its session's loop begins with, not
