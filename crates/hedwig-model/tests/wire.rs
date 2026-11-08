@@ -459,7 +459,7 @@ fn a_secret_is_in_its_frame_and_in_nothing_printed() {
 #[test]
 fn an_entry_is_one_line_of_the_trail() {
     let entry: Entry = read(
-        r#"{"seq":1,"at":1790000000001,"tick":10,"event":{"started":{"version":"0.2.0 (v0.2.0)","origin":{"process":4200,"logon":65470465,"session":2,"integrity":"medium"},"after":null}}}"#,
+        r#"{"seq":1,"at":1790000000001,"tick":10,"event":{"started":{"version":"0.2.0","origin":{"process":4200,"logon":65470465,"session":2,"integrity":"medium"},"after":null}}}"#,
     )
     .expect("an entry");
     assert_eq!(&entry, corpus::entries().first().expect("an entry"));

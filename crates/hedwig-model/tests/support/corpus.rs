@@ -1382,7 +1382,7 @@ pub(crate) fn events() -> Vec<Event> {
     let remote = remote("coder", "dev/build");
     let mut events = vec![
         Event::Started {
-            version: "0.2.0 (v0.2.0)".to_owned(),
+            version: "0.2.0".to_owned(),
             origin: DESKTOP,
             after: None,
         },
@@ -1965,7 +1965,7 @@ pub(crate) fn events() -> Vec<Event> {
         },
     ];
     events.extend(breakdowns().into_iter().map(|cause| Event::Started {
-        version: "0.2.0 (v0.2.0)".to_owned(),
+        version: "0.2.0".to_owned(),
         origin: OVER_SSH,
         after: Some(cause),
     }));
@@ -2674,7 +2674,7 @@ fn workstation() -> Workstation {
 /// A status with a client of each kind.
 pub(crate) fn status() -> Status {
     Status {
-        version: "0.2.0 (v0.2.0)".to_owned(),
+        version: "0.2.0".to_owned(),
         since: Timestamp(1_790_000_000_000),
         origin: DESKTOP,
         attached: vec![
@@ -2747,7 +2747,7 @@ pub(crate) fn replies() -> Vec<Reply> {
     vec![
         Reply::Welcome {
             protocol: PROTOCOL,
-            version: "0.2.0 (v0.2.0)".to_owned(),
+            version: "0.2.0".to_owned(),
             you: OVER_SSH,
         },
         Reply::Status(status()),
