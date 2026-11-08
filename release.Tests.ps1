@@ -129,26 +129,53 @@ Describe 'Publish-ReleaseTag' {
         $fakeGit.Calls[-1] | Should -BeExactly 'ls-remote --tags origin refs/tags/v1.2.3'
     }
 
-    It 'accepts the pre-release and build forms <Version>' -TestCases @(
-        @{ Version = '0.1.0-alpha.1' }
-        @{ Version = '10.20.30-rc.12+build.7' }
+    It 'tags the pre-release and build forms <Version> with their notes as the message' -TestCases @(
+        @{ Version = '0.2.0-alpha.1' }
+        @{ Version = '10.20.30-alpha.12+build.7' }
     ) {
+        $notes = Join-Path -Path $TestDrive -ChildPath 'notes for the release.md'
+        Set-Content -LiteralPath $notes -Value '# Hedwig', '', 'What it carries.'
         Initialize-Crate -ManifestVersion $Version -LockfileVersion $Version
+        $tagging = "tag --sign --annotate v$Version --cleanup=whitespace --file $notes"
         $fakeGit.Output["tag --list v$Version"] = @()
         $fakeGit.Output["ls-remote --tags origin refs/tags/v$Version"] = @()
-        $fakeGit.Output["tag --sign --annotate v$Version -m Release version v$Version"] = @()
+        $fakeGit.Output[$tagging] = @()
         $fakeGit.Output["push origin v$Version"] = @()
         $release.Version = $Version
 
-        (Publish-ReleaseTag @release).Tag | Should -BeExactly "v$Version"
+        (Publish-ReleaseTag @release -NotesPath $notes).Tag | Should -BeExactly "v$Version"
+        $fakeGit.Calls | Should -Contain $tagging
+    }
+
+    It 'refuses a pre-release without notes before touching git' {
+        $release.Version = '0.2.0-alpha.1'
+
+        { Publish-ReleaseTag @release } | Should -Throw -ErrorId 'NotesRequired*'
+        $fakeGit.Calls | Should -BeNullOrEmpty
+    }
+
+    It 'refuses a notes file that is <Case> before touching git' -TestCases @(
+        @{ Case = 'missing'; Text = $null }
+        @{ Case = 'empty'; Text = '' }
+        @{ Case = 'blank'; Text = "  `n`t" }
+    ) {
+        $notes = Join-Path -Path $TestDrive -ChildPath "notes $Case.md"
+        if ($null -ne $Text) { Set-Content -LiteralPath $notes -Value $Text -NoNewline }
+        $release.Version = '0.2.0-alpha.1'
+
+        { Publish-ReleaseTag @release -NotesPath $notes } |
+            Should -Throw -ErrorId 'ParameterArgumentValidationError*' -ExpectedMessage '*missing or holds no notes*'
+        $fakeGit.Calls | Should -BeNullOrEmpty
     }
 
     It 'rejects the version string <Version> before touching git' -TestCases @(
         @{ Version = '1.2' }
         @{ Version = 'v1.2.3' }
         @{ Version = '01.2.3' }
-        @{ Version = '1.2.3-RC.1' }
-        @{ Version = '1.2.3-rc.0' }
+        @{ Version = '1.2.3-ALPHA.1' }
+        @{ Version = '1.2.3-alpha.0' }
+        @{ Version = '1.2.3-beta.1' }
+        @{ Version = '1.2.3-rc.1' }
         @{ Version = '1.2.3-preview.1' }
         @{ Version = '1.2.3 ' }
     ) {
