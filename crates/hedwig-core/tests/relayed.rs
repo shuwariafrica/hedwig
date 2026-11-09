@@ -19,10 +19,14 @@ use std::num::NonZeroU32;
 use hedwig_core::adb::Reverse;
 use hedwig_core::agent::{Ask as AgentAsk, Breach as AgentBreach};
 use hedwig_core::assuan::{Ask, Breach, Side};
-use hedwig_core::dispatch::{Core, Effect, Input, Knock, Link, Now, Step};
+use hedwig_core::dispatch::{Core, Effect, Input, Knock, Link, Now, ReadId, Step};
+use hedwig_core::keys::{Cards, Known};
 use hedwig_core::relay::Reach;
 use hedwig_core::relay::{Relayed, Relaying};
-use hedwig_model::capability::{AgentAt, Exposure, Lends, Operation, Setup, Toward};
+use hedwig_model::capability::{
+    Access, AgentAt, Capability, Exposure, Home, Installation, Lends, Operation, Setup, Source,
+    Toward,
+};
 use hedwig_model::config::{Activation, Catalogue, Change, Configuration, Grant, Terms};
 use hedwig_model::holder::{Rights, SignedIn, SourceHolder, Whose};
 use hedwig_model::policy::{Basis, ConnectionScope, Keys, Mode, RuleScope, Selector};
@@ -35,8 +39,8 @@ use hedwig_model::remote::{Granted, RemoteId, Remotes};
 use hedwig_model::setting::{Heard, Waits};
 use hedwig_model::text::Location;
 use hedwig_model::text::{
-    Address, DeviceSerial, Fingerprint, Grip, KeyId, Mark, Name, Port, RemotePath, Serial, SshKey,
-    Words,
+    Address, DeviceSerial, Fingerprint, Folder, Grip, KeyId, Mark, Name, Port, RemotePath, Serial,
+    SshKey, Words,
 };
 use hedwig_model::trail::{
     Binding, Card, Carriage, ClientKind, ConnectionId, Event, Failure, Health, Held, Integrity,
@@ -114,6 +118,13 @@ impl Scene {
     /// A terminal attached, `capability` granted to the remote acknowledging
     /// `acknowledged`, and the channel up forwarding it at `binding`.
     fn granted(capability: &str, acknowledged: Exposure, binding: Binding) -> Scene {
+        let mut scene = Scene::attached();
+        scene.forwarding(capability, acknowledged, binding);
+        scene
+    }
+
+    /// A terminal attached to a core that has begun.
+    fn attached() -> Scene {
         let mut core = Core::new(
             Catalogue::shipped().unwrap(),
             Configuration::default(),
@@ -127,6 +138,13 @@ impl Scene {
             connection: ConnectionId(hedwig_model::trail::Seq(0)),
         };
         scene.attach(TERMINAL, ClientKind::Terminal);
+        scene
+    }
+
+    /// `capability` granted to the remote acknowledging `acknowledged`, and
+    /// the channel up forwarding it at `binding`.
+    fn forwarding(&mut self, capability: &str, acknowledged: Exposure, binding: Binding) {
+        let scene = self;
         scene.ask(
             TERMINAL,
             Request::Change(Change::Grant {
@@ -168,7 +186,6 @@ impl Scene {
                 bound: true,
             },
         });
-        scene
     }
 
     fn step(&mut self, input: Input) -> Step {
@@ -601,20 +618,23 @@ fn the_keys_read_before_a_survey_are_recorded_and_planned() {
     );
     let Some(Effect::Read {
         connection,
+        id,
         sources,
+        ..
     }) = acts(&step).first().copied()
     else {
         panic!("the keys are read first: {step:?}");
     };
-    let connection = *connection;
+    let (connection, first) = (*connection, *id);
     assert_eq!(connection, scene.connection);
     assert_eq!(sources.len(), 1);
     let read = Read {
         keyring: keyring.clone(),
         armoured: [(primary.clone(), armour.clone())].into(),
-        cards: Vec::new(),
+        ..Read::default()
     };
     let told = Told::Read {
+        id: first,
         read: vec![(name("gpg"), Ok(read.clone()))],
     };
     let step = scene.core.step(Input::Channel { connection, told }, NOW);
@@ -639,25 +659,10 @@ fn the_keys_read_before_a_survey_are_recorded_and_planned() {
         Write::SigningKey(Mark::try_from(primary.as_str()).unwrap())
     )));
 
-    // Read again and unchanged, nothing is recorded.
-    let step = scene.core.step(
-        Input::Asked {
-            link: TERMINAL,
-            frame: ToCore {
-                id: 91,
-                request: Request::Check {
-                    remote: remote(),
-                    capability: name("gpg"),
-                },
-            },
-        },
-        NOW,
-    );
-    assert!(acts(&step).is_empty() || matches!(acts(&step).first(), Some(Effect::Read { .. })));
-    let told = Told::Read {
-        read: vec![(name("gpg"), Ok(read))],
-    };
-    let step = scene.core.step(Input::Channel { connection, told }, NOW);
+    // Read again, for a key no reading accounts for, and unchanged: nothing
+    // is recorded.
+    let (again, _) = scene.sign_unread_key(9).expect("the source is read again");
+    let step = scene.told_read(again, read);
     assert!(
         !events(&step)
             .iter()
@@ -1914,19 +1919,30 @@ fn read_with(touch: Option<Touch>, card_read: bool) -> hedwig_core::keys::Read {
             signing: None,
         },
         armoured: BTreeMap::new(),
-        cards: if card_read {
-            vec![Card {
-                serial: Serial::try_from(CARD).unwrap(),
-                keys: vec![Held {
-                    grip: Grip::try_from(GRIP).unwrap(),
-                    touch,
-                }],
-                pin: Some(SignaturePin::Once),
-            }]
-        } else {
-            Vec::new()
-        },
+        cards: Ok(Cards {
+            cards: if card_read {
+                vec![Card {
+                    serial: Serial::try_from(CARD).unwrap(),
+                    keys: vec![Held {
+                        grip: Grip::try_from(GRIP).unwrap(),
+                        touch,
+                    }],
+                    pin: Some(SignaturePin::Once),
+                }]
+            } else {
+                Vec::new()
+            },
+            keyless: Vec::new(),
+        }),
     }
+}
+
+/// The cards a read found, where it read them.
+fn cards_of(read: &hedwig_core::keys::Read) -> Vec<Card> {
+    read.cards
+        .clone()
+        .map(|cards| cards.cards)
+        .unwrap_or_default()
 }
 
 impl Scene {
@@ -1950,7 +1966,7 @@ impl Scene {
 
     /// A signature naming `GRIP`, stepped without the suite's own answer to
     /// a read, and the read it asks for.
-    fn sign_unread(&mut self, knock: u64) -> (Step, Option<ConnectionId>) {
+    fn sign_unread(&mut self, knock: u64) -> (Step, Option<Asked>) {
         let step = self.core.step(
             Input::Relayed {
                 knock: Knock(knock),
@@ -1961,26 +1977,38 @@ impl Scene {
             },
             NOW,
         );
-        let read = acts(&step).into_iter().find_map(|effect| match effect {
-            Effect::Read {
-                connection,
-                sources,
-            } if sources.len() == 1 => Some(*connection),
-            _ => None,
-        });
+        let read = acts(&step).into_iter().find_map(whole_read);
         (step, read)
     }
 
-    fn told_read(&mut self, connection: ConnectionId, read: hedwig_core::keys::Read) -> Step {
+    fn told_read(&mut self, (connection, id): Asked, read: hedwig_core::keys::Read) -> Step {
         self.core.step(
             Input::Channel {
                 connection,
                 told: hedwig_core::dispatch::Told::Read {
+                    id,
                     read: vec![(name("gpg"), Ok(read))],
                 },
             },
             NOW,
         )
+    }
+}
+
+/// A read under way: the connection its answer comes on, and the read it
+/// answers.
+type Asked = (ConnectionId, ReadId);
+
+/// The whole source of one capability, read where `effect` asks for it.
+fn whole_read(effect: &Effect) -> Option<Asked> {
+    match effect {
+        Effect::Read {
+            connection,
+            id,
+            sources,
+            ..
+        } if sources.len() == 1 => Some((*connection, *id)),
+        _ => None,
     }
 }
 
@@ -2014,7 +2042,10 @@ fn a_request_for_a_key_no_reading_accounts_for_waits_for_the_source_and_its_card
                 .iter()
                 .any(|event| matches!(event, Event::Offered { .. }))
         );
-        let card = read_with(touch, true).cards.into_iter().next().unwrap();
+        let card = cards_of(&read_with(touch, true))
+            .into_iter()
+            .next()
+            .unwrap();
         assert!(recorded.contains(&Event::Card(card)));
         assert_eq!(
             recorded
@@ -2070,22 +2101,43 @@ fn holding(serial: &str, touch: Option<Touch>) -> Card {
 }
 
 /// The source's cards alone, read where `effect` asks for them.
-fn cards_read(effect: &Effect) -> Option<ConnectionId> {
+fn cards_read(effect: &Effect) -> Option<Asked> {
     match effect {
         Effect::Cards {
             connection,
+            id,
             sources,
-        } if sources.len() == 1 => Some(*connection),
+            ..
+        } if sources.len() == 1 => Some((*connection, *id)),
+        _ => None,
+    }
+}
+
+/// The capability a read of the cards `effect` asks for goes through.
+fn cards_read_through(effect: &Effect) -> Option<Name> {
+    match effect {
+        Effect::Cards { sources, .. } => sources.first().map(|(capability, ..)| capability.clone()),
         _ => None,
     }
 }
 
 impl Scene {
-    fn told_cards(&mut self, connection: ConnectionId, cards: Vec<Card>) -> Step {
+    fn told_cards(&mut self, asked: Asked, cards: Vec<Card>) -> Step {
+        self.told(
+            asked,
+            Cards {
+                cards,
+                keyless: Vec::new(),
+            },
+        )
+    }
+
+    fn told(&mut self, (connection, id): Asked, cards: Cards) -> Step {
         self.core.step(
             Input::Channel {
                 connection,
                 told: hedwig_core::dispatch::Told::Cards {
+                    id,
                     read: vec![(name("gpg"), Ok(cards))],
                 },
             },
@@ -2101,8 +2153,9 @@ impl Scene {
     fn served_card_signature(&mut self, knock: u64) -> ConnectionId {
         self.opened(knock);
         let (_, read) = self.sign_unread(knock);
-        let connection = read.expect("a read");
-        let step = self.told_read(connection, read_with(Some(Touch::On), true));
+        let asked = read.expect("a read");
+        let (connection, _) = asked;
+        let step = self.told_read(asked, read_with(Some(Touch::On), true));
         assert!(
             settled(&step)
                 .iter()
@@ -2121,14 +2174,11 @@ fn the_cards_alone_are_read_once_a_connection_that_used_a_card_ends() {
     let mut scene = Scene::new();
     let connection = scene.served_card_signature(1);
     let step = scene.ended(1);
-    assert_eq!(
-        acts(&step)
-            .into_iter()
-            .filter_map(cards_read)
-            .collect::<Vec<_>>(),
-        vec![connection],
-        "{step:?}"
-    );
+    let reads: Vec<Asked> = acts(&step).into_iter().filter_map(cards_read).collect();
+    let [asked] = reads.as_slice() else {
+        panic!("one read of the cards: {step:?}");
+    };
+    assert_eq!(asked.0, connection);
     assert!(
         !acts(&step)
             .iter()
@@ -2136,7 +2186,7 @@ fn the_cards_alone_are_read_once_a_connection_that_used_a_card_ends() {
         "the whole source is not read again"
     );
     let step = scene.told_cards(
-        connection,
+        *asked,
         vec![
             holding(SECOND_CARD, Some(Touch::Off)),
             holding(CARD, Some(Touch::On)),
@@ -2147,7 +2197,14 @@ fn the_cards_alone_are_read_once_a_connection_that_used_a_card_ends() {
         vec![Event::Card(holding(SECOND_CARD, Some(Touch::Off)))],
         "the first card says nothing new; the second is recorded"
     );
-    let step = scene.told_cards(connection, vec![holding(SECOND_CARD, None)]);
+    scene.opened(2);
+    scene.sign(2);
+    let step = scene.ended(2);
+    let again = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the second use");
+    let step = scene.told_cards(again, vec![holding(SECOND_CARD, None)]);
     assert!(
         events(&step).is_empty(),
         "a card read again that leaves its key unsaid says nothing new: {step:?}"
@@ -2164,13 +2221,12 @@ fn a_card_request_after_a_card_was_used_waits_for_one_reading_of_the_cards() {
     let mut scene = Scene::new();
     let connection = scene.served_card_signature(1);
     let step = scene.sign(1);
-    assert_eq!(
-        acts(&step)
-            .into_iter()
-            .filter_map(cards_read)
-            .collect::<Vec<_>>(),
-        vec![connection]
-    );
+    let reads: Vec<Asked> = acts(&step).into_iter().filter_map(cards_read).collect();
+    let [asked] = reads.as_slice() else {
+        panic!("one read of the cards: {step:?}");
+    };
+    let asked = *asked;
+    assert_eq!(asked.0, connection);
     assert!(
         !events(&step)
             .iter()
@@ -2187,7 +2243,7 @@ fn a_card_request_after_a_card_was_used_waits_for_one_reading_of_the_cards() {
         "the second waits on the reading under way: {step:?}"
     );
     let step = scene.told_cards(
-        connection,
+        asked,
         vec![
             holding(CARD, Some(Touch::On)),
             holding(SECOND_CARD, Some(Touch::On)),
@@ -2230,13 +2286,21 @@ fn a_card_used_while_the_cards_are_read_leaves_them_stale() {
     };
     allow(&mut scene, first);
     let step = scene.ended(1);
-    assert!(acts(&step).into_iter().find_map(cards_read).is_some());
+    let reading = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read");
     allow(&mut scene, held);
-    scene.told_cards(connection, vec![holding(CARD, Some(Touch::On))]);
+    let step = scene.told_cards(reading, vec![holding(CARD, Some(Touch::On))]);
+    assert_eq!(
+        acts(&step).into_iter().find_map(cards_read),
+        None,
+        "nothing waits, so nothing is read at the answer: {step:?}"
+    );
     let step = scene.ended(2);
     assert!(
         acts(&step).into_iter().find_map(cards_read).is_some(),
-        "the signature allowed during the reading still has the cards read: {step:?}"
+        "the use allowed during the reading has the cards read at its connection's end: {step:?}"
     );
 }
 
@@ -2265,6 +2329,1111 @@ fn a_card_request_never_served_has_nothing_read() {
         acts(&step).into_iter().find_map(cards_read).is_none(),
         "{step:?}"
     );
+}
+
+/// A keygrip no reading of the suite's source accounts for.
+const UNREAD_GRIP: &str = "1D3AA6A1A0F4C9B92A3B5F07E6E0D0C3D4E5F601";
+
+impl Scene {
+    /// A signature on `knock` naming `UNREAD_GRIP`, and the whole read of the
+    /// source it asks for.
+    fn sign_unread_key(&mut self, knock: u64) -> Option<(Asked, Known)> {
+        self.opened(knock);
+        let step = self.core.step(
+            Input::Relayed {
+                knock: Knock(knock),
+                relayed: Relayed::Asks(Ask {
+                    operation: Operation::Sign,
+                    key: Some(Grip::try_from(UNREAD_GRIP).unwrap()),
+                }),
+            },
+            NOW,
+        );
+        acts(&step).into_iter().find_map(read_and_known)
+    }
+
+    /// A signature naming `GRIP` on `knock`, opened now, and the read of the
+    /// cards it asks for, if any.
+    fn sign_card_key(&mut self, knock: u64) -> (Step, Option<Asked>) {
+        self.opened(knock);
+        let (step, _) = self.sign_unread(knock);
+        let read = acts(&step).into_iter().find_map(cards_read);
+        (step, read)
+    }
+
+    /// The survey's read of what the source offers, and what it is read on.
+    fn surveyed(&mut self) -> Option<(Asked, Known)> {
+        let step = self.core.step(
+            Input::Asked {
+                link: TERMINAL,
+                frame: ToCore {
+                    id: 91,
+                    request: Request::Check {
+                        remote: remote(),
+                        capability: name("gpg"),
+                    },
+                },
+            },
+            NOW,
+        );
+        acts(&step).into_iter().find_map(read_and_known)
+    }
+}
+
+/// A whole read `effect` asks for, and the known cards it is read on.
+fn read_and_known(effect: &Effect) -> Option<(Asked, Known)> {
+    match effect {
+        Effect::Read {
+            connection,
+            id,
+            known,
+            ..
+        } => Some(((*connection, *id), known.clone())),
+        _ => None,
+    }
+}
+
+/// The known cards an effect reading the cards hands over.
+fn known_of(effect: &Effect) -> Option<&Known> {
+    match effect {
+        Effect::Cards { known, .. } => Some(known),
+        _ => None,
+    }
+}
+
+/// Each read of the cards is handed what the core knows - every card it has
+/// read, and for the cards alone the keyring the source last offered - so a
+/// card it knows is read again from its attributes alone, without a walk.
+#[test]
+fn the_cards_are_read_on_the_cards_and_keyring_the_core_knows() {
+    let mut scene = Scene::new();
+    scene.served_card_signature(1);
+    let read = read_with(Some(Touch::On), true);
+    let step = scene.ended(1);
+    let Some(Effect::Cards { sources, known, .. }) = acts(&step)
+        .into_iter()
+        .find(|effect| cards_read(effect).is_some())
+    else {
+        panic!("the cards are read: {step:?}");
+    };
+    assert_eq!(known.cards, cards_of(&read));
+    let [(capability, _, keyring)] = sources.as_slice() else {
+        panic!("one source: {sources:?}");
+    };
+    assert_eq!((capability, keyring), (&name("gpg"), &read.keyring));
+    let (_, known) = scene.sign_unread_key(2).expect("the whole source is read");
+    assert_eq!(
+        known.cards,
+        cards_of(&read),
+        "read again for a key no reading accounts for"
+    );
+    let (_, known) = scene.surveyed().expect("a read before a survey");
+    assert_eq!(known.cards, cards_of(&read), "read before a survey");
+}
+
+/// A card a walk found holding no key says nothing about the person, so it
+/// is recorded nowhere; the core remembers it for the run, from a read of the
+/// cards or of the whole source, so the next read knows it and walks nothing
+/// for it.
+#[test]
+fn a_card_holding_no_key_is_remembered_for_the_run_and_never_recorded() {
+    let empty = Serial::try_from(SECOND_CARD).unwrap();
+    let mut scene = Scene::new();
+    scene.served_card_signature(1);
+    let step = scene.ended(1);
+    let reading = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read");
+    let step = scene.told(
+        reading,
+        Cards {
+            cards: cards_of(&read_with(Some(Touch::On), true)),
+            keyless: vec![empty.clone()],
+        },
+    );
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Card(_))),
+        "nothing is recorded of a card holding no key: {step:?}"
+    );
+    let (step, _) = scene.sign_card_key(2);
+    assert!(
+        settled(&step)
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, Outcome::Served(_))),
+        "{step:?}"
+    );
+    let step = scene.ended(2);
+    let known = acts(&step)
+        .into_iter()
+        .find_map(known_of)
+        .expect("the cards are read after the use");
+    assert_eq!(known.keyless, [empty.clone()].into());
+    assert_eq!(known.cards, cards_of(&read_with(Some(Touch::On), true)));
+    let cards_on = acts(&step).into_iter().find_map(cards_read).unwrap();
+    scene.told_cards(cards_on, cards_of(&read_with(Some(Touch::On), true)));
+    let (survey, known) = scene.surveyed().expect("a read before a survey");
+    assert_eq!(
+        known.keyless,
+        [empty.clone()].into(),
+        "read before a survey"
+    );
+    let third = Serial::try_from("D2760001240103040006333333330000").unwrap();
+    let mut whole = read_with(Some(Touch::On), true);
+    whole.cards = Ok(Cards {
+        cards: cards_of(&whole),
+        keyless: vec![third.clone()],
+    });
+    let step = scene.told_read(survey, whole);
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Card(_))),
+        "{step:?}"
+    );
+    scene.sign_card_key(3);
+    let step = scene.ended(3);
+    let known = acts(&step)
+        .into_iter()
+        .find_map(known_of)
+        .expect("the cards are read after the use");
+    assert_eq!(known.keyless, [empty, third].into(), "remembered from both");
+}
+
+impl Scene {
+    /// The person allows `request` once.
+    fn allow_once(&mut self, request: RequestId) {
+        let step = self.ask(
+            TERMINAL,
+            Request::Decide {
+                request,
+                decision: Decision::Once,
+            },
+        );
+        assert_eq!(Scene::refused(&step, TERMINAL), None);
+    }
+
+    /// Two signatures held for the person under `confirm_signatures`, on
+    /// knocks 1 and 2, the first allowed and its connection ended, then the
+    /// second allowed: the cards read after the first use, and a second use
+    /// served while that read is under way.
+    fn two_uses_one_read_under_way(&mut self) -> Asked {
+        self.confirm_signatures();
+        self.opened(1);
+        let (_, read) = self.sign_unread(1);
+        self.told_read(read.expect("a read"), read_with(Some(Touch::On), true));
+        self.opened(2);
+        let held = asked(&self.sign(2));
+        let first = asked(&self.sign(1));
+        self.allow_once(first);
+        let step = self.ended(1);
+        let reading = acts(&step)
+            .into_iter()
+            .find_map(cards_read)
+            .expect("the cards are read after the first use");
+        self.allow_once(held);
+        reading
+    }
+}
+
+/// How many requests a step held for the person.
+fn held_for_the_person(step: &Step) -> usize {
+    events(step)
+        .iter()
+        .filter(|event| matches!(event, Event::Asked { .. }))
+        .count()
+}
+
+/// The suite's card holding `UNREAD_GRIP` beside `GRIP`, as a newer reading
+/// names it.
+fn newer_reading() -> hedwig_core::keys::Read {
+    let mut newer = read_with(Some(Touch::On), true);
+    if let Ok(Cards { cards, .. }) = &mut newer.cards
+        && let Some(card) = cards.first_mut()
+    {
+        card.keys.push(Held {
+            grip: Grip::try_from(UNREAD_GRIP).unwrap(),
+            touch: None,
+        });
+    }
+    newer
+}
+
+/// A whole reading of the source recorded while a read of its cards is under
+/// way began after the last use, so it stands for that read: what waits on
+/// the cards is decided on it. The read it overtook began on the cards as
+/// known before it and is never recorded; what waits after a use since is
+/// decided only on a read begun after that use.
+#[test]
+fn a_read_of_the_cards_a_whole_reading_overtook_is_never_recorded() {
+    let mut scene = Scene::new();
+    scene.served_card_signature(1);
+    let step = scene.ended(1);
+    let overtaken = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read");
+    let (step, again) = scene.sign_card_key(3);
+    assert_eq!(again, None, "the read under way serves: {step:?}");
+    assert!(settled(&step).is_empty(), "waits for the cards: {step:?}");
+    let (whole, _) = scene.sign_unread_key(2).expect("the whole source is read");
+    let newer = newer_reading();
+    let step = scene.told_read(whole, newer.clone());
+    let recorded: Vec<Event> = cards_of(&newer).iter().cloned().map(Event::Card).collect();
+    assert!(
+        recorded.iter().all(|card| events(&step).contains(card)),
+        "the newer reading is recorded: {step:?}"
+    );
+    assert_eq!(
+        settled(&step).len(),
+        1,
+        "the request waiting on the cards is decided on it: {step:?}"
+    );
+    let after = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the request naming the new key follows a use since: the cards are read again");
+    let step = scene.told_cards(overtaken, cards_of(&read_with(Some(Touch::On), true)));
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Card(_))),
+        "the older reading would drop the key the newer one named: {step:?}"
+    );
+    assert!(
+        settled(&step).is_empty() && acts(&step).into_iter().find_map(cards_read).is_none(),
+        "nothing is decided on it, and the read begun after the use is waited for: {step:?}"
+    );
+    let step = scene.told_cards(after, cards_of(&newer));
+    assert_eq!(settled(&step).len(), 1, "decided on that read: {step:?}");
+}
+
+/// A request waiting on the cards is decided only on a read of them begun
+/// after the last use: a read begun before it stands for no read after it, so
+/// one is asked at the connection's end, and answered first it decides
+/// nothing.
+#[test]
+fn a_request_is_decided_only_on_a_read_of_the_cards_begun_after_the_last_use() {
+    let mut scene = Scene::new();
+    let before = scene.two_uses_one_read_under_way();
+    let step = scene.ended(2);
+    let read = acts(&step).into_iter().find_map(cards_read);
+    assert!(
+        read.is_some_and(|after| after != before),
+        "the read under way, begun before the second use, stands for no read after it: {step:?}"
+    );
+    let after = read.expect("asserted above");
+    scene.opened(3);
+    let step = scene.sign(3);
+    assert_eq!(
+        acts(&step).into_iter().find_map(cards_read),
+        None,
+        "the read begun after the second use serves: {step:?}"
+    );
+    assert_eq!(held_for_the_person(&step), 0, "{step:?}");
+    let step = scene.told_cards(before, cards_of(&read_with(Some(Touch::On), true)));
+    assert_eq!(
+        held_for_the_person(&step),
+        0,
+        "not decided on a read begun before the second use: {step:?}"
+    );
+    let step = scene.told_cards(after, cards_of(&read_with(Some(Touch::On), true)));
+    assert_eq!(held_for_the_person(&step), 1, "{step:?}");
+}
+
+/// Two reads of the cards under way are both overtaken by a whole reading
+/// recorded meanwhile, and neither is recorded nor made again: the reading,
+/// begun after the last use, read the cards after it.
+#[test]
+fn every_read_of_the_cards_a_whole_reading_overtook_is_set_aside() {
+    let mut scene = Scene::new();
+    let before = scene.two_uses_one_read_under_way();
+    let step = scene.ended(2);
+    let after = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the second use");
+    scene.opened(3);
+    scene.sign(3);
+    let (whole, _) = scene.sign_unread_key(4).expect("the whole source is read");
+    let step = scene.told_read(whole, newer_reading());
+    assert_eq!(
+        held_for_the_person(&step),
+        2,
+        "both requests are decided on it, begun after the last use: {step:?}"
+    );
+    for overtaken in [before, after] {
+        let step = scene.told_cards(overtaken, cards_of(&read_with(Some(Touch::On), true)));
+        assert!(
+            !events(&step)
+                .iter()
+                .any(|event| matches!(event, Event::Card(_))),
+            "{step:?}"
+        );
+        assert_eq!(
+            acts(&step).into_iter().find_map(cards_read),
+            None,
+            "the cards were read after the last use, so nothing is read again: {step:?}"
+        );
+    }
+}
+
+/// A whole reading begun before the last use overtakes every read of the
+/// cards under way and stands for none: what waits on the cards waits for a
+/// read made again on what is known now, and is decided on that one.
+#[test]
+fn a_read_of_the_cards_overtaken_by_a_reading_begun_before_the_last_use_is_made_again() {
+    let mut scene = Scene::new();
+    scene.confirm_signatures();
+    scene.opened(1);
+    let (_, read) = scene.sign_unread(1);
+    scene.told_read(read.expect("a read"), read_with(Some(Touch::On), true));
+    scene.opened(2);
+    let held = asked(&scene.sign(2));
+    let first = asked(&scene.sign(1));
+    scene.allow_once(first);
+    let step = scene.ended(1);
+    let before = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the first use");
+    let (whole, _) = scene.sign_unread_key(4).expect("the whole source is read");
+    scene.allow_once(held);
+    scene.opened(3);
+    let step = scene.sign(3);
+    let after = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the second use");
+    let step = scene.told_read(whole, newer_reading());
+    assert_eq!(held_for_the_person(&step), 0, "{step:?}");
+    let Some(again) = acts(&step).into_iter().find_map(cards_read) else {
+        panic!("the cards are read again on the newer reading: {step:?}");
+    };
+    for overtaken in [before, after] {
+        let step = scene.told_cards(overtaken, cards_of(&read_with(Some(Touch::On), true)));
+        assert!(
+            !events(&step)
+                .iter()
+                .any(|event| matches!(event, Event::Card(_))),
+            "{step:?}"
+        );
+        assert_eq!(held_for_the_person(&step), 0, "{step:?}");
+        assert_eq!(
+            acts(&step).into_iter().find_map(cards_read),
+            None,
+            "{step:?}"
+        );
+    }
+    let step = scene.told_cards(again, cards_of(&newer_reading()));
+    assert_eq!(
+        held_for_the_person(&step),
+        2,
+        "both requests are decided on the read made again: {step:?}"
+    );
+}
+
+impl Scene {
+    /// A request signing with `GRIP` on a new connection `knock` to
+    /// `capability`'s forward.
+    fn sign_through(&mut self, knock: u64, capability: &str) -> Step {
+        self.knock_on(knock, capability);
+        self.relayed(knock, Relayed::Reached(Ok(())));
+        self.core.step(
+            Input::Relayed {
+                knock: Knock(knock),
+                relayed: Relayed::Asks(Ask {
+                    operation: Operation::Sign,
+                    key: Some(Grip::try_from(GRIP).unwrap()),
+                }),
+            },
+            NOW,
+        )
+    }
+
+    /// `capability`'s source defined as `source`.
+    fn define(&mut self, capability: &str, source: Source) {
+        let step = self.ask(
+            TERMINAL,
+            Request::Change(Change::Define(Capability {
+                id: name(capability),
+                source,
+            })),
+        );
+        assert_eq!(Scene::refused(&step, TERMINAL), None, "{step:?}");
+    }
+
+    /// What `capability`'s source offers, told as the answer to `asked`.
+    fn told_read_of(
+        &mut self,
+        (connection, id): Asked,
+        capability: &str,
+        read: hedwig_core::keys::Read,
+    ) -> Step {
+        let told = hedwig_core::dispatch::Told::Read {
+            id,
+            read: vec![(name(capability), Ok(read))],
+        };
+        self.core.step(Input::Channel { connection, told }, NOW)
+    }
+
+    /// The cards `capability`'s source holds, told as the answer to `asked`.
+    fn told_cards_of(
+        &mut self,
+        (connection, id): Asked,
+        capability: &str,
+        cards: Vec<Card>,
+    ) -> Step {
+        let told = hedwig_core::dispatch::Told::Cards {
+            id,
+            read: vec![(
+                name(capability),
+                Ok(Cards {
+                    cards,
+                    keyless: Vec::new(),
+                }),
+            )],
+        };
+        self.core.step(Input::Channel { connection, told }, NOW)
+    }
+}
+
+/// `work`, a capability of the person's own defining that relays the
+/// registered `GnuPG`'s default home, forwarded to the remote, with every
+/// signature through it put to the person.
+fn work_confirmed() -> Scene {
+    let mut scene = Scene::attached();
+    scene.define(
+        "work",
+        Source::Gnupg {
+            installation: Installation::Registered,
+            home: Home::Default,
+            access: Access::Restricted,
+        },
+    );
+    let socket = RemotePath::try_from("/run/user/1000/gnupg/S.gpg-agent").unwrap();
+    scene.forwarding("work", Exposure::NONE, Binding::Socket(socket));
+    let step = scene.ask(
+        TERMINAL,
+        Request::Rule {
+            connection: scene.connection,
+            scope: ConnectionScope {
+                capability: Selector::Only(name("work")),
+                operation: Selector::Only(Operation::Sign),
+                key: Keys::Every,
+            },
+            mode: Some(Mode::Confirm),
+        },
+    );
+    assert_eq!(Scene::refused(&step, TERMINAL), None, "{step:?}");
+    scene
+}
+
+/// A read of the cards whose capability reaches another agent now - defined
+/// again with another `GnuPG` home meanwhile - has nothing of that agent to
+/// read again: each request waiting on its cards is decided on what is
+/// known, and nothing of the new agent is read for it.
+#[test]
+fn a_read_of_the_cards_whose_capability_reaches_another_agent_now_decides_what_waits() {
+    let mut scene = work_confirmed();
+    let step = scene.sign_through(1, "work");
+    let whole = acts(&step)
+        .into_iter()
+        .find_map(whole_read)
+        .expect("the source is read");
+    let step = scene.told_read_of(whole, "work", read_with(Some(Touch::On), true));
+    let first = asked(&step);
+    let held = asked(&scene.sign_through(2, "work"));
+    scene.allow_once(first);
+    let step = scene.ended(1);
+    let reading = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read");
+    scene.allow_once(held);
+    let step = scene.sign_through(3, "work");
+    assert_eq!(
+        held_for_the_person(&step),
+        0,
+        "waits for the cards: {step:?}"
+    );
+    scene.define(
+        "work",
+        Source::Gnupg {
+            installation: Installation::Registered,
+            home: Home::At(Folder::try_from(r"C:\Users\dev\other-gnupg").unwrap()),
+            access: Access::Restricted,
+        },
+    );
+    let step = scene.told_cards_of(
+        reading,
+        "work",
+        cards_of(&read_with(Some(Touch::Off), true)),
+    );
+    assert_eq!(
+        acts(&step).into_iter().find_map(cards_read),
+        None,
+        "nothing to read again: {step:?}"
+    );
+    assert!(
+        events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Asked { .. } | Event::Settled { .. })),
+        "what waited is decided: {step:?}"
+    );
+}
+
+impl Scene {
+    /// Each capability of `granted` granted to the remote, lending what it
+    /// names, and the channel up forwarding each at its socket.
+    fn forwarding_several(&mut self, granted: Vec<(&str, Lends, &str)>) {
+        let mut servings = Vec::new();
+        for (capability, lends, path) in granted {
+            let step = self.ask(
+                TERMINAL,
+                Request::Change(Change::Grant {
+                    grant: Grant {
+                        capability: name(capability),
+                        remotes: Granted::One(remote()),
+                    },
+                    terms: Terms {
+                        activation: Activation::OnRequest,
+                        setup: Setup::Write,
+                        acknowledged: Exposure::NONE,
+                        lends,
+                    },
+                }),
+            );
+            assert_eq!(Scene::refused(&step, TERMINAL), None, "{step:?}");
+            servings.push(Serving {
+                capability: name(capability),
+                binding: Binding::Socket(RemotePath::try_from(path).unwrap()),
+            });
+        }
+        self.ask(
+            TERMINAL,
+            Request::Connect {
+                remote: remote(),
+                with: Vec::new(),
+                acknowledged: Exposure::NONE,
+                lends: Lends::none(),
+            },
+        );
+        let (connection, _) = self.core.state().connection(&remote()).unwrap();
+        self.connection = connection;
+        self.step(Input::Channel {
+            connection,
+            told: common::placing(&servings),
+        });
+        for serving in &servings {
+            self.step(Input::Channel {
+                connection,
+                told: hedwig_core::dispatch::Told::Forwarded {
+                    capability: serving.capability.clone(),
+                    bound: true,
+                },
+            });
+        }
+    }
+}
+
+/// `gpg` and `gpg-ssh` granted to the remote, `gpg-ssh` lending `lent`, and
+/// the channel up forwarding both: two capabilities reaching one agent.
+fn gpg_beside_its_ssh_socket(lent: &SshKey) -> Scene {
+    let mut scene = Scene::attached();
+    scene.forwarding_several(vec![
+        ("gpg", Lends::none(), "/run/user/1000/gnupg/S.gpg-agent"),
+        (
+            "gpg-ssh",
+            Lends::of_keys([(lent.clone(), Toward::Anywhere.into())]),
+            "/run/user/1000/gnupg/S.gpg-agent.ssh",
+        ),
+    ]);
+    scene
+}
+
+/// A source's `gpg` socket and its SSH socket reach one agent and its cards:
+/// a whole reading made through the SSH capability overtakes a read of the
+/// cards the `gpg` capability's use asked for, and decides what waits on
+/// them.
+#[test]
+fn a_whole_reading_through_either_capability_of_one_agent_overtakes_its_cards_read() {
+    let unknown = SshKey::try_from(
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBrm25FDDmgurPp+9REqiJK8zAJcpqMSElCklOS/AsegLtx+gx5BUgH5CnBk5aAOQSkrVsP5DuaWeib+dCzCSqo=",
+    )
+    .unwrap();
+    let mut scene = gpg_beside_its_ssh_socket(&unknown);
+    scene.served_card_signature(1);
+    let step = scene.ended(1);
+    let overtaken = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read");
+    let (step, _) = scene.sign_card_key(2);
+    assert!(settled(&step).is_empty(), "waits for the cards: {step:?}");
+    scene.knock_on(3, "gpg-ssh");
+    scene.relayed(3, Relayed::Reached(Ok(())));
+    let step = scene.core.step(
+        Input::Relayed {
+            knock: Knock(3),
+            relayed: Relayed::Signs(AgentAsk {
+                operation: Operation::Authenticate,
+                key: unknown,
+                payload: Payload::Authentication {
+                    user: None,
+                    host: None,
+                },
+            }),
+        },
+        NOW,
+    );
+    let whole = acts(&step)
+        .into_iter()
+        .find_map(whole_read)
+        .expect("the SSH capability's source is read");
+    let newer = newer_reading();
+    let step = scene.told_read_of(whole, "gpg-ssh", newer.clone());
+    let recorded: Vec<Event> = cards_of(&newer).iter().cloned().map(Event::Card).collect();
+    assert!(
+        recorded.iter().all(|card| events(&step).contains(card)),
+        "the newer reading is recorded: {step:?}"
+    );
+    assert!(
+        settled(&step)
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, Outcome::Served(_))),
+        "the gpg request waiting on the cards is decided on it: {step:?}"
+    );
+    let step = scene.told_cards(overtaken, cards_of(&read_with(Some(Touch::On), true)));
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Card(_))),
+        "the gpg capability's older reading is never recorded: {step:?}"
+    );
+}
+
+/// A whole reading whose cards could not be read says nothing of them: it
+/// stands for no read of the cards and overtakes none under way, so what
+/// waits on them is decided on the read of the cards alone.
+#[test]
+fn a_whole_reading_whose_cards_could_not_be_read_stands_for_no_read_of_them() {
+    let mut scene = Scene::new();
+    scene.served_card_signature(1);
+    let step = scene.ended(1);
+    let reading = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read");
+    let (step, _) = scene.sign_card_key(3);
+    assert!(settled(&step).is_empty(), "waits for the cards: {step:?}");
+    let (survey, _) = scene.surveyed().expect("a read before a survey");
+    let mut failed = read_with(Some(Touch::On), true);
+    failed.cards = Err(Failure::Unreachable);
+    let step = scene.told_read(survey, failed);
+    assert!(
+        settled(&step).is_empty(),
+        "nothing is decided on a reading whose cards were not read: {step:?}"
+    );
+    let step = scene.told_cards(reading, cards_of(&newer_reading()));
+    assert!(
+        events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Card(_))),
+        "the read of the cards alone is recorded, overtaken by nothing: {step:?}"
+    );
+    assert_eq!(
+        settled(&step).len(),
+        1,
+        "what waits is decided on it: {step:?}"
+    );
+}
+
+/// A whole reading overtaken by another recorded first records none of its
+/// cards: it began on the cards as known before that one.
+#[test]
+fn a_whole_reading_another_overtook_records_none_of_its_cards() {
+    let mut scene = Scene::new();
+    let (survey, _) = scene.surveyed().expect("a read before a survey");
+    let (whole, _) = scene.sign_unread_key(2).expect("the source is read again");
+    let newer = newer_reading();
+    let step = scene.told_read(whole, newer.clone());
+    let recorded: Vec<Event> = cards_of(&newer).into_iter().map(Event::Card).collect();
+    assert!(
+        recorded.iter().all(|card| events(&step).contains(card)),
+        "the reading recorded first is recorded: {step:?}"
+    );
+    let step = scene.told_read(survey, read_with(Some(Touch::On), true));
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Card(_))),
+        "the older reading would drop the key the newer one named: {step:?}"
+    );
+}
+
+/// A read of the cards that failed counts as read: what waits on the cards is
+/// decided on what is known, never kept waiting on an agent that does not
+/// answer, and nothing is read again for it.
+#[test]
+fn a_read_of_the_cards_that_failed_decides_what_waits_on_what_is_known() {
+    let mut scene = Scene::new();
+    scene.served_card_signature(1);
+    let step = scene.ended(1);
+    let (connection, id) = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read");
+    let (step, _) = scene.sign_card_key(3);
+    assert!(settled(&step).is_empty(), "waits for the cards: {step:?}");
+    let told = hedwig_core::dispatch::Told::Cards {
+        id,
+        read: vec![(name("gpg"), Err(Failure::Unreachable))],
+    };
+    let step = scene.core.step(Input::Channel { connection, told }, NOW);
+    assert_eq!(
+        settled(&step).len(),
+        1,
+        "decided on what is known: {step:?}"
+    );
+    assert_eq!(
+        acts(&step).into_iter().find_map(cards_read),
+        None,
+        "nothing is read again: {step:?}"
+    );
+}
+
+/// A read of the cards after a use that a whole reading begun before that use
+/// overtook is made again while the cards are stale, though nothing waits: the
+/// cards are read after every use.
+#[test]
+fn an_overtaken_read_after_a_use_is_made_again_while_the_cards_are_stale() {
+    let mut scene = Scene::new();
+    scene.confirm_signatures();
+    scene.opened(1);
+    let (_, read) = scene.sign_unread(1);
+    scene.told_read(read.expect("a read"), read_with(Some(Touch::On), true));
+    let first = asked(&scene.sign(1));
+    let (survey, _) = scene.surveyed().expect("a read before a survey");
+    scene.allow_once(first);
+    let step = scene.ended(1);
+    let overtaken = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the use");
+    scene.told_read(survey, newer_reading());
+    let step = scene.told_cards(overtaken, cards_of(&read_with(Some(Touch::On), true)));
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Card(_))),
+        "{step:?}"
+    );
+    assert!(
+        acts(&step).into_iter().find_map(cards_read).is_some(),
+        "the cards are read again after the use: {step:?}"
+    );
+}
+
+/// What waits on an agent's cards is read for through a waiting request's
+/// capability that still reaches the agent, where the one the read was made
+/// through reaches another now: it is never decided on cards not read after
+/// the last use while the agent can still be read.
+#[test]
+fn what_waits_is_read_for_through_another_capability_still_reaching_the_agent() {
+    let ssh = SshKey::try_from(
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBrm25FDDmgurPp+9REqiJK8zAJcpqMSElCklOS/AsegLtx+gx5BUgH5CnBk5aAOQSkrVsP5DuaWeib+dCzCSqo=",
+    )
+    .unwrap();
+    let mut scene = Scene::attached();
+    scene.define(
+        "work-ssh",
+        Source::Agent {
+            at: AgentAt::Gnupg {
+                installation: Installation::Registered,
+                home: Home::Default,
+            },
+        },
+    );
+    scene.forwarding_several(vec![
+        ("gpg", Lends::none(), "/run/user/1000/gnupg/S.gpg-agent"),
+        (
+            "work-ssh",
+            Lends::of_keys([(ssh.clone(), Toward::Anywhere.into())]),
+            "/run/user/1000/gnupg/S.gpg-agent.ssh",
+        ),
+    ]);
+    let step = scene.ask(
+        TERMINAL,
+        Request::Change(Change::Rule {
+            scope: RuleScope {
+                remotes: Remotes::One(remote()),
+                capability: Selector::Every,
+                operation: Selector::Every,
+                key: Keys::Every,
+            },
+            mode: Mode::Confirm,
+        }),
+    );
+    assert_eq!(Scene::refused(&step, TERMINAL), None, "{step:?}");
+    // The key on the card, which the SSH socket names by its public half.
+    let mut read = read_with(Some(Touch::On), true);
+    if let Some(key) = read.keyring.keys.first_mut() {
+        key.uses = Uses::SIGN.with(Uses::AUTHENTICATE);
+        key.ssh = Some(ssh.clone());
+    }
+    scene.knock_on(1, "work-ssh");
+    scene.relayed(1, Relayed::Reached(Ok(())));
+    let step = scene.core.step(
+        Input::Relayed {
+            knock: Knock(1),
+            relayed: Relayed::Signs(AgentAsk {
+                operation: Operation::Authenticate,
+                key: ssh,
+                payload: Payload::Authentication {
+                    user: None,
+                    host: None,
+                },
+            }),
+        },
+        NOW,
+    );
+    let whole = acts(&step)
+        .into_iter()
+        .find_map(whole_read)
+        .expect("the SSH capability's source is read");
+    let first = asked(&scene.told_read_of(whole, "work-ssh", read.clone()));
+    let step = scene.sign_through(2, "gpg");
+    let step = match acts(&step).into_iter().find_map(whole_read) {
+        Some(whole) => scene.told_read_of(whole, "gpg", read.clone()),
+        None => step,
+    };
+    let second = asked(&step);
+    scene.allow_once(first);
+    let step = scene.ended(1);
+    let before = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the first use, through work-ssh");
+    scene.allow_once(second);
+    let step = scene.sign_through(3, "gpg");
+    let after = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the second use, through gpg");
+    assert_eq!(held_for_the_person(&step), 0, "{step:?}");
+    scene.define(
+        "work-ssh",
+        Source::Agent {
+            at: AgentAt::Machine,
+        },
+    );
+    let step = scene.told_cards_of(before, "work-ssh", cards_of(&read));
+    assert_eq!(
+        held_for_the_person(&step),
+        0,
+        "not decided on a read begun before the second use: {step:?}"
+    );
+    let step = scene.told_cards_of(after, "gpg", cards_of(&read));
+    assert_eq!(held_for_the_person(&step), 1, "{step:?}");
+}
+
+/// A scene carrying `gpg` and `work-ssh`, two capabilities of one agent,
+/// every request confirmed, with `work-ssh`'s source read and a signature
+/// through it held for the person: the scene, the reading and the request.
+fn held_through_work_ssh() -> (Scene, hedwig_core::keys::Read, RequestId) {
+    let ssh = SshKey::try_from(
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBrm25FDDmgurPp+9REqiJK8zAJcpqMSElCklOS/AsegLtx+gx5BUgH5CnBk5aAOQSkrVsP5DuaWeib+dCzCSqo=",
+    )
+    .unwrap();
+    let mut scene = Scene::attached();
+    scene.define(
+        "work-ssh",
+        Source::Agent {
+            at: AgentAt::Gnupg {
+                installation: Installation::Registered,
+                home: Home::Default,
+            },
+        },
+    );
+    scene.forwarding_several(vec![
+        ("gpg", Lends::none(), "/run/user/1000/gnupg/S.gpg-agent"),
+        (
+            "work-ssh",
+            Lends::of_keys([(ssh.clone(), Toward::Anywhere.into())]),
+            "/run/user/1000/gnupg/S.gpg-agent.ssh",
+        ),
+    ]);
+    let step = scene.ask(
+        TERMINAL,
+        Request::Change(Change::Rule {
+            scope: RuleScope {
+                remotes: Remotes::One(remote()),
+                capability: Selector::Every,
+                operation: Selector::Every,
+                key: Keys::Every,
+            },
+            mode: Mode::Confirm,
+        }),
+    );
+    assert_eq!(Scene::refused(&step, TERMINAL), None, "{step:?}");
+    let mut read = read_with(Some(Touch::On), true);
+    if let Some(key) = read.keyring.keys.first_mut() {
+        key.uses = Uses::SIGN.with(Uses::AUTHENTICATE);
+        key.ssh = Some(ssh.clone());
+    }
+    scene.knock_on(1, "work-ssh");
+    scene.relayed(1, Relayed::Reached(Ok(())));
+    let step = scene.core.step(
+        Input::Relayed {
+            knock: Knock(1),
+            relayed: Relayed::Signs(AgentAsk {
+                operation: Operation::Authenticate,
+                key: ssh,
+                payload: Payload::Authentication {
+                    user: None,
+                    host: None,
+                },
+            }),
+        },
+        NOW,
+    );
+    let whole = acts(&step)
+        .into_iter()
+        .find_map(whole_read)
+        .expect("the SSH capability's source is read");
+    let first = asked(&scene.told_read_of(whole, "work-ssh", read.clone()));
+    (scene, read, first)
+}
+
+/// The cards are read on the keyring of their agent: a request through `gpg`,
+/// whose own keyring names no key, has them read on the one `work-ssh` offered
+/// from the same home, so a known card is not walked.
+#[test]
+fn the_cards_are_read_on_the_keyring_of_any_capability_of_their_agent() {
+    let (mut scene, read, first) = held_through_work_ssh();
+    scene.allow_once(first);
+    let step = scene.sign_through(2, "gpg");
+    let keyring = acts(&step).into_iter().find_map(|effect| match effect {
+        Effect::Cards { sources, .. } => sources.first().map(|(_, _, keyring)| keyring.clone()),
+        _ => None,
+    });
+    assert_eq!(keyring, Some(read.keyring), "{step:?}");
+}
+
+/// The cards are read on the keyring of the capability they are read through
+/// where that names a key, ahead of any other of their agent's, whichever
+/// name sorts first among the grants.
+#[test]
+fn the_cards_are_read_on_their_own_capabilitys_keyring_where_it_names_a_key() {
+    let keyring_of = |step: &Step| {
+        acts(step).into_iter().find_map(|effect| match effect {
+            Effect::Cards { sources, .. } => sources.first().map(|(_, _, keyring)| keyring.clone()),
+            _ => None,
+        })
+    };
+    let (mut scene, read, first) = held_through_work_ssh();
+    let (survey, _) = scene.surveyed().expect("a read before a survey");
+    scene.allow_once(first);
+    scene.told_read_of(survey, "gpg", newer_reading());
+    let step = scene.sign_through(2, "gpg");
+    assert_eq!(
+        keyring_of(&step),
+        Some(newer_reading().keyring),
+        "through gpg: {step:?}"
+    );
+    let through_gpg = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read through gpg");
+    let held = asked(&scene.told_cards_of(through_gpg, "gpg", cards_of(&newer_reading())));
+    scene.allow_once(held);
+    let step = scene.ended(1);
+    assert_eq!(
+        keyring_of(&step),
+        Some(read.keyring),
+        "through work-ssh: {step:?}"
+    );
+}
+
+/// An overtaken read of the cards after a use, whose capability was defined
+/// again meanwhile to reach another agent, is made again through a capability
+/// still reaching the agent it read, though nothing waits: the cards are read
+/// after every use while that agent can still be read.
+#[test]
+fn an_overtaken_read_is_made_again_through_a_capability_still_reaching_its_agent() {
+    let (mut scene, read, first) = held_through_work_ssh();
+    let (survey, _) = scene.surveyed().expect("a read before a survey");
+    scene.allow_once(first);
+    let step = scene.ended(1);
+    let overtaken = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the use, through work-ssh");
+    scene.define(
+        "work-ssh",
+        Source::Agent {
+            at: AgentAt::Machine,
+        },
+    );
+    scene.told_read_of(survey, "gpg", newer_reading());
+    let step = scene.told_cards_of(overtaken, "work-ssh", cards_of(&read));
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Card(_))),
+        "{step:?}"
+    );
+    assert_eq!(
+        acts(&step).into_iter().find_map(cards_read_through),
+        Some(name("gpg")),
+        "the cards are read again after the use, through gpg: {step:?}"
+    );
+}
+
+/// An overtaken read is not made again through a granted capability where
+/// no keyring of the agent names a key: with nothing to tie a slot to a key,
+/// that read would walk a card the core knows, with nothing waiting on it.
+#[test]
+fn an_overtaken_read_is_not_made_again_through_a_capability_with_no_keyring() {
+    let (mut scene, read, first) = held_through_work_ssh();
+    let (survey, _) = scene.surveyed().expect("a read before a survey");
+    scene.allow_once(first);
+    let step = scene.ended(1);
+    let overtaken = acts(&step)
+        .into_iter()
+        .find_map(cards_read)
+        .expect("the cards are read after the use, through work-ssh");
+    scene.define(
+        "work-ssh",
+        Source::Agent {
+            at: AgentAt::Machine,
+        },
+    );
+    // Only work-ssh's part answers: gpg, granted and reaching the agent, has
+    // no key in its keyring.
+    scene.told_read_of(survey, "work-ssh", newer_reading());
+    let step = scene.told_cards_of(overtaken, "work-ssh", cards_of(&read));
+    assert_eq!(
+        acts(&step).into_iter().find_map(cards_read_through),
+        None,
+        "no read through a capability with no keyring: {step:?}"
+    );
+}
+
+/// A request with a key on a card has the cards alone read for it while a
+/// whole reading is under way: that reading's `gpg` runs unbounded, a read of
+/// the cards alone does not.
+#[test]
+fn a_card_request_has_the_cards_alone_read_while_a_whole_reading_is_under_way() {
+    let mut scene = Scene::new();
+    scene.served_card_signature(1);
+    scene.sign_unread_key(2).expect("the whole source is read");
+    let (step, read) = scene.sign_card_key(3);
+    assert!(read.is_some(), "the cards alone are read: {step:?}");
+    assert!(settled(&step).is_empty(), "waits for them: {step:?}");
 }
 
 /// Lending a device to a remote while one of its ADB connections is
@@ -3064,13 +4233,19 @@ fn an_unread_ssh_key_waits_for_the_keyring_and_is_decided_as_the_key_it_ties_to(
         },
         NOW,
     );
-    assert!(
-        acts(&step).iter().any(|effect| matches!(
-            effect,
-            Effect::Read { sources, .. } if sources.iter().any(|(capability, _)| *capability == name("gpg-ssh"))
-        )),
-        "{step:?}"
-    );
+    let first = acts(&step)
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Read { id, sources, .. }
+                if sources
+                    .iter()
+                    .any(|(capability, _)| *capability == name("gpg-ssh")) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{step:?}"));
     assert!(
         !events(&step)
             .iter()
@@ -3098,6 +4273,7 @@ fn an_unread_ssh_key_waits_for_the_keyring_and_is_decided_as_the_key_it_ties_to(
         Input::Channel {
             connection: scene.connection,
             told: Told::Read {
+                id: first,
                 read: vec![(name("gpg-ssh"), Ok(read.clone()))],
             },
         },
@@ -3132,15 +4308,18 @@ fn an_unread_ssh_key_waits_for_the_keyring_and_is_decided_as_the_key_it_ties_to(
         },
         NOW,
     );
-    assert!(
-        acts(&step)
-            .iter()
-            .any(|effect| matches!(effect, Effect::Read { .. }))
-    );
+    let again = acts(&step)
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Read { id, .. } => Some(*id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{step:?}"));
     let step = scene.core.step(
         Input::Channel {
             connection: scene.connection,
             told: Told::Read {
+                id: again,
                 read: vec![(name("gpg-ssh"), Ok(read))],
             },
         },

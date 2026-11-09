@@ -233,13 +233,15 @@ impl Harness {
                 // no keys, and the person's own GnuPG is never asked.
                 Effect::Read {
                     connection,
+                    id,
                     sources,
+                    ..
                 } => {
                     let read = sources
                         .into_iter()
                         .map(|(capability, _)| (capability, Ok(hedwig_core::keys::Read::default())))
                         .collect();
-                    let told = hedwig_core::dispatch::Told::Read { read };
+                    let told = hedwig_core::dispatch::Told::Read { id, read };
                     let step = self.core.step(Input::Channel { connection, told }, now());
                     self.carry(step);
                 }

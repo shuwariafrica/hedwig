@@ -9,7 +9,7 @@
 //! it. The readers of what the tools print are plain functions;
 //! running the tools is the rest.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -24,13 +24,43 @@ use crate::assuan::LINE;
 use crate::relay::{Agents, Gnupg, gpgconf, launch, listed, unescape};
 
 /// What one read of a source found.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Read {
     pub keyring: Keyring,
     /// Each key's public half, armoured, by its primary fingerprint.
     pub armoured: BTreeMap<Fingerprint, String>,
-    /// The cards the source's scdaemon holds.
+    /// The cards the source's scdaemon holds, as [`read_cards`] read them,
+    /// or why they could not be read: a reading whose cards were not read
+    /// says nothing of them.
+    pub cards: Result<Cards, Failure>,
+}
+
+impl Default for Read {
+    fn default() -> Self {
+        Read {
+            keyring: Keyring::default(),
+            armoured: BTreeMap::new(),
+            cards: Ok(Cards::default()),
+        }
+    }
+}
+
+/// What a read of the cards found.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Cards {
     pub cards: Vec<Card>,
+    /// Each card scdaemon holds that a walk named no key on: a card no
+    /// statement can be about, so it is recorded nowhere, and remembered by
+    /// the core only so it is not walked again.
+    pub keyless: Vec<Serial>,
+}
+
+/// What the core knows of the cards a read builds on: every card it has
+/// recorded, and each card a walk found holding no key.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Known {
+    pub cards: Vec<Card>,
+    pub keyless: BTreeSet<Serial>,
 }
 
 /// The fields of one line of a colon listing.
@@ -357,12 +387,100 @@ pub fn pin(status: &[Vec<u8>]) -> Option<SignaturePin> {
 
 /// What the card scdaemon reaches first said of itself: its serial number,
 /// and, where its first application is `OpenPGP`'s, the touch of each slot
-/// and the signature PIN.
+/// and the signature PIN, and the fingerprint of the key in each slot where
+/// that was asked.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct First {
     pub serial: Option<Serial>,
     pub touches: [Option<Touch>; 3],
     pub pin: Option<SignaturePin>,
+    pub slots: [Option<Fingerprint>; 3],
+}
+
+/// The serial number of each card `SCD GETINFO card_list` says scdaemon
+/// holds, one `SERIALNO <serial>` status line per card.
+pub fn held(status: &[Vec<u8>]) -> Vec<Serial> {
+    status
+        .iter()
+        .filter_map(|line| text(line.strip_prefix(b"SERIALNO ")?))
+        .collect()
+}
+
+/// The fingerprint of the key in each `OpenPGP` slot, from `GETATTR KEY-FPR`'s
+/// `KEY-FPR <slot> <fingerprint>` lines; a slot it leaves out is empty.
+pub fn slots(status: &[Vec<u8>]) -> [Option<Fingerprint>; 3] {
+    let mut slots: [Option<Fingerprint>; 3] = Default::default();
+    for line in status {
+        let mut words = line.split(|byte| *byte == b' ');
+        if words.next() != Some(b"KEY-FPR".as_slice()) {
+            continue;
+        }
+        let slot = words
+            .next()
+            .and_then(|n| std::str::from_utf8(n).ok())
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| n.checked_sub(1));
+        if let (Some(place), Some(fingerprint)) = (
+            slot.and_then(|slot| slots.get_mut(slot)),
+            words.next().and_then(text),
+        ) {
+            *place = Some(fingerprint);
+        }
+    }
+    slots
+}
+
+/// `known` read again from what the card scdaemon reaches first says of
+/// itself, which selects nothing: the keys it is known to hold, each that an
+/// `OpenPGP` slot holds with what the card asks now before its use, the rest
+/// unsaid. `None` where that card is not `known`, or its slots name a key the
+/// keyring does not tie to one `known` holds, or leave out one it holds that
+/// the keyring names: a key was put on or taken off the card, which only a
+/// walk of its applications names.
+pub fn from_attributes(known: &Card, keyring: &Keyring, first: &First) -> Option<Card> {
+    if first.serial.as_ref() != Some(&known.serial) {
+        return None;
+    }
+    let mut slotted: Vec<(&Grip, usize)> = Vec::new();
+    for (slot, fingerprint) in first.slots.iter().enumerate() {
+        let Some(fingerprint) = fingerprint else {
+            continue;
+        };
+        let key = keyring
+            .keys
+            .iter()
+            .find(|key| key.fingerprint == *fingerprint)?;
+        if !known.keys.iter().any(|held| held.grip == key.grip) {
+            return None;
+        }
+        slotted.push((&key.grip, slot));
+    }
+    let slot_of = |grip: &Grip| {
+        slotted
+            .iter()
+            .find(|(slotted, _)| *slotted == grip)
+            .map(|(_, slot)| *slot)
+    };
+    if known
+        .keys
+        .iter()
+        .any(|held| keyring.by_grip(&held.grip).is_some() && slot_of(&held.grip).is_none())
+    {
+        return None;
+    }
+    Some(Card {
+        serial: known.serial.clone(),
+        keys: known
+            .keys
+            .iter()
+            .map(|held| Held {
+                grip: held.grip.clone(),
+                touch: slot_of(&held.grip)
+                    .and_then(|slot| first.touches.get(slot).copied().flatten()),
+            })
+            .collect(),
+        pin: first.pin,
+    })
 }
 
 /// The cards, each with the keys on it, from what `SCD KEYINFO --list` named
@@ -535,28 +653,42 @@ pub fn read_ssh(agents: &Agents, source: &Gnupg, keys: &mut [Key]) -> Result<(),
     Ok(())
 }
 
-/// The commands a card read sends, each read-only and none naming a card, an
-/// application or a key: `KEYINFO --list` walks only the cards scdaemon
-/// already holds and selects each one's first application again after it; a
-/// `GETATTR` without a keygrip reaches the card scdaemon reaches first, in the
-/// application it has selected.
+/// Lists the serial number of each card scdaemon holds, opening and selecting
+/// nothing.
+pub const CARD_LIST: &[u8] = b"SCD GETINFO card_list";
+/// Names each key on every card scdaemon holds, with its card and, for an
+/// `OpenPGP` key, its slot: the one read that names a card's keys outside
+/// those slots, or a card scdaemon does not reach first. On a card of several
+/// applications it selects each in turn and the first again after it, which
+/// has the card forget every PIN it had verified, as the agent's own lookup
+/// does before every card operation.
 pub const KEYINFO: &[u8] = b"SCD KEYINFO --list";
 pub const SERIALNO: &[u8] = b"SCD GETATTR SERIALNO";
 pub const APPTYPE: &[u8] = b"SCD GETATTR APPTYPE";
+pub const KEY_FPR: &[u8] = b"SCD GETATTR KEY-FPR";
 pub const EXTCAP: &[u8] = b"SCD GETATTR EXTCAP";
 pub const UIF: &[u8] = b"SCD GETATTR UIF";
 pub const CHV_STATUS: &[u8] = b"SCD GETATTR CHV-STATUS";
 
 /// Reads the cards `source`'s scdaemon holds through the agent's own socket,
-/// which is the one `SCD GETATTR` is not refused on. Nothing is asked of a
-/// card scdaemon does not hold already, so nothing is opened; nothing names
-/// a card or an application, so nothing is switched.
+/// which is the one `SCD GETATTR` is not refused on, building on `known`, what
+/// the core knows of the cards, and `keyring`, which ties a slot's
+/// fingerprint to its keygrip. Where every card held is known, the card
+/// scdaemon reaches first is read from its attributes alone; a card never
+/// read, or one whose slots changed, has every card held walked (see
+/// [`KEYINFO`]). Nothing is asked of a card scdaemon does not hold already,
+/// so nothing is opened.
 ///
 /// # Errors
 ///
 /// The agent not answering. A card that says nothing is not an error: it is
 /// read as one whose safeguards are not known.
-pub fn read_cards(agents: &Agents, source: &Gnupg) -> Result<Vec<Card>, Failure> {
+pub fn read_cards(
+    agents: &Agents,
+    source: &Gnupg,
+    known: &Known,
+    keyring: &Keyring,
+) -> Result<Cards, Failure> {
     let standard = Gnupg {
         access: Access::Unrestricted,
         ..source.clone()
@@ -565,48 +697,119 @@ pub fn read_cards(agents: &Agents, source: &Gnupg) -> Result<Vec<Card>, Failure>
     agent
         .set_read_timeout(Some(crate::PATIENCE))
         .map_err(|_| Failure::Unreachable)?;
-    let Ok(listed) = ask(&mut agent, KEYINFO)? else {
-        return Ok(Vec::new());
+    // `card_list` refused - no card held, or an scdaemon without the command -
+    // leaves the walk, which knows no less.
+    let held = match ask(&mut agent, CARD_LIST)? {
+        Ok(listed) => held(&listed),
+        Err(_) => return walk(&mut agent, &[], known),
     };
-    let listed = on_cards(&listed);
-    if listed.is_empty() {
-        return Ok(Vec::new());
+    // With no card held a `GETATTR` would have scdaemon scan for one.
+    if held.is_empty() {
+        return Ok(Cards::default());
     }
+    let card = |serial: &Serial| known.cards.iter().find(|card| card.serial == *serial);
+    let is_known = |serial: &Serial| card(serial).is_some() || known.keyless.contains(serial);
+    if held.iter().all(is_known) {
+        // A first card in another application says nothing more without a
+        // switch of its application, which no read makes.
+        let Some(mut first) = first(&mut agent)? else {
+            return Ok(Cards::default());
+        };
+        if let Ok(fingerprints) = ask(&mut agent, KEY_FPR)? {
+            first.slots = slots(&fingerprints);
+        }
+        if let Some(serial) = first.serial.as_ref() {
+            match card(serial) {
+                Some(known) => {
+                    if let Some(again) = from_attributes(known, keyring, &first) {
+                        return Ok(Cards {
+                            cards: vec![again],
+                            keyless: Vec::new(),
+                        });
+                    }
+                }
+                // A card known to hold no key whose slots are still empty
+                // says nothing new; a key put in its `OpenPGP` slots since is
+                // a changed slot.
+                None if first.slots.iter().all(Option::is_none) => return Ok(Cards::default()),
+                None => {}
+            }
+        }
+    }
+    walk(&mut agent, &held, known)
+}
+
+/// Every card scdaemon holds, each with the keys `KEYINFO --list` names on
+/// it and what the card it reaches first says before each; and each card
+/// `held` that it names no key on, unless the core knows that card, which
+/// then keeps what it said.
+fn walk(agent: &mut TcpStream, held: &[Serial], known: &Known) -> Result<Cards, Failure> {
+    let listed = match ask(agent, KEYINFO)? {
+        Ok(listed) => on_cards(&listed),
+        Err(_) => Vec::new(),
+    };
+    let cards = if listed.is_empty() {
+        Vec::new()
+    } else {
+        cards(&listed, &first(agent)?.unwrap_or_default())
+    };
+    let keyless = held
+        .iter()
+        .filter(|serial| {
+            !cards.iter().any(|card| card.serial == **serial)
+                && !known.cards.iter().any(|card| card.serial == **serial)
+        })
+        .cloned()
+        .collect();
+    Ok(Cards { cards, keyless })
+}
+
+/// What the card scdaemon reaches first says of itself through `GETATTR`,
+/// none naming a card, an application or a key, so none selects anything -
+/// unless scdaemon, under `pcsc-shared` or after a direct APDU, finds another
+/// program changed the card's application and selects its own again first
+/// (`scd/app.c`, `maybe_switch_app`). `None` where its current application is
+/// not `OpenPGP`'s, whose attributes these are.
+fn first(agent: &mut TcpStream) -> Result<Option<First>, Failure> {
     let mut first = First::default();
-    if let Ok(serial) = ask(&mut agent, SERIALNO)? {
+    if let Ok(serial) = ask(agent, SERIALNO)? {
         first.serial = said(&serial, b"SERIALNO").and_then(text);
     }
     let openpgp = matches!(
-        ask(&mut agent, APPTYPE)?,
+        ask(agent, APPTYPE)?,
         Ok(status) if said(&status, b"APPTYPE") == Some(b"openpgp".as_slice())
     );
-    if openpgp {
-        let touches = match ask(&mut agent, EXTCAP)? {
-            Ok(extcap) if button(&extcap) == Some(false) => [Some(Touch::Off); 3],
-            Ok(extcap) if button(&extcap) == Some(true) => match ask(&mut agent, UIF)? {
-                Ok(uif) => [touch(&uif, 1), touch(&uif, 2), touch(&uif, 3)],
-                Err(_) => [None; 3],
-            },
-            _ => [None; 3],
-        };
-        first.touches = touches;
-        if let Ok(chv) = ask(&mut agent, CHV_STATUS)? {
-            first.pin = pin(&chv);
-        }
-    } else {
-        first.serial = None;
+    if !openpgp {
+        return Ok(None);
     }
-    Ok(cards(&listed, &first))
+    first.touches = match ask(agent, EXTCAP)? {
+        Ok(extcap) if button(&extcap) == Some(false) => [Some(Touch::Off); 3],
+        Ok(extcap) if button(&extcap) == Some(true) => match ask(agent, UIF)? {
+            Ok(uif) => [touch(&uif, 1), touch(&uif, 2), touch(&uif, 3)],
+            Err(_) => [None; 3],
+        },
+        _ => [None; 3],
+    };
+    if let Ok(chv) = ask(agent, CHV_STATUS)? {
+        first.pin = pin(&chv);
+    }
+    Ok(Some(first))
 }
 
-/// Reads what `source` offers. `gpg` lists secret keys through the agent and
-/// is told never to start one itself: where none answers, the agent, and
-/// `keyboxd` where its `gpg` uses one, are started as [`launch`] starts them.
+/// Reads what `source` offers, its cards read as [`read_cards`] reads them on
+/// `known`. `gpg` lists secret keys through the agent and is told never to
+/// start one itself: where none answers, the agent, and `keyboxd` where its
+/// `gpg` uses one, are started as [`launch`] starts them.
 ///
 /// # Errors
 ///
 /// The failure of the source's own tools.
-pub fn read(agents: &Agents, source: &Gnupg, search: &std::ffi::OsStr) -> Result<Read, Failure> {
+pub fn read(
+    agents: &Agents,
+    source: &Gnupg,
+    search: &std::ffi::OsStr,
+    known: &Known,
+) -> Result<Read, Failure> {
     let gpgconf = gpgconf(&source.installation)?;
     let mut dirs = home(&source.home);
     dirs.push("--list-dirs".into());
@@ -654,8 +857,8 @@ pub fn read(agents: &Agents, source: &Gnupg, search: &std::ffi::OsStr) -> Result
         armoured.insert(primary, String::from_utf8_lossy(&block).into_owned());
     }
     // The cards are read once the listing has started the agent; a card read
-    // that fails leaves every card's safeguards unknown, never the keys unread.
-    let cards = read_cards(agents, source).unwrap_or_default();
+    // that fails leaves the keys read all the same.
+    let cards = read_cards(agents, source, known, &keyring);
     Ok(Read {
         keyring,
         armoured,

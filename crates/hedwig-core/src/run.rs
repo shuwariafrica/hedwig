@@ -43,7 +43,7 @@ use crate::dispatch::{
 };
 use crate::listing::Listings;
 use crate::peer::placed;
-use crate::relay::{Agents, Gnupg, Relayed, Relaying, Settle};
+use crate::relay::{Agents, Relayed, Relaying, Settle};
 use crate::serve::{Out, Server, integrity};
 use crate::service::Service;
 use crate::store::{Kept, Opened, Places, StoreError, Trail, load, prepare, settle};
@@ -490,14 +490,12 @@ impl Desk {
                     Effect::Refuse { knock } => {
                         self.knocking.remove(&knock);
                     }
-                    Effect::Read {
-                        connection,
-                        sources,
-                    } => self.read(connection, sources),
-                    Effect::Cards {
-                        connection,
-                        sources,
-                    } => self.read_cards(connection, sources),
+                    reading @ (Effect::Read { .. } | Effect::Cards { .. }) => start_read(
+                        reading,
+                        Arc::clone(&self.agents),
+                        self.search.clone(),
+                        self.messages.clone(),
+                    ),
                     reversing @ (Effect::Endpoint { .. }
                     | Effect::Withhold { .. }
                     | Effect::Unhauled { .. }
@@ -1118,37 +1116,6 @@ impl Desk {
         }
     }
 
-    /// Reads what each source offers, on a thread of its own.
-    fn read(&self, connection: ConnectionId, sources: Vec<(Name, Gnupg)>) {
-        let (messages, search) = (self.messages.clone(), self.search.clone());
-        let agents = Arc::clone(&self.agents);
-        thread::spawn(move || {
-            let read = sources
-                .into_iter()
-                .map(|(capability, source)| {
-                    (capability, crate::keys::read(&agents, &source, &search))
-                })
-                .collect();
-            let told = Told::Read { read };
-            let _ = messages.send(Message::Input(Input::Channel { connection, told }));
-        });
-    }
-
-    /// Reads the cards alone each source's scdaemon holds, on a thread of its
-    /// own.
-    fn read_cards(&self, connection: ConnectionId, sources: Vec<(Name, Gnupg)>) {
-        let messages = self.messages.clone();
-        let agents = Arc::clone(&self.agents);
-        thread::spawn(move || {
-            let read = sources
-                .into_iter()
-                .map(|(capability, source)| (capability, crate::keys::read_cards(&agents, &source)))
-                .collect();
-            let told = Told::Cards { read };
-            let _ = messages.send(Message::Input(Input::Channel { connection, told }));
-        });
-    }
-
     /// Keeps a connection to a forward's end until the core has said what
     /// becomes of it, and asks.
     fn knocked(
@@ -1184,6 +1151,57 @@ impl Desk {
         if !sent && then == Then::Stop {
             self.stopped = true;
         }
+    }
+}
+
+/// Starts the read `effect` asks for - what its sources offer, or their cards
+/// alone - on a thread of its own, and sends `messages` its answer as the
+/// deciding thread hears it. Any other effect starts nothing.
+pub fn start_read(
+    effect: Effect,
+    agents: Arc<Agents>,
+    search: OsString,
+    messages: Sender<Message>,
+) {
+    let answer = move |connection, told| {
+        let _ = messages.send(Message::Input(Input::Channel { connection, told }));
+    };
+    match effect {
+        Effect::Read {
+            connection,
+            id,
+            sources,
+            known,
+        } => {
+            thread::spawn(move || {
+                let read = sources
+                    .into_iter()
+                    .map(|(capability, source)| {
+                        let read = crate::keys::read(&agents, &source, &search, &known);
+                        (capability, read)
+                    })
+                    .collect();
+                answer(connection, Told::Read { id, read });
+            });
+        }
+        Effect::Cards {
+            connection,
+            id,
+            sources,
+            known,
+        } => {
+            thread::spawn(move || {
+                let read = sources
+                    .into_iter()
+                    .map(|(capability, source, keyring)| {
+                        let read = crate::keys::read_cards(&agents, &source, &known, &keyring);
+                        (capability, read)
+                    })
+                    .collect();
+                answer(connection, Told::Cards { id, read });
+            });
+        }
+        _ => {}
     }
 }
 

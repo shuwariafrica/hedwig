@@ -13,8 +13,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hedwig_model::capability::{
-    Access, AgentAt, Capability, Exposure, Form, KeyKind, Lends, Operation, Query, ServicePort,
-    Source, Stream,
+    Access, AgentAt, Capability, Exposure, Form, Home, Installation, KeyKind, Lends, Operation,
+    Query, ServicePort, Source, Stream,
 };
 use hedwig_model::config::{Catalogue, Configuration, Document, Effect as Changed};
 use hedwig_model::credential::Place;
@@ -36,16 +36,16 @@ use hedwig_model::text::{
 };
 use hedwig_model::trail::{
     Asking, Binding, Breakdown, Card, Carriage, Carry, ChannelEnd, ClientId, ClientKind,
-    ConnectionId, Dropped, Entry, Event, Failure, Finding, Gave, Given, Health, Item, Network,
-    Opener, Origin, Outcome, Payload, Peer, Phase, PromptId, Readiness, Release, RequestId, Seq,
-    Serving, State, Store, Target, Tick, Timestamp, Write, page,
+    ConnectionId, Dropped, Entry, Event, Failure, Finding, Gave, Given, Health, Item, Keyring,
+    Network, Opener, Origin, Outcome, Payload, Peer, Phase, PromptId, Readiness, Release,
+    RequestId, Seq, Serving, State, Store, Target, Tick, Timestamp, Write, page,
 };
 
 use crate::adb::Reverse;
 use crate::assuan::Breach;
 use crate::browse::Browse;
 use crate::channel::{asked, ended, words};
-use crate::keys::Read;
+use crate::keys::{Cards, Known, Read};
 use crate::relay::{Gnupg, Relayed, Relaying};
 use crate::serial::Serial;
 use crate::service::Service;
@@ -231,15 +231,18 @@ pub enum Told {
     /// The remote's own tool used a capability once, the answer to
     /// [`Effect::Exercise`]: what it said last, or why it could not run.
     Exercised { ran: Result<Option<Words>, Finding> },
-    /// What each `GnuPG` capability's source offers, the answer to
-    /// [`Effect::Read`], or why it could not be read.
+    /// What each `GnuPG` capability's source offers, the answer to the
+    /// [`Effect::Read`] `id` names, or why it could not be read.
     Read {
+        id: ReadId,
         read: Vec<(Name, Result<Read, Failure>)>,
     },
     /// The cards each `GnuPG` capability's source's scdaemon holds, the
-    /// answer to [`Effect::Cards`], or why they could not be read.
+    /// answer to the [`Effect::Cards`] `id` names, or why they could not be
+    /// read.
     Cards {
-        read: Vec<(Name, Result<Vec<Card>, Failure>)>,
+        id: ReadId,
+        read: Vec<(Name, Result<Cards, Failure>)>,
     },
     /// The client was started, from this program, let ask as `asking`.
     Ran {
@@ -330,17 +333,24 @@ pub enum Effect {
     Unlist { route: Name },
     /// End the channel's job, and with it every forward.
     End { connection: ConnectionId },
-    /// Read what each `GnuPG` source offers, before `connection`'s survey,
-    /// and answer with [`Told::Read`].
+    /// Read what each `GnuPG` source offers, before `connection`'s survey or
+    /// for a key no reading accounts for, and answer with [`Told::Read`]
+    /// naming `id`, its cards read on `known`, what the core knows of them
+    /// ([`crate::keys::read_cards`]).
     Read {
         connection: ConnectionId,
+        id: ReadId,
         sources: Vec<(Name, Gnupg)>,
+        known: Known,
     },
     /// Read the cards alone of each `GnuPG` source, after a card was used
-    /// through it, and answer with [`Told::Cards`].
+    /// through it, on the keyring the source last offered and `known`, and
+    /// answer with [`Told::Cards`] naming `id`.
     Cards {
         connection: ConnectionId,
-        sources: Vec<(Name, Gnupg)>,
+        id: ReadId,
+        sources: Vec<(Name, Gnupg, Keyring)>,
+        known: Known,
     },
     /// Hand an admitted connection to what carries `capability`, as coming
     /// from `connection`'s remote. `presents` are the bytes a Windows remote's
@@ -660,6 +670,53 @@ enum Purpose {
     Withdraw,
 }
 
+/// Names one read of what a source offers, or of its cards alone, so its
+/// answer is matched to the read it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadId(pub u64);
+
+/// The agent whose scdaemon holds the cards a `GnuPG` source reaches, as its
+/// source names it: its installation and home, whichever capability names
+/// them - its `gpg` socket's or its SSH socket's.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CardAgent {
+    installation: Installation,
+    home: Home,
+}
+
+/// An agent's card uses in this run: `served`, the requests with a key on a
+/// card it served - at each the agent scans for a card, which only a read
+/// begun after it sees - and `read`, how many of them its cards were last
+/// read after. Its cards are stale while `served` is ahead of `read`.
+#[derive(Debug, Clone, Copy, Default)]
+struct CardUses {
+    served: u64,
+    read: u64,
+}
+
+/// What a read under way reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// The whole source, its cards among what it offers; its `gpg` runs
+    /// unbounded.
+    Whole,
+    /// The cards alone, which [`PATIENCE`](crate::PATIENCE) bounds.
+    Cards,
+}
+
+/// One capability's part of a read under way.
+#[derive(Debug, Clone)]
+struct Began {
+    agent: CardAgent,
+    /// The uses `agent` had served when the read began.
+    uses: u64,
+    reading: Reading,
+    /// Whether a whole reading of `agent` was recorded since: this read was
+    /// built on the cards as known before it, so what it says of a card's keys
+    /// would undo what that reading recorded.
+    overtaken: bool,
+}
+
 /// A connection a relay carries: what it reaches, and the request it holds
 /// for a decision, where it holds one.
 #[derive(Debug, Clone)]
@@ -802,15 +859,19 @@ pub struct Core {
     /// The keygrips a fresh reading did not account for either, by
     /// capability, which are decided as they stand until the next reading.
     sought: BTreeSet<(Name, KeyId)>,
-    /// How many requests with a key on a card each source served since its
-    /// cards were last read: the agent scanned for a card for each, which no
-    /// read that cannot open one sees before.
-    cards_stale: BTreeMap<Name, u64>,
-    /// Each source's cards read under way, with how many uses it began after.
-    cards_reading: BTreeMap<Name, u64>,
-    /// Each request with a key on a card waiting for its source's cards to be
-    /// read again before it is decided.
-    cards_waiting: BTreeMap<Name, Vec<Waiting>>,
+    /// Each agent's card uses in this run.
+    card_uses: BTreeMap<CardAgent, CardUses>,
+    /// Each read under way - of what sources offer, which reads their cards
+    /// too, or of the cards alone - with each capability it reads.
+    reading: BTreeMap<ReadId, BTreeMap<Name, Began>>,
+    /// The identity of the next read.
+    next_read: u64,
+    /// Each card a walk found holding no key, for this run alone: nothing on
+    /// it applies to the person, so it is recorded nowhere.
+    keyless: BTreeSet<hedwig_model::text::Serial>,
+    /// Each request with a key on a card waiting, before it is decided, for
+    /// its agent's cards to be read after its last use.
+    cards_waiting: BTreeMap<CardAgent, Vec<Waiting>>,
     /// Each key's public half, armoured, as the last read found it. Kept in
     /// memory: the bytes are the keyring's, which the trail never copies.
     armoured: BTreeMap<Fingerprint, String>,
@@ -878,8 +939,10 @@ impl Core {
             keyed: BTreeSet::new(),
             rereading: BTreeMap::new(),
             sought: BTreeSet::new(),
-            cards_stale: BTreeMap::new(),
-            cards_reading: BTreeMap::new(),
+            card_uses: BTreeMap::new(),
+            reading: BTreeMap::new(),
+            next_read: 0,
+            keyless: BTreeSet::new(),
             cards_waiting: BTreeMap::new(),
             armoured: BTreeMap::new(),
             hushed: BTreeMap::new(),
@@ -1502,9 +1565,16 @@ impl Core {
         let sources = self.keyrings_carried(connection);
         if !sources.is_empty() && !self.keyed.contains(&connection) {
             self.surveys.insert(connection, (dialect, purpose));
+            let known = self.known();
+            let id = self.begin_read(
+                Reading::Whole,
+                sources.iter().map(|(capability, _)| capability),
+            );
             step.effects.push(Effect::Read {
                 connection,
+                id,
                 sources,
+                known,
             });
             return;
         }
@@ -1905,15 +1975,20 @@ impl Core {
     }
 
     /// What the sources offer, read before a survey or again for a request:
-    /// recorded where it changed; then the survey run with it, and each
-    /// request that waited on it decided.
+    /// recorded where it changed - its cards only where they were read and no
+    /// other whole reading of their agent was recorded since it began, a
+    /// reading whose cards could not be read standing for no read of them;
+    /// then each request waiting on the cards settled, the survey run with
+    /// it, and each request that waited on it decided.
     fn read(
         &mut self,
         step: &mut Step,
         now: Now,
         connection: ConnectionId,
+        id: ReadId,
         read: Vec<(Name, Result<Read, Failure>)>,
     ) {
+        let began = self.reading.remove(&id).unwrap_or_default();
         let mut waited = Vec::new();
         for (capability, found) in read {
             self.sought.retain(|(of, _)| *of != capability);
@@ -1937,12 +2012,22 @@ impl Core {
                         self.record(step, now, offered);
                     }
                     self.armoured.extend(armoured);
-                    self.known_cards(step, now, cards);
+                    if let Some(part) = began.get(&capability).filter(|part| !part.overtaken)
+                        && let Ok(Cards { cards, keyless }) = cards
+                    {
+                        self.known_cards(step, now, cards);
+                        self.keyless.extend(keyless);
+                        self.overtake(&part.agent);
+                        self.read_through(&part.agent, part.uses);
+                    }
                     Health::Sound
                 }
                 Err(failure) => Health::Failing(failure),
             };
             self.source(step, now, &capability, health);
+        }
+        for (capability, part) in &began {
+            self.settle_cards(step, now, connection, capability, &part.agent);
         }
         for (knock, operation, key, payload) in waited {
             self.ask_with(step, now, knock, operation, Some(key), payload);
@@ -1956,15 +2041,84 @@ impl Core {
 
     /// Asks for `capability`'s source to be read again, answered as a read
     /// for `connection` is; `false` for a source with no keyring to read.
-    fn reread(&self, step: &mut Step, connection: ConnectionId, capability: &Name) -> bool {
+    fn reread(&mut self, step: &mut Step, connection: ConnectionId, capability: &Name) -> bool {
         let Some(source) = self.keyring_source(capability) else {
             return false;
         };
+        let known = self.known();
+        let id = self.begin_read(Reading::Whole, [capability]);
         step.effects.push(Effect::Read {
             connection,
+            id,
             sources: vec![(capability.clone(), source)],
+            known,
         });
         true
+    }
+
+    /// A new read's identity, its part for each of `capabilities` recorded
+    /// under way with the uses its agent had served.
+    fn begin_read<'a>(
+        &mut self,
+        reading: Reading,
+        capabilities: impl IntoIterator<Item = &'a Name>,
+    ) -> ReadId {
+        let id = ReadId(self.next_read);
+        self.next_read = self.next_read.wrapping_add(1);
+        let parts = capabilities
+            .into_iter()
+            .filter_map(|capability| {
+                let agent = self.card_agent(capability)?;
+                let uses = self.card_uses.get(&agent).map_or(0, |uses| uses.served);
+                let part = Began {
+                    agent,
+                    uses,
+                    reading,
+                    overtaken: false,
+                };
+                Some((capability.clone(), part))
+            })
+            .collect();
+        self.reading.insert(id, parts);
+        id
+    }
+
+    /// Marks every read of `agent`'s cards under way overtaken: a whole
+    /// reading of it was recorded after each began.
+    fn overtake(&mut self, agent: &CardAgent) {
+        for part in self.reading.values_mut().flat_map(BTreeMap::values_mut) {
+            if part.agent == *agent {
+                part.overtaken = true;
+            }
+        }
+    }
+
+    /// Notes `agent`'s cards read after its first `uses` uses.
+    fn read_through(&mut self, agent: &CardAgent, uses: u64) {
+        let known = self.card_uses.entry(agent.clone()).or_default();
+        known.read = known.read.max(uses);
+    }
+
+    /// The agent whose cards `capability`'s requests use.
+    fn card_agent(&self, capability: &Name) -> Option<CardAgent> {
+        self.keyring_source(capability).map(|source| CardAgent {
+            installation: source.installation,
+            home: source.home,
+        })
+    }
+
+    /// Whether `agent` served a use of a card its cards were not read after.
+    fn agent_stale(&self, agent: &CardAgent) -> bool {
+        self.card_uses
+            .get(agent)
+            .is_some_and(|uses| uses.served > uses.read)
+    }
+
+    /// Whether `capability`'s agent served a use of a card its cards were not
+    /// read after.
+    fn cards_stale(&self, capability: &Name) -> bool {
+        self.card_agent(capability)
+            .is_some_and(|agent| self.agent_stale(&agent))
     }
 
     /// Records each card a reading changes what the core knows of: one never
@@ -1981,47 +2135,167 @@ impl Core {
         }
     }
 
-    /// Asks for `capability`'s source's cards to be read again, unless a
-    /// reading begun since its last card use is under way; `false` for a
-    /// source with no keyring to read.
+    /// What a read of the cards builds on: every card recorded, and each card
+    /// a walk found holding no key in this run.
+    fn known(&self) -> Known {
+        Known {
+            cards: self.state.cards().cloned().collect(),
+            keyless: self.keyless.clone(),
+        }
+    }
+
+    /// Asks for `capability`'s agent's cards to be read again, unless a read
+    /// of the cards alone begun since its last card use, and overtaken by no
+    /// whole reading, is under way; `false` for a source with no keyring to
+    /// read. A whole reading under way is not waited for, its `gpg` being
+    /// unbounded, though one begun after the last use that answers first
+    /// stands for the read.
     fn read_cards(&mut self, step: &mut Step, connection: ConnectionId, capability: &Name) -> bool {
-        let Some(source) = self.keyring_source(capability) else {
+        let (Some(source), Some(agent)) =
+            (self.keyring_source(capability), self.card_agent(capability))
+        else {
             return false;
         };
-        let uses = self
-            .cards_stale
-            .get(capability)
-            .copied()
-            .unwrap_or_default();
-        if self.cards_reading.get(capability) != Some(&uses) {
-            self.cards_reading.insert(capability.clone(), uses);
+        let served = self.card_uses.get(&agent).map_or(0, |uses| uses.served);
+        let under_way = self
+            .reading
+            .values()
+            .flat_map(BTreeMap::values)
+            .any(|part| {
+                part.agent == agent
+                    && part.uses == served
+                    && part.reading == Reading::Cards
+                    && !part.overtaken
+            });
+        if !under_way {
+            let keyring = self.agent_keyring(capability, &agent);
+            let known = self.known();
+            let id = self.begin_read(Reading::Cards, [capability]);
             step.effects.push(Effect::Cards {
                 connection,
-                sources: vec![(capability.clone(), source)],
+                id,
+                sources: vec![(capability.clone(), source, keyring)],
+                known,
             });
         }
         true
     }
 
     /// The cards a source's scdaemon holds, read after a card was used:
-    /// recorded where they changed, no longer stale unless a card was used
-    /// again after the reading began, and each request waiting on them
-    /// decided on them. A reading that failed leaves the cards as they were.
-    fn cards(&mut self, step: &mut Step, now: Now, read: Vec<(Name, Result<Vec<Card>, Failure>)>) {
+    /// recorded where they changed, unless a whole reading of their agent was
+    /// recorded since the read began, which was built on the cards as known
+    /// before it, so what it says of a card's keys would undo what that
+    /// reading recorded; an overtaken read is made again while the cards are stale,
+    /// as the use it was made for asks, through a capability still reaching
+    /// their agent ([`Core::reaching`]). A reading that failed leaves the
+    /// cards as they are and counts as read, so what waits is decided on what
+    /// is known rather than kept waiting on an agent that does not answer.
+    /// Either way, each request waiting on the cards is settled.
+    fn cards(
+        &mut self,
+        step: &mut Step,
+        now: Now,
+        connection: ConnectionId,
+        id: ReadId,
+        read: Vec<(Name, Result<Cards, Failure>)>,
+    ) {
+        let began = self.reading.remove(&id).unwrap_or_default();
         for (capability, found) in read {
-            let began = self.cards_reading.remove(&capability);
-            if let Ok(cards) = found {
-                self.known_cards(step, now, cards);
+            let Some(part) = began.get(&capability) else {
+                continue;
+            };
+            if part.overtaken {
+                if self.agent_stale(&part.agent)
+                    && let Some(through) = self.reaching(&capability, &part.agent)
+                {
+                    self.read_cards(step, connection, &through);
+                }
+            } else {
+                if let Ok(Cards { cards, keyless }) = found {
+                    self.known_cards(step, now, cards);
+                    self.keyless.extend(keyless);
+                }
+                self.read_through(&part.agent, part.uses);
             }
-            if began.is_some() && began == self.cards_stale.get(&capability).copied() {
-                self.cards_stale.remove(&capability);
-            }
-            for (knock, operation, key, payload) in
-                self.cards_waiting.remove(&capability).unwrap_or_default()
-            {
-                self.decide_now(step, now, knock, operation, Some(key), payload);
-            }
+            self.settle_cards(step, now, connection, &capability, &part.agent);
         }
+    }
+
+    /// Decides each request waiting on `agent`'s cards once they were read
+    /// after its last card use. While they were not, a read begun after it is
+    /// under way, or is asked for through the capability [`Core::reaching`]
+    /// gives, and what waits waits for that; where it gives none, what waits is
+    /// decided on what is known. With nothing waiting nothing is read here: the
+    /// cards are read when the connection that used one ends, or before the
+    /// next request using one.
+    fn settle_cards(
+        &mut self,
+        step: &mut Step,
+        now: Now,
+        connection: ConnectionId,
+        capability: &Name,
+        agent: &CardAgent,
+    ) {
+        if self.cards_waiting.get(agent).is_none_or(Vec::is_empty) {
+            return;
+        }
+        let through = self.reaching(capability, agent);
+        if self.agent_stale(agent)
+            && let Some(through) = through
+            && self.read_cards(step, connection, &through)
+        {
+            return;
+        }
+        for (knock, operation, key, payload) in self.cards_waiting.remove(agent).unwrap_or_default()
+        {
+            self.decide_now(step, now, knock, operation, Some(key), payload);
+        }
+    }
+
+    /// The capability to read `agent`'s cards through: `capability` while it
+    /// still reaches `agent`, else one a request waiting on them came through,
+    /// else one granted to a remote where a keyring of `agent` names a key,
+    /// since with nothing to tie its slots to keys a read walks a card it
+    /// knows; none where nothing of these reaches `agent` any more.
+    fn reaching(&self, capability: &Name, agent: &CardAgent) -> Option<Name> {
+        let waiting = self
+            .cards_waiting
+            .get(agent)
+            .into_iter()
+            .flatten()
+            .filter_map(|(knock, ..)| self.streams.get(knock))
+            .map(|streamed| streamed.capability.clone());
+        let keyed = !self.agent_keyring(capability, agent).keys.is_empty();
+        let granted = self
+            .configuration
+            .grants()
+            .map(|(grant, _)| grant.capability.clone())
+            .filter(|_| keyed);
+        std::iter::once(capability.clone())
+            .chain(waiting)
+            .chain(granted)
+            .find(|reaching| self.card_agent(reaching).as_ref() == Some(agent))
+    }
+
+    /// The keyring that ties `agent`'s cards' slots to keys: `capability`'s
+    /// where it names a key, else that of a capability granted to a remote
+    /// that reaches `agent` and names one. Empty where none does, and a read
+    /// on it walks the cards.
+    fn agent_keyring(&self, capability: &Name, agent: &CardAgent) -> Keyring {
+        let granted = self
+            .configuration
+            .grants()
+            .map(|(grant, _)| grant.capability.clone());
+        std::iter::once(capability.clone())
+            .chain(granted)
+            .filter(|candidate| self.card_agent(candidate).as_ref() == Some(agent))
+            .find_map(|candidate| {
+                self.state
+                    .offered(&candidate)
+                    .filter(|keyring| !keyring.keys.is_empty())
+                    .cloned()
+            })
+            .unwrap_or_default()
     }
 
     /// Whether `grip` is on a card: the source's keyring places it on one by
@@ -2379,9 +2653,10 @@ impl Core {
                 if let Some(reverse) = ended.as_ref().and_then(|ended| ended.reversing.clone()) {
                     self.unreverse(step, reverse);
                 }
-                if let Some(ended) = ended.as_ref().filter(|ended| {
-                    ended.used_card && self.cards_stale.contains_key(&ended.capability)
-                }) {
+                if let Some(ended) = ended
+                    .as_ref()
+                    .filter(|ended| ended.used_card && self.cards_stale(&ended.capability))
+                {
                     self.read_cards(step, ended.connection, &ended.capability);
                 }
                 if let Some(request) = ended.and_then(|ended| ended.request)
@@ -3483,13 +3758,16 @@ impl Core {
         }
         if let Some(named) = &key
             && self.card_key(&streamed.capability, named)
-            && self.cards_stale.contains_key(&streamed.capability)
+            && self.cards_stale(&streamed.capability)
+            && let Some(agent) = self.card_agent(&streamed.capability)
             && self.read_cards(step, streamed.connection, &streamed.capability)
         {
-            self.cards_waiting
-                .entry(streamed.capability.clone())
-                .or_default()
-                .push((knock, operation, named.clone(), payload));
+            self.cards_waiting.entry(agent).or_default().push((
+                knock,
+                operation,
+                named.clone(),
+                payload,
+            ));
             return;
         }
         self.decide_now(step, now, knock, operation, key, payload);
@@ -3576,16 +3854,21 @@ impl Core {
         let interaction = self.world().interaction(&outcome);
         self.record(step, now, Event::Settled { request, outcome });
         if let Some(knock) = knock {
+            let card_used = self
+                .streams
+                .get(&knock)
+                .filter(|streamed| verdict.is_ok() && streamed.asking_card)
+                .and_then(|streamed| self.card_agent(&streamed.capability));
+            if let Some(agent) = card_used {
+                let counted = self.card_uses.entry(agent).or_default();
+                counted.served = counted.served.wrapping_add(1);
+            }
             if let Some(streamed) = self.streams.get_mut(&knock) {
                 streamed.request = None;
                 if verdict.is_ok() {
                     streamed.served = Some(request);
                     if streamed.asking_card {
                         streamed.used_card = true;
-                        *self
-                            .cards_stale
-                            .entry(streamed.capability.clone())
-                            .or_default() += 1;
                     }
                 }
                 if let Some(taking) = streamed.port.as_mut() {
@@ -3894,8 +4177,8 @@ impl Core {
                 self.surveyed(step, now, connection, report, &theirs);
             }
             Told::Exercised { ran } => self.exercised(step, now, connection, ran),
-            Told::Read { read } => self.read(step, now, connection, read),
-            Told::Cards { read } => self.cards(step, now, read),
+            Told::Read { id, read } => self.read(step, now, connection, id, read),
+            Told::Cards { id, read } => self.cards(step, now, connection, id, read),
             Told::Ran {
                 program,
                 release,

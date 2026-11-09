@@ -15,6 +15,7 @@
     reason = "tests"
 )]
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -25,13 +26,17 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use hedwig_core::assuan::{Ask, Breach, Nonce, Side};
-use hedwig_core::keys;
+use hedwig_core::dispatch::{Effect, Input, ReadId, Told};
+use hedwig_core::keys::{self, Cards, Known};
 use hedwig_core::relay::{Agents, Gnupg, Relayed, Settle, carry, listed};
+use hedwig_core::run::{Message, start_read};
 use hedwig_model::capability::{Access, Home, Installation, Operation};
 use hedwig_model::holder::Whose;
 use hedwig_model::refusal::{Refusal, Whereabouts};
 use hedwig_model::text::{Fingerprint, Folder as Place, Grip, Mark, Name, Serial};
-use hedwig_model::trail::{Card, Failure, Held, SignaturePin, Touch, Uses};
+use hedwig_model::trail::{
+    Card, ConnectionId, Failure, Held, Keyring, Seq, SignaturePin, Touch, Uses,
+};
 use hedwig_support::lower::{Less, token};
 use hedwig_support::{Folder, SCDAEMON_LOG, readerless, retire_home};
 use hedwig_win::process::{Job, Process};
@@ -654,7 +659,13 @@ fn the_keys_read_back_as_the_sources_own_tools_list_them() {
     let (fingerprint, grip) = workstation.key();
     let search = std::env::var_os("PATH").unwrap_or_default();
     let agents = Agents::default();
-    let read = keys::read(&agents, &workstation.source(Access::Restricted), &search).unwrap();
+    let read = keys::read(
+        &agents,
+        &workstation.source(Access::Restricted),
+        &search,
+        &Known::default(),
+    )
+    .unwrap();
     let [key] = read.keyring.keys.as_slice() else {
         panic!("one key: {read:?}");
     };
@@ -671,7 +682,7 @@ fn the_keys_read_back_as_the_sources_own_tools_list_them() {
         Some(fingerprint.as_str())
     );
     assert_eq!(key.card, None);
-    assert!(read.cards.is_empty(), "no card: {:?}", read.cards);
+    assert!(cards_in(&read).is_empty(), "no card: {:?}", cards_in(&read));
     let armour = read.armoured.get(&fingerprint).unwrap();
     assert!(armour.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
     let other = Scratch::new("relay-keys-import");
@@ -701,7 +712,7 @@ fn a_posix_emulated_gnupg_is_named_and_never_started() {
     );
     let search = std::env::var_os("PATH").unwrap_or_default();
     assert_eq!(
-        keys::read(&Agents::default(), &source, &search).err(),
+        keys::read(&Agents::default(), &source, &search, &Known::default()).err(),
         Some(Failure::Unserved)
     );
 }
@@ -763,13 +774,19 @@ impl Scratch {
     }
 }
 
-/// What scdaemon answers for the two cards: `KEYINFO --list` naming each key
-/// with its card and slot; the first card's serial number, application,
-/// capabilities, the flags that say what each slot asks for, and the PIN's
-/// status, each in the form scdaemon 2.5.24's `send_status_info` writes it
-/// (`scd/app-openpgp.c`, `do_getattr`; `scd/command.c`, `send_status_info`).
-fn exchange(grip: &Grip, application: &str) -> String {
+/// What scdaemon answers for the two cards: the cards it holds; `KEYINFO
+/// --list` naming each key with its card and slot; the first card's serial
+/// number, application, the fingerprint in its signing slot, capabilities, the
+/// flags that say what each slot asks for, and the PIN's status, each in the
+/// form scdaemon 2.5.24 writes it (`scd/app.c`,
+/// `send_serialno_and_app_status`; `scd/app-openpgp.c`, `do_getattr`;
+/// `scd/command.c`, `send_status_info`).
+fn exchange(grip: &Grip, fingerprint: &Fingerprint, application: &str) -> String {
     [
+        "> GETINFO card_list".to_owned(),
+        format!("S SERIALNO {FIRST_CARD}"),
+        format!("S SERIALNO {SECOND_CARD}"),
+        "OK".to_owned(),
         "> KEYINFO --list".to_owned(),
         format!("S KEYINFO {grip} T {FIRST_CARD} OPENPGP.1 sc"),
         format!("S KEYINFO {SECOND_GRIP} T {SECOND_CARD} OPENPGP.3 a"),
@@ -779,6 +796,9 @@ fn exchange(grip: &Grip, application: &str) -> String {
         "OK".to_owned(),
         "> GETATTR APPTYPE".to_owned(),
         format!("S APPTYPE {application}"),
+        "OK".to_owned(),
+        "> GETATTR KEY-FPR".to_owned(),
+        format!("S KEY-FPR 1 {fingerprint}"),
         "OK".to_owned(),
         "> GETATTR EXTCAP".to_owned(),
         "S EXTCAP gc=1+ki=1+fc=1+pd=1+mcl3=2048+aac=1+sm=0+si=5+dec=1+bt=1+kdf=1".to_owned(),
@@ -807,20 +827,29 @@ fn only_reads(log: &Path) -> Vec<String> {
     for command in &sent {
         let read = matches!(
             command.as_str(),
-            "KEYINFO --list"
+            "GETINFO card_list"
+                | "KEYINFO --list"
                 | "GETATTR SERIALNO"
                 | "GETATTR APPTYPE"
+                | "GETATTR KEY-FPR"
                 | "GETATTR EXTCAP"
                 | "GETATTR UIF"
                 | "GETATTR CHV-STATUS"
         );
-        let agents_own = command == "GETINFO socket_name"
-            || command.starts_with("OPTION event-signal=")
-            || command == "RESTART"
-            || command == "killscd";
-        assert!(read || agents_own, "{command} was sent to the card");
+        assert!(
+            read || agents_own(command),
+            "{command} was sent to the card"
+        );
     }
     sent
+}
+
+/// A command the agent sends scdaemon to start or end a session of its own.
+fn agents_own(command: &str) -> bool {
+    command == "GETINFO socket_name"
+        || command.starts_with("OPTION event-signal=")
+        || command == "RESTART"
+        || command == "killscd"
 }
 
 /// The cards are read through the person's agent: the key's card from its
@@ -830,14 +859,15 @@ fn only_reads(log: &Path) -> Vec<String> {
 #[test]
 fn the_cards_are_read_through_the_agent_and_nothing_sent_opens_or_switches_one() {
     let workstation = Scratch::new("relay-cards");
-    let (_, grip) = workstation.key();
+    let (fingerprint, grip) = workstation.key();
     workstation.on_card(&grip, FIRST_CARD);
-    let log = workstation.with_card(&exchange(&grip, "openpgp"));
+    let log = workstation.with_card(&exchange(&grip, &fingerprint, "openpgp"));
     let search = std::env::var_os("PATH").unwrap_or_default();
     let read = keys::read(
         &Agents::default(),
         &workstation.source(Access::Restricted),
         &search,
+        &Known::default(),
     )
     .unwrap();
     let [key] = read.keyring.keys.as_slice() else {
@@ -846,7 +876,7 @@ fn the_cards_are_read_through_the_agent_and_nothing_sent_opens_or_switches_one()
     assert_eq!(key.grip, grip);
     assert_eq!(key.card.as_ref().map(Serial::as_str), Some(FIRST_CARD));
     assert_eq!(
-        read.cards,
+        cards_in(&read),
         vec![
             Card {
                 serial: Serial::try_from(FIRST_CARD).unwrap(),
@@ -890,11 +920,17 @@ fn the_cards_are_read_through_the_agent_and_nothing_sent_opens_or_switches_one()
 #[test]
 fn a_first_card_in_another_application_is_named_and_not_switched() {
     let workstation = Scratch::new("relay-cards-piv");
-    let (_, grip) = workstation.key();
+    let (fingerprint, grip) = workstation.key();
     workstation.on_card(&grip, FIRST_CARD);
-    let log = workstation.with_card(&exchange(&grip, "piv"));
-    let cards =
-        keys::read_cards(&Agents::default(), &workstation.source(Access::Restricted)).unwrap();
+    let log = workstation.with_card(&exchange(&grip, &fingerprint, "piv"));
+    let cards = keys::read_cards(
+        &Agents::default(),
+        &workstation.source(Access::Restricted),
+        &Known::default(),
+        &Keyring::default(),
+    )
+    .unwrap()
+    .cards;
     assert_eq!(cards.len(), 2);
     assert!(
         cards
@@ -909,6 +945,48 @@ fn a_first_card_in_another_application_is_named_and_not_switched() {
     );
 }
 
+/// A whole reading whose card read fails - scdaemon answering the card list
+/// only after twice `PATIENCE`, so the agent is silent past it - keeps the keys
+/// its listing read and says the cards could not be read, never that no card
+/// is held.
+#[test]
+fn a_whole_reading_whose_card_read_fails_says_so_and_keeps_its_keys() {
+    let workstation = Scratch::new("relay-cards-silent");
+    let (fingerprint, grip) = workstation.key();
+    workstation.on_card(&grip, FIRST_CARD);
+    workstation.with_card(&delayed(
+        &exchange(&grip, &fingerprint, "openpgp"),
+        "GETINFO card_list",
+        hedwig_core::PATIENCE * 2,
+    ));
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    let read = keys::read(
+        &Agents::default(),
+        &workstation.source(Access::Restricted),
+        &search,
+        &Known::default(),
+    )
+    .unwrap();
+    assert!(!read.keyring.keys.is_empty(), "{read:?}");
+    assert!(read.cards.is_err(), "{read:?}");
+}
+
+/// `exchange` with `command` answered only after `late`, as scdaemon held by
+/// another card operation answers. The stand-in sleeps through it, so it
+/// outlives a test whose read gave up first by what remains of `late`.
+fn delayed(exchange: &str, command: &str, late: Duration) -> String {
+    let heading = format!("> {command}");
+    let pause = format!("PAUSE {}", late.as_millis());
+    let mut lines = Vec::new();
+    for line in exchange.lines() {
+        lines.push(line);
+        if line == heading {
+            lines.push(&pause);
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
 /// With `GnuPG`'s own scdaemon and no card it holds, nothing is read:
 /// `KEYINFO --list` walks only the cards scdaemon holds.
 #[test]
@@ -916,7 +994,799 @@ fn with_no_card_scdaemon_holds_nothing_is_read() {
     let workstation = Scratch::new("relay-cards-none");
     workstation.key();
     workstation.launch();
-    let cards =
-        keys::read_cards(&Agents::default(), &workstation.source(Access::Restricted)).unwrap();
+    let cards = keys::read_cards(
+        &Agents::default(),
+        &workstation.source(Access::Restricted),
+        &Known::default(),
+        &Keyring::default(),
+    )
+    .unwrap()
+    .cards;
     assert!(cards.is_empty(), "{cards:?}");
+}
+
+/// After a use, with every card scdaemon holds one the core has read, the card
+/// read lists the cards and asks the first for its attributes alone: no
+/// keygrip lookup, which would select each application of each card and have
+/// the card forget its verified PIN. A card never read, or a slot the keyring
+/// cannot tie to a key the card is known to hold, has the cards walked.
+#[test]
+fn a_known_card_is_read_after_a_use_without_a_keygrip_lookup() {
+    let workstation = Scratch::new("relay-cards-known");
+    let (fingerprint, grip) = workstation.key();
+    workstation.on_card(&grip, FIRST_CARD);
+    let log = workstation.with_card(&exchange(&grip, &fingerprint, "openpgp"));
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    let (agents, source) = (Agents::default(), workstation.source(Access::Restricted));
+    let read = keys::read(&agents, &source, &search, &Known::default()).unwrap();
+    assert_eq!(cards_in(&read).len(), 2, "{read:?}");
+    let since = |mark: usize| -> Vec<String> {
+        only_reads(&log)
+            .into_iter()
+            .skip(mark)
+            .filter(|command| !agents_own(command))
+            .collect()
+    };
+    let mark = only_reads(&log).len();
+    let again =
+        keys::read_cards(&agents, &source, &knowing(&cards_in(&read)), &read.keyring).unwrap();
+    assert_eq!(again.cards, cards_in(&read)[..1]);
+    assert_eq!(
+        since(mark),
+        [
+            "GETINFO card_list",
+            "GETATTR SERIALNO",
+            "GETATTR APPTYPE",
+            "GETATTR EXTCAP",
+            "GETATTR UIF",
+            "GETATTR CHV-STATUS",
+            "GETATTR KEY-FPR"
+        ]
+    );
+    let mark = only_reads(&log).len();
+    let first_only = keys::read_cards(
+        &agents,
+        &source,
+        &knowing(&cards_in(&read)[..1]),
+        &read.keyring,
+    )
+    .unwrap();
+    assert_eq!(
+        first_only.cards,
+        cards_in(&read),
+        "a card never read has the cards walked"
+    );
+    assert!(
+        since(mark)
+            .iter()
+            .any(|command| command == "KEYINFO --list")
+    );
+    let mark = only_reads(&log).len();
+    let unnamed = keys::read_cards(
+        &agents,
+        &source,
+        &knowing(&cards_in(&read)),
+        &Keyring::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        unnamed.cards,
+        cards_in(&read),
+        "a slot the keyring cannot name has the cards walked"
+    );
+    assert!(
+        since(mark)
+            .iter()
+            .any(|command| command == "KEYINFO --list")
+    );
+}
+
+/// With every card scdaemon holds known and the first in another application,
+/// nothing more is read: its attributes would need its application switched.
+#[test]
+fn a_known_first_card_in_another_application_has_nothing_more_read() {
+    let workstation = Scratch::new("relay-cards-known-piv");
+    let (fingerprint, grip) = workstation.key();
+    workstation.on_card(&grip, FIRST_CARD);
+    let log = workstation.with_card(&exchange(&grip, &fingerprint, "piv"));
+    let (agents, source) = (Agents::default(), workstation.source(Access::Restricted));
+    let walked =
+        keys::read_cards(&agents, &source, &Known::default(), &Keyring::default()).unwrap();
+    let mark = only_reads(&log).len();
+    let again = keys::read_cards(
+        &agents,
+        &source,
+        &knowing(&walked.cards),
+        &Keyring::default(),
+    )
+    .unwrap();
+    assert_eq!(again, Cards::default());
+    let sent: Vec<String> = only_reads(&log)
+        .into_iter()
+        .skip(mark)
+        .filter(|command| !agents_own(command))
+        .collect();
+    assert_eq!(
+        sent,
+        ["GETINFO card_list", "GETATTR SERIALNO", "GETATTR APPTYPE"]
+    );
+}
+
+/// A card list naming no card has nothing more asked: a `GETATTR` with no card
+/// held would have scdaemon scan the readers for one.
+#[test]
+fn a_card_list_naming_no_card_has_nothing_more_asked() {
+    let workstation = Scratch::new("relay-cards-empty-list");
+    workstation.key();
+    let log = workstation.with_card("> GETINFO card_list\nOK");
+    let cards = keys::read_cards(
+        &Agents::default(),
+        &workstation.source(Access::Restricted),
+        &Known::default(),
+        &Keyring::default(),
+    )
+    .unwrap()
+    .cards;
+    assert_eq!(cards, []);
+    let sent: Vec<String> = only_reads(&log)
+        .into_iter()
+        .filter(|command| !agents_own(command))
+        .collect();
+    assert_eq!(sent, ["GETINFO card_list"]);
+}
+
+/// A third card held, the stand-in's, on which `KEYINFO --list` names no key.
+const KEYLESS_CARD: &str = "D2760001240103040006555555550000";
+
+/// A card scdaemon holds on which a walk names no key is returned as holding
+/// none, for the core to remember and record nowhere; a read that knows it
+/// walks nothing for it.
+#[test]
+fn a_held_card_naming_no_key_is_walked_once() {
+    let workstation = Scratch::new("relay-cards-keyless");
+    let (fingerprint, grip) = workstation.key();
+    workstation.on_card(&grip, FIRST_CARD);
+    let listed = format!("S SERIALNO {FIRST_CARD}\nS SERIALNO {SECOND_CARD}\nOK");
+    let exchange = exchange(&grip, &fingerprint, "openpgp").replacen(
+        &listed,
+        &format!(
+            "S SERIALNO {FIRST_CARD}\nS SERIALNO {SECOND_CARD}\nS SERIALNO {KEYLESS_CARD}\nOK"
+        ),
+        1,
+    );
+    assert!(exchange.contains(KEYLESS_CARD), "the card list names three");
+    let log = workstation.with_card(&exchange);
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    let (agents, source) = (Agents::default(), workstation.source(Access::Restricted));
+    let read = keys::read(&agents, &source, &search, &Known::default()).unwrap();
+    let keyless = Serial::try_from(KEYLESS_CARD).unwrap();
+    assert_eq!(keyless_in(&read), std::slice::from_ref(&keyless));
+    assert!(
+        cards_in(&read).iter().all(|card| card.serial != keyless),
+        "{read:?}"
+    );
+    let mark = only_reads(&log).len();
+    let known = Known {
+        cards: cards_in(&read).clone(),
+        keyless: BTreeSet::from([keyless]),
+    };
+    let again = keys::read_cards(&agents, &source, &known, &read.keyring).unwrap();
+    assert_eq!(
+        again.cards,
+        cards_in(&read)[..1],
+        "the first card's attributes"
+    );
+    assert!(
+        !only_reads(&log)
+            .iter()
+            .skip(mark)
+            .any(|command| command == "KEYINFO --list"),
+        "a card known to hold no key is not walked again"
+    );
+}
+
+/// A card the core has read on which a later walk names no key keeps what it
+/// said: the walk returns it neither read again nor holding none, so the
+/// core's record of it stands.
+#[test]
+fn a_known_card_a_walk_names_no_key_on_keeps_its_word() {
+    let workstation = Scratch::new("relay-cards-unnamed");
+    let (fingerprint, grip) = workstation.key();
+    workstation.on_card(&grip, FIRST_CARD);
+    let both = exchange(&grip, &fingerprint, "openpgp");
+    let second = format!("S KEYINFO {SECOND_GRIP} T {SECOND_CARD} OPENPGP.3 a\n");
+    let first_named = both.replacen(&second, "", 1);
+    assert_ne!(first_named, both, "the walk names the first card alone");
+    workstation.with_card(&first_named);
+    let (agents, source) = (Agents::default(), workstation.source(Access::Restricted));
+    let second_card = Card {
+        serial: Serial::try_from(SECOND_CARD).unwrap(),
+        keys: vec![Held {
+            grip: Grip::try_from(SECOND_GRIP).unwrap(),
+            touch: None,
+        }],
+        pin: None,
+    };
+    let first_card = Card {
+        serial: Serial::try_from(FIRST_CARD).unwrap(),
+        keys: vec![Held {
+            grip: grip.clone(),
+            touch: Some(Touch::On),
+        }],
+        pin: Some(SignaturePin::Once),
+    };
+    // A keyring that cannot name the first card's slot has the cards walked.
+    let walked = keys::read_cards(
+        &agents,
+        &source,
+        &knowing(&[first_card.clone(), second_card]),
+        &Keyring::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        walked,
+        Cards {
+            cards: vec![first_card],
+            keyless: Vec::new(),
+        }
+    );
+}
+
+/// A card a walk once found holding no key, recorded since with a key, is read
+/// as recorded: its slots emptied again leave out a key it is known to hold,
+/// which has the cards walked.
+#[test]
+fn a_card_recorded_since_it_held_no_key_is_read_as_recorded() {
+    let workstation = Scratch::new("relay-cards-was-keyless");
+    let (fingerprint, grip) = workstation.key();
+    workstation.on_card(&grip, FIRST_CARD);
+    let full = exchange(&grip, &fingerprint, "openpgp");
+    let slot = format!("S KEY-FPR 1 {fingerprint}\n");
+    let emptied = full.replacen(&slot, "", 1);
+    assert_ne!(emptied, full, "the first card's slots are empty");
+    let log = workstation.with_card(&emptied);
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    let (agents, source) = (Agents::default(), workstation.source(Access::Restricted));
+    let read = keys::read(&agents, &source, &search, &Known::default()).unwrap();
+    let first = Serial::try_from(FIRST_CARD).unwrap();
+    let known = Known {
+        cards: cards_in(&read).clone(),
+        keyless: BTreeSet::from([first]),
+    };
+    let mark = only_reads(&log).len();
+    keys::read_cards(&agents, &source, &known, &read.keyring).unwrap();
+    assert!(
+        only_reads(&log)
+            .iter()
+            .skip(mark)
+            .any(|command| command == "KEYINFO --list"),
+        "the key it is known to hold is in no slot"
+    );
+}
+
+/// A first card known to hold no key is read from its slots alone: still
+/// empty, nothing more is asked; a key put on it since is a changed slot,
+/// which has the cards walked.
+#[test]
+fn a_first_card_known_to_hold_no_key_is_read_from_its_slots() {
+    let workstation = Scratch::new("relay-cards-keyless-first");
+    let (fingerprint, grip) = workstation.key();
+    workstation.on_card(&grip, FIRST_CARD);
+    let edits = [
+        (
+            format!("S SERIALNO {FIRST_CARD}\nS SERIALNO {SECOND_CARD}\nOK"),
+            format!("S SERIALNO {FIRST_CARD}\nS SERIALNO {KEYLESS_CARD}\nOK"),
+        ),
+        (
+            format!("S KEYINFO {SECOND_GRIP} T {SECOND_CARD} OPENPGP.3 a\n"),
+            String::new(),
+        ),
+        (
+            format!("> GETATTR SERIALNO\nS SERIALNO {FIRST_CARD}"),
+            format!("> GETATTR SERIALNO\nS SERIALNO {KEYLESS_CARD}"),
+        ),
+    ];
+    let mut slotted = exchange(&grip, &fingerprint, "openpgp");
+    for (from, to) in &edits {
+        let edited = slotted.replacen(from, to, 1);
+        assert_ne!(edited, slotted, "{from}");
+        slotted = edited;
+    }
+    let empty = slotted.replacen(&format!("S KEY-FPR 1 {fingerprint}\n"), "", 1);
+    assert_ne!(empty, slotted, "the keyless card's slots are empty");
+    let log = workstation.with_card(&empty);
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    let (agents, source) = (Agents::default(), workstation.source(Access::Restricted));
+    let read = keys::read(&agents, &source, &search, &Known::default()).unwrap();
+    let keyless = Serial::try_from(KEYLESS_CARD).unwrap();
+    assert_eq!(
+        keyless_in(&read),
+        std::slice::from_ref(&keyless),
+        "{read:?}"
+    );
+    let known = Known {
+        cards: cards_in(&read).clone(),
+        keyless: BTreeSet::from([keyless]),
+    };
+    let walks = |mark: usize| {
+        only_reads(&log)
+            .iter()
+            .skip(mark)
+            .any(|command| command == "KEYINFO --list")
+    };
+    let mark = only_reads(&log).len();
+    let again = keys::read_cards(&agents, &source, &known, &read.keyring).unwrap();
+    assert_eq!(again, Cards::default());
+    assert!(!walks(mark), "its slots are still empty");
+    // The stand-in reads its exchange once, at its start with the agent's.
+    let mark = only_reads(&log).len();
+    assert_eq!(workstation.with_card(&slotted), log);
+    keys::read_cards(&agents, &source, &known, &read.keyring).unwrap();
+    assert!(walks(mark), "a key was put on it");
+}
+
+/// The cards a whole read found; a test whose read could not read them fails.
+fn cards_in(read: &keys::Read) -> Vec<Card> {
+    read.cards.clone().unwrap().cards
+}
+
+/// The cards a whole read found holding no key.
+fn keyless_in(read: &keys::Read) -> Vec<Serial> {
+    read.cards.clone().unwrap().keyless
+}
+
+/// What the core knows having read `cards` and found no card holding no key.
+fn knowing(cards: &[Card]) -> Known {
+    Known {
+        cards: cards.to_vec(),
+        keyless: BTreeSet::new(),
+    }
+}
+
+/// The channel the reads handed off here answer on.
+const CHANNEL: ConnectionId = ConnectionId(Seq(3));
+
+/// A home whose agent starts the recorded-exchange stand-in, its cards read
+/// once as the core reads them at first sight; and the deciding thread's end
+/// of the channel a read handed off answers on.
+struct AtDesk {
+    workstation: Scratch,
+    log: PathBuf,
+    agents: Arc<Agents>,
+    search: OsString,
+    whole: keys::Read,
+    messages: mpsc::Sender<Message>,
+    answers: Receiver<Message>,
+}
+
+impl AtDesk {
+    fn new(purpose: &str) -> AtDesk {
+        let workstation = Scratch::new(purpose);
+        let (fingerprint, grip) = workstation.key();
+        workstation.on_card(&grip, FIRST_CARD);
+        let log = workstation.with_card(&exchange(&grip, &fingerprint, "openpgp"));
+        let search = std::env::var_os("PATH").unwrap_or_default();
+        let agents = Arc::new(Agents::default());
+        let source = workstation.source(Access::Restricted);
+        let whole = keys::read(&agents, &source, &search, &Known::default()).unwrap();
+        let (messages, answers) = mpsc::channel();
+        AtDesk {
+            workstation,
+            log,
+            agents,
+            search,
+            whole,
+            messages,
+            answers,
+        }
+    }
+
+    fn capability() -> Name {
+        Name::try_from("gpg").unwrap()
+    }
+
+    fn source(&self) -> Gnupg {
+        self.workstation.source(Access::Restricted)
+    }
+
+    /// What the core knows once it has recorded the first read of the cards.
+    fn known(&self) -> Known {
+        knowing(&cards_in(&self.whole))
+    }
+
+    fn cards(&self, id: u64, known: Known, keyring: Keyring) -> Effect {
+        Effect::Cards {
+            connection: CHANNEL,
+            id: ReadId(id),
+            sources: vec![(AtDesk::capability(), self.source(), keyring)],
+            known,
+        }
+    }
+
+    fn read(&self, id: u64, known: Known) -> Effect {
+        Effect::Read {
+            connection: CHANNEL,
+            id: ReadId(id),
+            sources: vec![(AtDesk::capability(), self.source())],
+            known,
+        }
+    }
+
+    /// Hands `effect` off as the deciding thread does, and gives back what it
+    /// answers, on the channel the effect named.
+    fn hand_off(&self, effect: Effect) -> Told {
+        start_read(
+            effect,
+            Arc::clone(&self.agents),
+            self.search.clone(),
+            self.messages.clone(),
+        );
+        match self.answers.recv_timeout(WAIT).unwrap() {
+            Message::Input(Input::Channel { connection, told }) => {
+                assert_eq!(connection, CHANNEL);
+                told
+            }
+            other => panic!("not a read's answer: {other:?}"),
+        }
+    }
+
+    fn mark(&self) -> usize {
+        only_reads(&self.log).len()
+    }
+
+    /// What the card was sent since `mark`, but for the agent's own sessions.
+    fn sent_since(&self, mark: usize) -> Vec<String> {
+        only_reads(&self.log)
+            .into_iter()
+            .skip(mark)
+            .filter(|command| !agents_own(command))
+            .collect()
+    }
+
+    fn walks_since(&self, mark: usize) -> usize {
+        self.sent_since(mark)
+            .iter()
+            .filter(|command| *command == "KEYINFO --list")
+            .count()
+    }
+}
+
+/// A read of the cards handed off to the agent's thread carries what the core
+/// knows - the cards it has read and the keyring that ties their slots - so a
+/// card it knows is read from its attributes alone, and an effect naming none
+/// has the cards walked; each answer names the read it answers.
+#[test]
+fn a_read_of_the_cards_handed_off_is_read_on_what_the_core_knows_and_answered_by_its_identity() {
+    let desk = AtDesk::new("relay-desk-cards");
+    let mark = desk.mark();
+    let told = desk.hand_off(desk.cards(1, desk.known(), desk.whole.keyring.clone()));
+    let first = cards_in(&desk.whole)[..1].to_vec();
+    assert_eq!(
+        told,
+        Told::Cards {
+            id: ReadId(1),
+            read: vec![(
+                AtDesk::capability(),
+                Ok(Cards {
+                    cards: first,
+                    keyless: Vec::new(),
+                }),
+            )],
+        }
+    );
+    assert_eq!(
+        desk.sent_since(mark),
+        [
+            "GETINFO card_list",
+            "GETATTR SERIALNO",
+            "GETATTR APPTYPE",
+            "GETATTR EXTCAP",
+            "GETATTR UIF",
+            "GETATTR CHV-STATUS",
+            "GETATTR KEY-FPR"
+        ]
+    );
+    let mark = desk.mark();
+    let told = desk.hand_off(desk.cards(2, Known::default(), desk.whole.keyring.clone()));
+    let Told::Cards { id, .. } = told else {
+        panic!("the answer to a read of the cards: {told:?}");
+    };
+    assert_eq!(id, ReadId(2));
+    assert!(
+        desk.walks_since(mark) > 0,
+        "an effect naming no card the core knows has the cards walked"
+    );
+}
+
+/// A whole read handed off carries what the core knows too: read on it, the
+/// read adds no walk of the cards to the agent's own for the listing, where
+/// read on nothing it walks them after the listing; each answer names the read
+/// it answers.
+#[test]
+fn a_whole_read_handed_off_on_what_the_core_knows_adds_no_walk_to_the_listings_own() {
+    let desk = AtDesk::new("relay-desk-read");
+    let mark = desk.mark();
+    let listed = desk.workstation.run(
+        "gpg.exe",
+        &[
+            "--no-autostart",
+            "--batch",
+            "--with-colons",
+            "--with-keygrip",
+            "--fixed-list-mode",
+            "--list-secret-keys",
+        ],
+    );
+    assert!(listed.status.success(), "{listed:?}");
+    let alone = desk.walks_since(mark);
+
+    let mark = desk.mark();
+    let told = desk.hand_off(desk.read(1, desk.known()));
+    let Told::Read { id, read } = told else {
+        panic!("the answer to a whole read: {told:?}");
+    };
+    assert_eq!(id, ReadId(1));
+    let [(capability, Ok(found))] = read.as_slice() else {
+        panic!("one source, read: {read:?}");
+    };
+    assert_eq!(*capability, AtDesk::capability());
+    assert_eq!(found.keyring, desk.whole.keyring);
+    assert_eq!(cards_in(found), cards_in(&desk.whole)[..1]);
+    let walks = desk.walks_since(mark);
+    assert!(
+        walks <= alone,
+        "{walks} walks where the listing alone has {alone}"
+    );
+
+    let mark = desk.mark();
+    let told = desk.hand_off(desk.read(2, Known::default()));
+    let Told::Read { id, .. } = told else {
+        panic!("the answer to a whole read: {told:?}");
+    };
+    assert_eq!(id, ReadId(2));
+    let walks = desk.walks_since(mark);
+    assert!(
+        walks > alone,
+        "read on nothing, the read walks the cards after the listing: {walks}, {alone}"
+    );
+}
+
+/// The serial number of the stand-in card of two applications, a `YubiKey`'s
+/// as scdaemon writes it.
+const PIN_CARD: &str = "D2760001240103040006111111110000";
+
+/// A card of the suite's own holding two applications: its RSA key held by a
+/// home whose agent signs for the stand-in scdaemon, and the workstation home
+/// that holds the key's stub, whose pinentry counts the PINs asked.
+struct TwoApplications {
+    /// Kept for its agent, which signs for the stand-in.
+    _card: Scratch,
+    workstation: Scratch,
+    fingerprint: Fingerprint,
+    grip: Grip,
+    state: PathBuf,
+    card_log: PathBuf,
+    pin_log: PathBuf,
+}
+
+impl TwoApplications {
+    fn new() -> TwoApplications {
+        let card = Scratch::new("relay-pin-card");
+        let made = card.run(
+            "gpg.exe",
+            &[
+                "--batch",
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                "Card PIN <card-pin@example.invalid>",
+                "rsa2048",
+                "sign",
+                "never",
+            ],
+        );
+        assert!(made.status.success(), "{made:?}");
+        let listed = card.run("gpg.exe", &["--with-colons", "--with-keygrip", "-K"]);
+        let text = String::from_utf8(listed.stdout).unwrap();
+        let field = |kind: &str| {
+            text.lines()
+                .find(|line| line.starts_with(kind))
+                .and_then(|line| line.split(':').nth(9))
+                .unwrap()
+                .to_owned()
+        };
+        let fingerprint = Fingerprint::try_from(field("fpr:").as_str()).unwrap();
+        let grip = Grip::try_from(field("grp:").as_str()).unwrap();
+        card.launch();
+        let public = card.path().join("public.asc");
+        let exported = card.run(
+            "gpg.exe",
+            &[
+                "--armor",
+                "--output",
+                &public.to_string_lossy(),
+                "--export",
+                fingerprint.as_str(),
+            ],
+        );
+        assert!(exported.status.success(), "{exported:?}");
+        let workstation = Scratch::new("relay-pin");
+        let imported = workstation.run(
+            "gpg.exe",
+            &["--batch", "--import", &public.to_string_lossy()],
+        );
+        assert!(imported.status.success(), "{imported:?}");
+        std::fs::write(
+            workstation.path().join("gpg-agent.conf"),
+            format!(
+                "scdaemon-program {}\npinentry-program {}\n",
+                env!("CARGO_BIN_EXE_scdaemon-pin"),
+                env!("CARGO_BIN_EXE_pinentry")
+            ),
+        )
+        .unwrap();
+        let state = workstation.path().join("inserted.txt");
+        std::fs::write(
+            &state,
+            format!(
+                "{PIN_CARD} {fingerprint} {} {}",
+                card.path().display(),
+                card.dir("agent-socket").display()
+            ),
+        )
+        .unwrap();
+        let card_log = workstation.path().join("card.log");
+        let pin_log = workstation.path().join("pinentry.log");
+        let two = TwoApplications {
+            _card: card,
+            workstation,
+            fingerprint,
+            grip,
+            state,
+            card_log,
+            pin_log,
+        };
+        two.start("openpgp piv", "yubikey");
+        let learned = two.workstation.run(
+            "gpg-connect-agent.exe",
+            &["--no-autostart", "LEARN --sendinfo", "/bye"],
+        );
+        assert!(learned.status.success(), "{learned:?}");
+        two
+    }
+
+    /// A fresh agent, so neither the stand-in nor the agent's PIN cache
+    /// carries anything over: the card holding `apps`, scdaemon keeping a PIN
+    /// in the agent's cache unless `cache` is `none`.
+    fn start(&self, apps: &str, cache: &str) {
+        let stopped = self
+            .workstation
+            .run("gpgconf.exe", &["--kill", "gpg-agent"]);
+        assert!(stopped.status.success(), "{stopped:?}");
+        let launched = Command::new(tool("gpgconf.exe"))
+            .arg("--homedir")
+            .arg(self.workstation.path())
+            .args(["--launch", "gpg-agent"])
+            .env("HEDWIG_CARD_STATE", &self.state)
+            .env("HEDWIG_CARD_APPS", apps)
+            .env("HEDWIG_CARD_CACHE", cache)
+            .env("HEDWIG_CARD_LOG", &self.card_log)
+            .env("HEDWIG_PINENTRY_LOG", &self.pin_log)
+            .output()
+            .unwrap();
+        assert!(launched.status.success(), "{launched:?}");
+    }
+
+    fn keyring(&self) -> Keyring {
+        Keyring {
+            keys: vec![hedwig_model::trail::Key {
+                grip: self.grip.clone(),
+                fingerprint: self.fingerprint.clone(),
+                primary: self.fingerprint.clone(),
+                uses: Uses::SIGN,
+                user: None,
+                card: Some(Serial::try_from(PIN_CARD).unwrap()),
+                ssh: None,
+            }],
+            signing: None,
+        }
+    }
+
+    fn lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Three signatures in a row from a fresh agent, the cards read after each
+    /// as the core reads them after a use where `read` says so: on the cards
+    /// read before where it is `Some(true)`, as cards never read where it is
+    /// `Some(false)`. The PINs the person was asked, and what each read
+    /// selected.
+    fn three(&self, apps: &str, cache: &str, read: Option<bool>) -> (usize, Vec<usize>) {
+        self.start(apps, cache);
+        let asked = Self::lines(&self.pin_log).len();
+        let source = self.workstation.source(Access::Unrestricted);
+        let agents = Agents::default();
+        let mut known = Known::default();
+        let mut selected = Vec::new();
+        for n in 1..=3 {
+            let text = self.workstation.path().join(format!("signed-{n}.txt"));
+            std::fs::write(&text, format!("signature {n}")).unwrap();
+            let signature = format!("{}.sig", text.display());
+            let signed = self.workstation.run(
+                "gpg.exe",
+                &[
+                    "--batch",
+                    "--yes",
+                    "-bsau",
+                    self.fingerprint.as_str(),
+                    "--output",
+                    &signature,
+                    &text.to_string_lossy(),
+                ],
+            );
+            assert!(signed.status.success(), "{signed:?}");
+            if let Some(on_known) = read {
+                let mark = Self::lines(&self.card_log).len();
+                let cards = keys::read_cards(&agents, &source, &known, &self.keyring()).unwrap();
+                if on_known {
+                    for card in cards.cards {
+                        known.cards.retain(|was| was.serial != card.serial);
+                        known.cards.push(card);
+                    }
+                    known.keyless.extend(cards.keyless);
+                }
+                let selections = Self::lines(&self.card_log)
+                    .iter()
+                    .skip(mark)
+                    .filter(|line| line.starts_with("# selected"))
+                    .count();
+                selected.push(selections);
+            }
+        }
+        let prompts = Self::lines(&self.pin_log)
+            .iter()
+            .skip(asked)
+            .filter(|line| line.starts_with("GETPIN"))
+            .count();
+        (prompts, selected)
+    }
+}
+
+/// A card of two applications forgets its verified PIN whenever an
+/// application is selected, and the agent selects them itself before every
+/// signature. So the PINs asked across consecutive signatures are what the
+/// agent's own lookups cost - one where scdaemon keeps the PIN in the agent's
+/// cache, one each where it keeps none - and the core's card read after each
+/// changes neither: walked, it selects every application; on the cards it
+/// knows, nothing.
+#[test]
+fn the_card_read_after_each_signature_asks_no_pin_and_selects_nothing_once_known() {
+    let two = TwoApplications::new();
+    for (cache, each) in [("yubikey", 1), ("none", 3)] {
+        let (alone, _) = two.three("openpgp piv", cache, None);
+        assert_eq!(alone, each, "{cache}: the agent's own signatures");
+        let (walked, walks) = two.three("openpgp piv", cache, Some(false));
+        assert_eq!(walked, alone, "{cache}: a walk after each");
+        assert!(
+            walks.iter().all(|selections| *selections > 0),
+            "{cache}: {walks:?}"
+        );
+        let (known, reads) = two.three("openpgp piv", cache, Some(true));
+        assert_eq!(
+            known, alone,
+            "{cache}: a read on the cards known after each"
+        );
+        assert_eq!(
+            reads.get(1..),
+            Some([0, 0].as_slice()),
+            "{cache}: {reads:?}"
+        );
+    }
+    let (single, walks) = two.three("openpgp", "none", Some(false));
+    assert_eq!(single, 1, "a card of one application keeps its PIN");
+    assert!(walks.iter().all(|selections| *selections == 0), "{walks:?}");
 }

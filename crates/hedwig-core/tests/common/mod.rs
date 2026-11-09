@@ -92,9 +92,11 @@ pub(crate) fn keyed(
         step.effects.retain(|effect| match effect {
             Effect::Read {
                 connection,
+                id,
                 sources,
+                ..
             } => {
-                reads.push((*connection, sources.clone()));
+                reads.push((*connection, *id, sources.clone()));
                 false
             }
             _ => true,
@@ -102,7 +104,7 @@ pub(crate) fn keyed(
         if reads.is_empty() {
             return step;
         }
-        for (connection, sources) in reads {
+        for (connection, id, sources) in reads {
             let read = sources
                 .into_iter()
                 .map(|(capability, _)| (capability, Ok(hedwig_core::keys::Read::default())))
@@ -110,7 +112,7 @@ pub(crate) fn keyed(
             let next = core.step(
                 Input::Channel {
                     connection,
-                    told: Told::Read { read },
+                    told: Told::Read { id, read },
                 },
                 now,
             );

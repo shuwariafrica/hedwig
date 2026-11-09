@@ -2175,6 +2175,11 @@ impl State {
         self.cards.get(serial).map(|(card, _)| card)
     }
 
+    /// Every card the core has read, as last read.
+    pub fn cards(&self) -> impl Iterator<Item = &Card> {
+        self.cards.values().map(|(card, _)| card)
+    }
+
     /// Every key the cards the core has read hold.
     pub fn keys(&self) -> impl Iterator<Item = &Grip> {
         self.cards

@@ -989,7 +989,8 @@ fn each_key_gpg_offers_carries_the_ssh_key_the_agent_lists_it_by() {
         access: Access::Restricted,
     };
     let search = std::env::var_os("PATH").unwrap_or_default();
-    let read = hedwig_core::keys::read(&Agents::default(), &source, &search).unwrap();
+    let known = hedwig_core::keys::Known::default();
+    let read = hedwig_core::keys::read(&Agents::default(), &source, &search, &known).unwrap();
     assert_eq!(read.keyring.keys.len(), 5, "{:?}", read.keyring);
     let forms: Vec<SshKey> = read
         .keyring
