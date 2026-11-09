@@ -232,24 +232,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-    steps:
-      - *checkout
-      - name: Check advisories, bans, licences and sources
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check
-
-  psscriptanalyzer:
-    name: powershell / psscriptanalyzer / lint
-    # Windows: the analyser checks aliases against its own session, and
-    # PowerShell defines ls, cat, sort and others on Windows alone.
-    runs-on: windows-2025-vs2026
-    timeout-minutes: 30
-    permissions:
-      contents: read
     defaults:
       run:
-        shell: pwsh
+        shell: bash
     steps:
       - *checkout
       - &gate-tools
@@ -265,6 +250,23 @@ jobs:
                       Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
               }
           }
+      - name: Check advisories, bans, licences and sources
+        run: cargo-deny --all-features --log-level warn check
+
+  psscriptanalyzer:
+    name: powershell / psscriptanalyzer / lint
+    # Windows: the analyser checks aliases against its own session, and
+    # PowerShell defines ls, cat, sort and others on Windows alone.
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - *checkout
+      - *gate-tools
       - &run-blocks
         name: Write out the workflows' run blocks
         shell: pwsh

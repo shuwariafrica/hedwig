@@ -185,11 +185,33 @@ function Save-VerifiedFile {
     $Path
 }
 
+function Get-TarProgram {
+    <#
+    .SYNOPSIS
+        Emits the tar that extracts a tar archive: Windows' own there, the one
+        on PATH elsewhere.
+
+    .DESCRIPTION
+        On Windows never the one a search path finds first: Git for Windows
+        puts its own tar there, and that GNU tar reads a drive letter as a
+        remote host.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    if ($IsWindows) {
+        Join-Path -Path ([Environment]::SystemDirectory) -ChildPath 'tar.exe'
+    } else {
+        'tar'
+    }
+}
+
 function Expand-ToolArchive {
     <#
     .SYNOPSIS
         Extracts an archive into an empty folder: a zip by PowerShell, a tar
-        archive by the tar on PATH.
+        archive by the tar Get-TarProgram emits.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -216,12 +238,13 @@ function Expand-ToolArchive {
         }
         return
     }
-    if (-not (Get-Command -Name 'tar' -CommandType Application -ErrorAction Ignore)) {
-        throw "No tar on PATH to extract $Archive."
+    $tar = Get-TarProgram
+    if (-not (Get-Command -Name $tar -CommandType Application -ErrorAction Ignore)) {
+        throw "No $tar to extract $Archive."
     }
-    & tar -xf $Archive -C $Destination
+    & $tar -xf $Archive -C $Destination
     if ($LASTEXITCODE -ne 0) {
-        throw "tar could not extract $Archive (exit code $LASTEXITCODE)"
+        throw "$tar could not extract $Archive (exit code $LASTEXITCODE)"
     }
 }
 

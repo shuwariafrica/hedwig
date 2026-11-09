@@ -178,6 +178,31 @@ Describe 'Install-Tool' {
     }
 }
 
+Describe 'Expand-ToolArchive' {
+    It 'extracts a tar archive with Windows'' own tar, whatever a search path finds first' -Skip:(-not $IsWindows) {
+        $source = Join-Path -Path $TestDrive -ChildPath 'source'
+        $null = New-Item -ItemType Directory -Force -Path $source
+        Set-Content -LiteralPath (Join-Path -Path $source -ChildPath 'tool') -Value 'program' -NoNewline
+        $archive = Join-Path -Path $TestDrive -ChildPath 'tool.tar.gz'
+        & (Join-Path -Path ([Environment]::SystemDirectory) -ChildPath 'tar.exe') -czf $archive -C $source 'tool'
+        $LASTEXITCODE | Should -Be 0
+        $standIn = Join-Path -Path $TestDrive -ChildPath 'stand-in'
+        $null = New-Item -ItemType Directory -Force -Path $standIn
+        Set-Content -LiteralPath (Join-Path -Path $standIn -ChildPath 'tar.cmd') -Value '@exit /b 128'
+        $destination = Join-Path -Path $TestDrive -ChildPath 'extracted'
+
+        $searched = $env:Path
+        try {
+            $env:Path = $standIn + [IO.Path]::PathSeparator + $searched
+            Expand-ToolArchive -Archive $archive -Destination $destination
+        } finally {
+            $env:Path = $searched
+        }
+
+        Get-Content -LiteralPath (Join-Path -Path $destination -ChildPath 'tool') -Raw | Should -BeExactly 'program'
+    }
+}
+
 Describe 'Save-Tool' {
     It 'refuses a platform tools.json pins nothing for' {
         $empty = Join-Path -Path $TestDrive -ChildPath 'empty.json'
@@ -196,6 +221,7 @@ Describe 'tools.json' {
 
     It 'gives every gate tool a pin for <_>' -ForEach @('linux-x64', 'windows-x64', 'windows-arm64') {
         $tools = (Get-ToolPin -Manifest $manifest -Set gate -Platform $_).tool | Sort-Object -Unique
-        $tools | Should -Be @('actionlint', 'Pester', 'PSScriptAnalyzer', 'shellcheck', 'shfmt', 'yq', 'zizmor')
+        $expected = @('actionlint', 'cargo-deny', 'Pester', 'PSScriptAnalyzer', 'shellcheck', 'shfmt', 'yq', 'zizmor')
+        $tools | Should -Be $expected
     }
 }
