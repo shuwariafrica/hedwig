@@ -7,9 +7,11 @@
 //! exchange, the file `HEDWIG_CARD` names: a line `> <command>` followed by the
 //! lines answering it, ending at the next `>` or the end. A command the
 //! exchange does not hold is answered as scdaemon answers one it does not know
-//! (`ERR 100663571 Unknown IPC command <SCD>`, `GPG_ERR_ASS_UNKNOWN_CMD`). Every
-//! command it is sent is appended, one to a line, to the file `HEDWIG_CARD_LOG`
-//! names, so a suite can say what anything asked of a card.
+//! (`ERR 100663571 Unknown IPC command <SCD>`, `GPG_ERR_ASS_UNKNOWN_CMD`). A
+//! line `PAUSE <milliseconds>` among the answering lines has it wait that long
+//! before the lines after it, as an scdaemon held by another card operation
+//! would. Every command it is sent is appended, one to a line, to the file
+//! `HEDWIG_CARD_LOG` names, so a suite can say what anything asked of a card.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -46,7 +48,15 @@ fn main() -> ExitCode {
             vec!["ERR 100663571 Unknown IPC command <SCD>".to_owned()]
         };
         for said in &answer {
-            if writeln!(out, "{said}").is_err() {
+            if let Some(pause) = said
+                .strip_prefix("PAUSE ")
+                .and_then(|millis| millis.parse().ok())
+            {
+                if out.flush().is_err() {
+                    return ExitCode::FAILURE;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(pause));
+            } else if writeln!(out, "{said}").is_err() {
                 return ExitCode::FAILURE;
             }
         }
