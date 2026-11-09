@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +33,7 @@ use hedwig_win::token::Token;
 use hedwig_model::trail::Network;
 use hedwig_win::start::Environment;
 
-use crate::adb::{Awaiting, Carriage, Forwarding, Forwards, Reverse, Unsent, Watch};
+use crate::adb::{Awaiting, Carriage, Forwarding, Forwards, Listening, Reverse, Unsent, Watch};
 use crate::assuan::Nonce;
 use crate::channel::{
     Askpass, Channels, Exercising, Hauled, Hauling, Order as Started, Placing, Setting, Surveying,
@@ -233,6 +233,14 @@ fn orders(messages: &Sender<Message>) {
     let _ = messages.send(Message::Orphaned);
 }
 
+/// A forward's carrier a relayed connection asked for, known until the core
+/// has recorded the forward or let it go.
+struct Placer {
+    connection: ConnectionId,
+    endpoint: Port,
+    listening: Arc<Listening>,
+}
+
 /// The deciding thread's own state: what it has asked to be written, and
 /// what waits on that.
 struct Desk {
@@ -259,6 +267,9 @@ struct Desk {
     carriage: Arc<Carriage>,
     /// Every carried forward's endpoint.
     forwards: Arc<Forwards>,
+    /// Each forward's carrier whose forward the core has not recorded, by the
+    /// connection that asked for it.
+    placers: Arc<Mutex<BTreeMap<Knock, Placer>>>,
     /// Each ADB capability's watch of its server's devices.
     watches: BTreeMap<Name, Arc<Watch>>,
     /// Each carried console's endpoint: its channel, its port, and what ends
@@ -349,6 +360,7 @@ impl Desk {
             relays: BTreeMap::new(),
             carriage: Arc::new(Carriage::default()),
             forwards: Arc::new(Forwards::default()),
+            placers: Arc::default(),
             watches: BTreeMap::new(),
             consoles: BTreeMap::new(),
             calls: BTreeMap::new(),
@@ -508,6 +520,8 @@ impl Desk {
                     | Effect::Replace { .. }
                     | Effect::Listen { .. }
                     | Effect::Unplace { .. }
+                    | Effect::NotPlaced { .. }
+                    | Effect::Withdraw { .. }
                     | Effect::Unlisten { .. }) => self.forwarding(forwarding),
                     Effect::Relend { knock, lending } => {
                         if let Some(relay) = self.relays.get(&knock) {
@@ -836,54 +850,16 @@ impl Desk {
     }
 
     /// What carries a forward a remote asked for: its carrier placed on the
-    /// remote, placed again, the server's listener it goes on to, its end, or
-    /// the server's own forward removed.
+    /// remote, placed again, the server's listener it goes on to, its end, its
+    /// refusal, or the server's own forward removed.
     fn forwarding(&mut self, effect: Effect) {
         match effect {
             Effect::Place {
                 knock,
-                remote,
-                capability,
                 port,
                 server,
                 carrier,
-            } => {
-                let Some(relay) = self.relays.get(&knock).cloned() else {
-                    return;
-                };
-                let jobs = self.channels.jobs();
-                let Ok((listening, endpoint)) = self.forwards.bind(server, &jobs) else {
-                    relay.place(Err("the workstation could not bind an endpoint".to_owned()));
-                    return;
-                };
-                let forwards = Arc::clone(&self.forwards);
-                let connection = carrier.connection;
-                self.channels.place(
-                    Placing {
-                        connection,
-                        client: carrier.client,
-                        address: carrier.address,
-                        port,
-                        listen: endpoint,
-                        asking: carrier.asking,
-                        keepalive: carrier.keepalive,
-                    },
-                    move |placed| {
-                        if let Ok(port) = placed {
-                            let forwarding = Forwarding {
-                                remote,
-                                capability,
-                                port,
-                            };
-                            forwards.keep(forwarding.clone(), listening);
-                            forwards.haul(&forwarding, connection);
-                        } else {
-                            listening.end();
-                        }
-                        relay.place(placed);
-                    },
-                );
-            }
+            } => self.place(knock, port, server, carrier),
             Effect::Replace {
                 forwarding,
                 server: _,
@@ -894,9 +870,10 @@ impl Desk {
                 };
                 self.forwards.haul(&forwarding, carrier.connection);
                 let messages = self.messages.clone();
+                let connection = carrier.connection;
                 self.channels.place(
                     Placing {
-                        connection: carrier.connection,
+                        connection,
                         client: carrier.client,
                         address: carrier.address,
                         port: forwarding.port.number(),
@@ -905,9 +882,13 @@ impl Desk {
                         keepalive: carrier.keepalive,
                     },
                     move |placed| {
-                        if placed.is_err() {
-                            let retaken = Input::Retaken { forwarding };
-                            let _ = messages.send(Message::Input(retaken));
+                        if let Err(why) = placed {
+                            let unreplaced = Input::Unreplaced {
+                                connection,
+                                forwarding,
+                                why,
+                            };
+                            let _ = messages.send(Message::Input(unreplaced));
                         }
                     },
                 );
@@ -917,12 +898,25 @@ impl Desk {
                 forwarding,
                 listener,
             } => self.listen(knock, &forwarding, listener),
-            Effect::Unplace {
-                connection,
-                forwarding,
-            } => {
-                if let Some(endpoint) = self.forwards.release(&forwarding) {
+            Effect::Unplace { forwarding } => {
+                if let Some((endpoint, connection)) = self.forwards.release(&forwarding) {
                     self.channels.unhaul(connection, endpoint);
+                }
+            }
+            Effect::NotPlaced { knock, why } => {
+                if let Some(relay) = self.relays.get(&knock) {
+                    relay.place(Err(why.to_owned()));
+                }
+            }
+            Effect::Withdraw { knock } => {
+                let placer = self
+                    .placers
+                    .lock()
+                    .ok()
+                    .and_then(|mut placers| placers.remove(&knock));
+                if let Some(placer) = placer {
+                    placer.listening.end();
+                    self.channels.unhaul(placer.connection, placer.endpoint);
                 }
             }
             Effect::Unlisten {
@@ -936,9 +930,74 @@ impl Desk {
         }
     }
 
+    /// Places a forward's carrier on the remote for the connection `knock`,
+    /// which is given the port bound there or why none was. It is known by
+    /// that connection until the core has recorded the forward or let it go.
+    fn place(&mut self, knock: Knock, port: u16, server: Service, carrier: Carrier) {
+        let Some(relay) = self.relays.get(&knock).cloned() else {
+            return;
+        };
+        let jobs = self.channels.jobs();
+        let Ok((listening, endpoint)) = self.forwards.bind(server, &jobs) else {
+            relay.place(Err("the workstation could not bind an endpoint".to_owned()));
+            return;
+        };
+        let connection = carrier.connection;
+        if let Ok(mut placers) = self.placers.lock() {
+            let placer = Placer {
+                connection,
+                endpoint,
+                listening: Arc::clone(&listening),
+            };
+            placers.insert(knock, placer);
+        }
+        let placers = Arc::clone(&self.placers);
+        self.channels.place(
+            Placing {
+                connection,
+                client: carrier.client,
+                address: carrier.address,
+                port,
+                listen: endpoint,
+                asking: carrier.asking,
+                keepalive: carrier.keepalive,
+            },
+            move |placed| {
+                // One found no longer known was withdrawn as it
+                // answered, and its carrier is already ended.
+                let withdrawn = placers.lock().is_ok_and(|mut placers| {
+                    if !placers.contains_key(&knock) {
+                        return true;
+                    }
+                    if placed.is_err() {
+                        placers.remove(&knock);
+                    }
+                    false
+                });
+                if withdrawn || placed.is_err() {
+                    listening.end();
+                }
+                if !withdrawn {
+                    relay.place(placed.map_err(|why| why.to_string()));
+                }
+            },
+        );
+    }
+
     /// Gives a forward's endpoint the server's listener, then answers the
-    /// relayed connection that asked for it.
+    /// relayed connection that asked for it. The core has recorded the
+    /// forward: its carrier and endpoint are kept as that forward's from here,
+    /// no longer ones to withdraw.
     fn listen(&self, knock: Knock, forwarding: &Forwarding, listener: Port) {
+        let placer = self
+            .placers
+            .lock()
+            .ok()
+            .and_then(|mut placers| placers.remove(&knock));
+        if let Some(placer) = placer {
+            self.forwards.keep(forwarding.clone(), placer.listening);
+            self.forwards.haul(forwarding, placer.connection);
+        }
         let listening = if self.forwards.listen(forwarding, Some(listener)) {
             Ok(())
         } else {

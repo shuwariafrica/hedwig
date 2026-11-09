@@ -1321,7 +1321,12 @@ choice!(Withheld {
         "hosted" => Hosted,
         "managing" => Managing,
     }
-    one { "unlent" => Unlent, "key-unlent" => KeyUnlent, "elsewhere" => Elsewhere }
+    one {
+        "unlent" => Unlent,
+        "key-unlent" => KeyUnlent,
+        "elsewhere" => Elsewhere,
+        "unhauled" => Unhauled,
+    }
 });
 
 choice!(Integrity { unit { "low" => Low, "medium" => Medium, "high" => High, "system" => System } });

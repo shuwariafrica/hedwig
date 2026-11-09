@@ -16,9 +16,10 @@ mod common;
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use hedwig_core::adb::Reverse;
+use hedwig_core::adb::{Forward, Forwarding, Reverse};
 use hedwig_core::agent::{Ask as AgentAsk, Breach as AgentBreach};
 use hedwig_core::assuan::{Ask, Breach, Side};
+use hedwig_core::channel::Unplaced;
 use hedwig_core::dispatch::{Core, Effect, Input, Knock, Link, Now, ReadId, Step};
 use hedwig_core::keys::{Cards, Known};
 use hedwig_core::relay::Reach;
@@ -39,13 +40,13 @@ use hedwig_model::remote::{Granted, RemoteId, Remotes};
 use hedwig_model::setting::{Heard, Waits};
 use hedwig_model::text::Location;
 use hedwig_model::text::{
-    Address, DeviceSerial, Fingerprint, Folder, Grip, KeyId, Mark, Name, Port, RemotePath, Serial,
-    SshKey, Words,
+    Address, DeviceSerial, DeviceSocket, Fingerprint, Folder, Grip, KeyId, Mark, Name, Port,
+    RemotePath, Serial, SshKey, Words,
 };
 use hedwig_model::trail::{
-    Binding, Card, Carriage, ClientKind, ConnectionId, Event, Failure, Health, Held, Integrity,
-    Key, Keyring, Origin, Outcome, Payload, Peer, RequestId, Serving, SignaturePin, Target, Tick,
-    Timestamp, Touch, Uses,
+    Binding, Card, Carriage, ClientKind, ConnectionId, Dropped, Event, Failure, Health, Held,
+    Integrity, Key, Keyring, Origin, Outcome, Payload, Peer, RequestId, Serving, SignaturePin,
+    Target, Tick, Timestamp, Touch, Uses,
 };
 
 const TERMINAL: Link = Link(1);
@@ -1622,6 +1623,1000 @@ fn a_returning_channel_carries_the_remotes_reverses_again() {
                 && reverse.remote == remote() && reverse.capability == name("adb")
                 && *capability == name("adb")
     ));
+}
+
+/// `adb`, granted lending every device.
+fn lending_adb() -> Scene {
+    let mut scene = adb();
+    lend_adb(&mut scene, Lends::Every);
+    scene
+}
+
+fn lend_adb(scene: &mut Scene, lends: Lends) -> Step {
+    let step = scene.ask(
+        TERMINAL,
+        Request::Change(Change::Grant {
+            grant: Grant {
+                capability: name("adb"),
+                remotes: Granted::One(remote()),
+            },
+            terms: Terms {
+                activation: Activation::OnRequest,
+                setup: Setup::Write,
+                acknowledged: Exposure::SERVICE,
+                lends,
+            },
+        }),
+    );
+    assert_eq!(Scene::refused(&step, TERMINAL), None);
+    step
+}
+
+const PHONE_ID: u64 = 3;
+
+fn phone() -> DeviceSerial {
+    DeviceSerial::try_from("TESTDEVICE01").unwrap()
+}
+
+fn on_the_phone() -> DeviceSocket {
+    DeviceSocket::try_from("tcp:7000").unwrap()
+}
+
+/// The connection `knock` asks for a forward at `port` on the remote.
+fn asks_forward(scene: &mut Scene, knock: u64, port: u16) -> Step {
+    scene.knock_on(knock, "adb");
+    scene.relayed(knock, Relayed::Reached(Ok(())));
+    scene.relayed(
+        knock,
+        Relayed::Forward {
+            port,
+            device: phone(),
+            socket: on_the_phone(),
+        },
+    )
+}
+
+/// The workstation's server took the forward at `port`.
+fn took(port: u16) -> Relayed {
+    Relayed::Forwarded {
+        forward: Forward {
+            port: Port::try_from(port).unwrap(),
+            server: Port::try_from(58765).unwrap(),
+            device: phone(),
+            socket: on_the_phone(),
+        },
+        replaced: None,
+        id: PHONE_ID,
+    }
+}
+
+fn holds_forward(scene: &Scene, port: u16) -> bool {
+    scene
+        .core
+        .state()
+        .carried(&remote(), &name("adb"))
+        .into_iter()
+        .flatten()
+        .any(|(carriage, _)| {
+            matches!(carriage, Carriage::Forward { port: at, .. } if at.number() == port)
+        })
+}
+
+fn channel_ended(scene: &mut Scene) -> Step {
+    scene.step(Input::Channel {
+        connection: scene.connection,
+        told: hedwig_core::dispatch::Told::Ended {
+            status: 255,
+            unverified: false,
+            last: None,
+        },
+    })
+}
+
+/// The remote's channel asked for again, as a new connection: the step that
+/// asked.
+fn channel_asked(scene: &mut Scene) -> Step {
+    let step = scene.ask(
+        TERMINAL,
+        Request::Connect {
+            remote: remote(),
+            with: Vec::new(),
+            acknowledged: Exposure::NONE,
+            lends: Lends::none(),
+        },
+    );
+    let (connection, _) = scene.core.state().connection(&remote()).unwrap();
+    assert_ne!(connection, scene.connection);
+    scene.connection = connection;
+    step
+}
+
+/// The remote's channel up again as a new connection: the step that said so.
+fn channel_back(scene: &mut Scene) -> Step {
+    channel_asked(scene);
+    channel_up(scene)
+}
+
+/// The channel asked for answers: the step that says it is up.
+fn channel_up(scene: &mut Scene) -> Step {
+    let connection = scene.connection;
+    let serving = Serving {
+        capability: name("adb"),
+        binding: adb_socket(),
+    };
+    scene.step(Input::Channel {
+        connection,
+        told: common::placing(std::slice::from_ref(&serving)),
+    });
+    scene.step(Input::Channel {
+        connection,
+        told: hedwig_core::dispatch::Told::Forwarded {
+            capability: name("adb"),
+            bound: true,
+        },
+    })
+}
+
+fn server_holds(devices: Vec<hedwig_core::devices::Device>) -> Input {
+    Input::Devices {
+        capability: name("adb"),
+        view: hedwig_core::devices::View {
+            devices,
+            listing: hedwig_core::devices::Listing::Read,
+            holder: None,
+        },
+    }
+}
+
+fn the_phone() -> hedwig_core::devices::Device {
+    hedwig_core::devices::Device {
+        serial: phone().as_str().to_owned(),
+        state: hedwig_core::devices::State::DEVICE,
+        usb: true,
+        devpath: String::new(),
+        product: String::new(),
+        model: String::new(),
+        device: String::new(),
+        id: PHONE_ID,
+    }
+}
+
+fn dropped(step: &Step) -> Vec<(ConnectionId, Dropped)> {
+    events(step)
+        .iter()
+        .filter_map(|event| match event {
+            Event::Dropped {
+                connection, why, ..
+            } => Some((*connection, *why)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn placed_again(step: &Step) -> Vec<u16> {
+    acts(step)
+        .iter()
+        .filter_map(|act| match act {
+            Effect::Replace { forwarding, .. } => Some(forwarding.port.number()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unplaced(step: &Step) -> Vec<u16> {
+    acts(step)
+        .iter()
+        .filter_map(|act| match act {
+            Effect::Unplace { forwarding, .. } => Some(forwarding.port.number()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A forward placed again on a returning channel is dropped on that channel,
+/// the one the record of it can be folded by, when its device leaves.
+#[test]
+fn a_forward_placed_again_is_dropped_on_the_channel_that_carries_it() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    assert!(holds_forward(&scene, 7100));
+    channel_ended(&mut scene);
+    let step = channel_back(&mut scene);
+    assert_eq!(placed_again(&step), [7100]);
+    let step = scene.step(server_holds(Vec::new()));
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Gone)]);
+    assert_eq!(unplaced(&step), [7100]);
+    assert!(!holds_forward(&scene, 7100));
+}
+
+/// A device that leaves while the channel is away changes nothing until the
+/// channel returns, when the forward is dropped rather than placed again.
+#[test]
+fn a_forward_whose_device_left_while_its_channel_was_away_is_dropped_on_its_return() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    channel_ended(&mut scene);
+    let step = scene.step(server_holds(Vec::new()));
+    assert_eq!(dropped(&step), Vec::new(), "nothing to record it by");
+    assert_eq!(unplaced(&step), Vec::<u16>::new());
+    assert!(holds_forward(&scene, 7100));
+    let step = channel_back(&mut scene);
+    assert_eq!(placed_again(&step), Vec::<u16>::new());
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Gone)]);
+    assert!(!holds_forward(&scene, 7100));
+}
+
+/// A device no longer lent with no connection to record it by: the server's
+/// listener and the endpoint go at once, and only once, and the drop is
+/// recorded when the channel returns, in place of placing it again.
+#[test]
+fn a_forward_whose_device_was_unlent_while_its_channel_was_away_is_dropped_on_its_return() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    channel_ended(&mut scene);
+    let step = lend_adb(&mut scene, Lends::none());
+    assert!(
+        acts(&step)
+            .iter()
+            .any(|act| matches!(act, Effect::Unlisten { id: PHONE_ID, .. })),
+        "{step:?}"
+    );
+    assert_eq!(unplaced(&step), [7100]);
+    assert_eq!(dropped(&step), Vec::new());
+    assert!(holds_forward(&scene, 7100), "nothing to record it by");
+    let step = scene.step(Input::Due);
+    assert_eq!(unplaced(&step), Vec::<u16>::new(), "once");
+    let step = channel_asked(&mut scene);
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Unlent)]);
+    assert!(!holds_forward(&scene, 7100));
+    let step = channel_up(&mut scene);
+    assert_eq!(placed_again(&step), Vec::<u16>::new());
+    assert_eq!(dropped(&step), Vec::new());
+}
+
+/// A removal the server has done, its channel gone before the core could hear
+/// of it, is recorded on the return in place of placing the forward again.
+#[test]
+fn a_forward_removed_as_its_channel_ended_is_not_placed_again() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    scene.knock_on(2, "adb");
+    scene.relayed(2, Relayed::Reached(Ok(())));
+    channel_ended(&mut scene);
+    let step = scene.relayed(2, Relayed::Unforwarded(Port::try_from(7100).unwrap()));
+    assert_eq!(dropped(&step), Vec::new());
+    assert_eq!(unplaced(&step), [7100]);
+    assert!(
+        !acts(&step)
+            .iter()
+            .any(|act| matches!(act, Effect::Unlisten { .. })),
+        "the server has let it go: {step:?}"
+    );
+    let step = channel_asked(&mut scene);
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Removed)]);
+    assert!(!holds_forward(&scene, 7100));
+    let step = channel_up(&mut scene);
+    assert_eq!(placed_again(&step), Vec::<u16>::new());
+}
+
+/// A new target for a recorded forward, taken as its channel ended, keeps the
+/// listener: it is the recorded forward's.
+#[test]
+fn a_rebind_the_server_took_as_its_channel_ended_keeps_its_listener() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    scene.knock_on(2, "adb");
+    scene.relayed(2, Relayed::Reached(Ok(())));
+    channel_ended(&mut scene);
+    let held = Forward {
+        port: Port::try_from(7100).unwrap(),
+        server: Port::try_from(58765).unwrap(),
+        device: phone(),
+        socket: on_the_phone(),
+    };
+    let step = scene.relayed(
+        2,
+        Relayed::Forwarded {
+            forward: held.clone(),
+            replaced: Some(held),
+            id: PHONE_ID,
+        },
+    );
+    assert_eq!(acts(&step), Vec::<&Effect>::new());
+}
+
+/// `adb` added to the connection alone, with no grant: the person's terms lend
+/// every device.
+fn connect_adding_adb(scene: &mut Scene) -> Step {
+    connect_adding_adb_lending(scene, Lends::Every)
+}
+
+fn connect_adding_adb_lending(scene: &mut Scene, lends: Lends) -> Step {
+    let step = scene.ask(
+        TERMINAL,
+        Request::Connect {
+            remote: remote(),
+            with: vec![name("adb")],
+            acknowledged: Exposure::SERVICE,
+            lends,
+        },
+    );
+    let (connection, _) = scene.core.state().connection(&remote()).unwrap();
+    assert_ne!(connection, scene.connection);
+    scene.connection = connection;
+    step
+}
+
+/// A terminal attached to a core with nothing granted and no channel.
+fn nothing_granted() -> Scene {
+    let mut core = Core::new(
+        Catalogue::shipped().unwrap(),
+        Configuration::default(),
+        Vec::new(),
+        "0.2.0".to_owned(),
+    );
+    core.begin(DESKTOP, None, Vec::new(), NOW);
+    let mut scene = Scene {
+        core,
+        asked: 0,
+        connection: ConnectionId(hedwig_model::trail::Seq(0)),
+    };
+    scene.attach(TERMINAL, ClientKind::Terminal);
+    scene
+}
+
+fn adb_added_to_the_connection() -> Scene {
+    let mut scene = nothing_granted();
+    connect_adding_adb(&mut scene);
+    channel_up(&mut scene);
+    scene
+}
+
+/// A forward on a capability added to the connection lives through the
+/// channel's return as one on a grant does: the person asked for those terms,
+/// and the channel comes back with them.
+#[test]
+fn a_forward_on_a_capability_added_to_the_connection_lives_through_its_channels_return() {
+    let mut scene = adb_added_to_the_connection();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    let step = channel_ended(&mut scene);
+    assert_eq!(unplaced(&step), Vec::<u16>::new());
+    let step = scene.step(Input::Due);
+    assert_eq!(unplaced(&step), Vec::<u16>::new());
+    assert!(holds_forward(&scene, 7100));
+    let step = connect_adding_adb(&mut scene);
+    assert_eq!(dropped(&step), Vec::new());
+    let step = channel_up(&mut scene);
+    assert_eq!(placed_again(&step), [7100]);
+}
+
+/// Checking another capability of a remote whose channel is away opens the
+/// connection its return would: a forward on a capability added to the
+/// connection stays, and is placed again when that connection comes up.
+#[test]
+fn a_check_while_a_channel_is_away_leaves_a_forward_on_a_capability_added_to_it() {
+    let mut scene = nothing_granted();
+    scene.ask(
+        TERMINAL,
+        Request::Change(Change::Grant {
+            grant: Grant {
+                capability: name("gpg"),
+                remotes: Granted::One(remote()),
+            },
+            terms: Terms {
+                activation: Activation::OnRequest,
+                setup: Setup::Write,
+                acknowledged: Exposure::NONE,
+                lends: Lends::none(),
+            },
+        }),
+    );
+    connect_adding_adb(&mut scene);
+    channel_up(&mut scene);
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    channel_ended(&mut scene);
+    let step = scene.ask(
+        TERMINAL,
+        Request::Check {
+            remote: remote(),
+            capability: name("gpg"),
+        },
+    );
+    let (checking, link) = scene.core.state().connection(&remote()).unwrap();
+    assert_ne!(checking, scene.connection, "a connection to check with");
+    assert_eq!(link.lends, Lends::Every, "the terms the person asked for");
+    assert_eq!(link.acknowledged, Exposure::SERVICE);
+    assert_eq!(dropped(&step), Vec::new());
+    assert_eq!(unplaced(&step), Vec::<u16>::new());
+    assert!(holds_forward(&scene, 7100));
+    scene.connection = checking;
+    let step = channel_up(&mut scene);
+    assert_eq!(placed_again(&step), [7100]);
+}
+
+/// A person's reconnect says what is lent from then on: a forward on a device
+/// it no longer names is dropped.
+#[test]
+fn a_reconnect_lending_other_devices_ends_a_forward_on_one_it_no_longer_names() {
+    let mut scene = nothing_granted();
+    connect_adding_adb_lending(&mut scene, Lends::devices([phone()]));
+    channel_up(&mut scene);
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    assert!(holds_forward(&scene, 7100));
+    channel_ended(&mut scene);
+    let other = DeviceSerial::try_from("OTHERDEVICE02").unwrap();
+    let step = connect_adding_adb_lending(&mut scene, Lends::devices([other]));
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Unlent)]);
+    assert!(!holds_forward(&scene, 7100));
+}
+
+fn emulator_port() -> Port {
+    Port::try_from(5038).unwrap()
+}
+
+/// `adb-emulator`, an ADB server at `host`, as the person defines it.
+fn emulator_at(host: hedwig_model::capability::ServiceHost) -> Request {
+    use hedwig_model::capability::{Offer, ServicePort, Stream};
+
+    let port = ServicePort::Fixed(emulator_port());
+    Request::Change(Change::Define(Capability {
+        id: name("adb-emulator"),
+        source: Source::Service {
+            host,
+            port,
+            stream: Stream::Adb,
+            remote: vec![Offer::Port(port)],
+        },
+    }))
+}
+
+/// `adb-emulator` moved to a host the connection never named.
+fn emulator_beyond_what_was_named() -> Request {
+    use hedwig_model::capability::ServiceHost;
+    use hedwig_model::text::Host;
+
+    emulator_at(ServiceHost::Named(Host::try_from("lab.example").unwrap()))
+}
+
+/// The forward at 7100 removed from the workstation's server, which took it.
+fn unlistened_on_the_workstation() -> Effect {
+    Effect::Unlisten {
+        server: hedwig_core::service::Service {
+            host: hedwig_model::capability::ServiceHost::Workstation,
+            port: emulator_port(),
+        },
+        id: PHONE_ID,
+        listener: Port::try_from(58765).unwrap(),
+    }
+}
+
+/// `adb-emulator` on the workstation added to the connection alone, named as a
+/// service and lending every device, with a forward taken at 7100.
+fn forwarding_on_an_added_emulator() -> Scene {
+    use hedwig_model::capability::ServiceHost;
+
+    let mut scene = nothing_granted();
+    scene.ask(TERMINAL, emulator_at(ServiceHost::Workstation));
+    scene.ask(
+        TERMINAL,
+        Request::Connect {
+            remote: remote(),
+            with: vec![name("adb-emulator")],
+            acknowledged: Exposure::SERVICE,
+            lends: Lends::Every,
+        },
+    );
+    let (connection, _) = scene.core.state().connection(&remote()).unwrap();
+    scene.connection = connection;
+    let serving = Serving {
+        capability: name("adb-emulator"),
+        binding: Binding::Port(emulator_port()),
+    };
+    scene.step(Input::Channel {
+        connection,
+        told: common::placing(std::slice::from_ref(&serving)),
+    });
+    scene.step(Input::Channel {
+        connection,
+        told: hedwig_core::dispatch::Told::Forwarded {
+            capability: name("adb-emulator"),
+            bound: true,
+        },
+    });
+    scene.knock_on(1, "adb-emulator");
+    scene.relayed(1, Relayed::Reached(Ok(())));
+    scene.relayed(
+        1,
+        Relayed::Forward {
+            port: 7100,
+            device: phone(),
+            socket: on_the_phone(),
+        },
+    );
+    scene.relayed(1, took(7100));
+    scene
+}
+
+/// A capability added to the connection that comes to expose more than the
+/// person named lends nothing further: the forward carried on it goes, though
+/// no connection stands to record it by, and its listener goes from the server
+/// that took it, not the one the capability names now.
+#[test]
+fn a_forward_on_an_added_capability_is_unlent_once_it_exposes_more_than_was_named() {
+    let mut scene = forwarding_on_an_added_emulator();
+    channel_ended(&mut scene);
+    let step = scene.ask(TERMINAL, emulator_beyond_what_was_named());
+    assert_eq!(Scene::refused(&step, TERMINAL), None);
+    assert_eq!(unplaced(&step), [7100]);
+    assert!(
+        acts(&step).contains(&&unlistened_on_the_workstation()),
+        "{step:?}"
+    );
+    assert_eq!(dropped(&step), Vec::new(), "nothing to record it by");
+    // A connection carrying nothing ends in the step that opens it, unrecorded.
+    let step = scene.ask(
+        TERMINAL,
+        Request::Connect {
+            remote: remote(),
+            with: vec![name("adb-emulator")],
+            acknowledged: Exposure::SERVICE.with(Exposure::NETWORK),
+            lends: Lends::Every,
+        },
+    );
+    let (connection, _) = scene.core.state().connection(&remote()).unwrap();
+    assert_eq!(dropped(&step), [(connection, Dropped::Unlent)]);
+}
+
+/// With its channel up the drop is recorded at once, and the listener goes
+/// from the server that took it, not the one the capability names now.
+#[test]
+fn a_forward_unlent_with_its_channel_up_goes_from_the_server_that_took_it() {
+    let mut scene = forwarding_on_an_added_emulator();
+    let step = scene.ask(TERMINAL, emulator_beyond_what_was_named());
+    assert_eq!(Scene::refused(&step, TERMINAL), None);
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Unlent)]);
+    assert_eq!(unplaced(&step), [7100]);
+    assert!(
+        acts(&step).contains(&&unlistened_on_the_workstation()),
+        "{step:?}"
+    );
+}
+
+/// A device lent again before the channel returns does not bring back a
+/// listener already taken: the forward is dropped, not placed again.
+#[test]
+fn a_forward_unlent_and_lent_again_while_its_channel_was_away_is_not_placed_again() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    channel_ended(&mut scene);
+    lend_adb(&mut scene, Lends::none());
+    lend_adb(&mut scene, Lends::Every);
+    let step = channel_asked(&mut scene);
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Unlent)]);
+    let step = channel_up(&mut scene);
+    assert_eq!(placed_again(&step), Vec::<u16>::new());
+}
+
+/// A drop owed from an outage is recorded once: the port asked for again
+/// afterwards is a forward of its own, and stays.
+#[test]
+fn a_forward_asked_for_again_after_its_drop_was_recorded_stays() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    channel_ended(&mut scene);
+    lend_adb(&mut scene, Lends::none());
+    channel_back(&mut scene);
+    assert!(!holds_forward(&scene, 7100));
+    lend_adb(&mut scene, Lends::Every);
+    asks_forward(&mut scene, 2, 7100);
+    let step = scene.relayed(2, took(7100));
+    assert_eq!(dropped(&step), Vec::new());
+    assert!(holds_forward(&scene, 7100));
+    let step = scene.step(Input::Due);
+    assert_eq!(dropped(&step), Vec::new());
+    assert!(holds_forward(&scene, 7100));
+}
+
+/// A forward whose device is unlent while the server answers is dropped as
+/// soon as it is recorded, its listener with it.
+#[test]
+fn a_forward_unlent_while_the_server_answered_is_dropped_once_recorded() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    lend_adb(&mut scene, Lends::none());
+    let step = scene.relayed(1, took(7100));
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Unlent)]);
+    assert!(
+        acts(&step)
+            .iter()
+            .any(|act| matches!(act, Effect::Unlisten { id: PHONE_ID, .. })),
+        "{step:?}"
+    );
+    assert!(!holds_forward(&scene, 7100));
+}
+
+/// A new target for a forward dropped while the server answered has no record
+/// to join: its listener goes, and the remote is told through an endpoint that
+/// is gone.
+#[test]
+fn a_new_target_for_a_forward_dropped_meanwhile_is_told_and_its_listener_goes() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    scene.knock_on(2, "adb");
+    scene.relayed(2, Relayed::Reached(Ok(())));
+    scene.step(server_holds(Vec::new()));
+    assert!(!holds_forward(&scene, 7100));
+    let held = Forward {
+        port: Port::try_from(7100).unwrap(),
+        server: Port::try_from(58765).unwrap(),
+        device: phone(),
+        socket: on_the_phone(),
+    };
+    let step = scene.relayed(
+        2,
+        Relayed::Forwarded {
+            forward: held.clone(),
+            replaced: Some(held),
+            id: PHONE_ID,
+        },
+    );
+    assert_eq!(events(&step), Vec::<Event>::new());
+    assert!(
+        matches!(
+            acts(&step).as_slice(),
+            [
+                Effect::Unlisten { id: PHONE_ID, .. },
+                Effect::Listen {
+                    knock: Knock(2),
+                    ..
+                }
+            ]
+        ),
+        "{step:?}"
+    );
+    assert!(!holds_forward(&scene, 7100));
+}
+
+/// The same new target with its channel gone as well: nothing can record it
+/// and no remote is there to tell, so only its listener goes.
+#[test]
+fn a_new_target_for_a_forward_dropped_meanwhile_with_no_channel_has_its_listener_removed() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    scene.knock_on(2, "adb");
+    scene.relayed(2, Relayed::Reached(Ok(())));
+    scene.step(server_holds(Vec::new()));
+    assert!(!holds_forward(&scene, 7100));
+    channel_ended(&mut scene);
+    let held = Forward {
+        port: Port::try_from(7100).unwrap(),
+        server: Port::try_from(58765).unwrap(),
+        device: phone(),
+        socket: on_the_phone(),
+    };
+    let step = scene.relayed(
+        2,
+        Relayed::Forwarded {
+            forward: held.clone(),
+            replaced: Some(held),
+            id: PHONE_ID,
+        },
+    );
+    assert_eq!(events(&step), Vec::<Event>::new());
+    assert!(
+        matches!(
+            acts(&step).as_slice(),
+            [Effect::Unlisten { id: PHONE_ID, .. }]
+        ),
+        "{step:?}"
+    );
+}
+
+/// A forward whose device is still lent and still held is placed again.
+#[test]
+fn a_forward_still_lent_and_held_is_placed_again_on_its_channels_return() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    channel_ended(&mut scene);
+    scene.step(server_holds(vec![the_phone()]));
+    let step = channel_back(&mut scene);
+    assert_eq!(placed_again(&step), [7100]);
+    assert_eq!(dropped(&step), Vec::new());
+    assert!(holds_forward(&scene, 7100));
+}
+
+/// Only the remote's own refusal says something there took the port; a
+/// placing the channel's end cut short leaves the forward for the next
+/// return.
+#[test]
+fn a_forward_placed_again_is_taken_only_by_the_remotes_refusal() {
+    let mut scene = lending_adb();
+    asks_forward(&mut scene, 1, 7100);
+    scene.relayed(1, took(7100));
+    let first = scene.connection;
+    channel_ended(&mut scene);
+    channel_back(&mut scene);
+    let forwarding = Forwarding {
+        remote: remote(),
+        capability: name("adb"),
+        port: Port::try_from(7100).unwrap(),
+    };
+    let refused = || Unplaced::Refused("the remote's ssh server would not listen".to_owned());
+    let step = scene.step(Input::Unreplaced {
+        connection: scene.connection,
+        forwarding: forwarding.clone(),
+        why: Unplaced::Unanswered("the remote's channel is down".to_owned()),
+    });
+    assert_eq!(dropped(&step), Vec::new());
+    assert!(holds_forward(&scene, 7100));
+    // Of an earlier channel: the forward is placed in a later one now.
+    let step = scene.step(Input::Unreplaced {
+        connection: first,
+        forwarding: forwarding.clone(),
+        why: refused(),
+    });
+    assert_eq!(dropped(&step), Vec::new());
+    assert!(holds_forward(&scene, 7100));
+    let step = scene.step(Input::Unreplaced {
+        connection: scene.connection,
+        forwarding,
+        why: refused(),
+    });
+    assert_eq!(dropped(&step), [(scene.connection, Dropped::Taken)]);
+    assert!(
+        acts(&step)
+            .iter()
+            .any(|act| matches!(act, Effect::Unlisten { id: PHONE_ID, .. })),
+        "the server's listener goes with it: {step:?}"
+    );
+    assert!(!holds_forward(&scene, 7100));
+}
+
+/// A forward its connection held and the core never recorded gives its place
+/// back as the connection ends, and its carrier goes.
+#[test]
+fn a_forward_never_recorded_gives_its_place_back_once_its_connection_ends() {
+    let mut scene = adb();
+    let eight = u64::try_from(hedwig_core::adb::CARRIED).unwrap();
+    for knock in 1..=eight {
+        let port = 9000 + u16::try_from(knock).unwrap();
+        let step = asks_forward(&mut scene, knock, port);
+        assert!(
+            matches!(acts(&step).as_slice(), [Effect::Place { .. }]),
+            "{step:?}"
+        );
+        let step = scene.relayed(knock, Relayed::Ended);
+        assert_eq!(
+            acts(&step),
+            [&Effect::Withdraw {
+                knock: Knock(knock)
+            }]
+        );
+    }
+    let step = asks_forward(&mut scene, 100, 9100);
+    assert!(
+        matches!(acts(&step).as_slice(), [Effect::Place { .. }]),
+        "{step:?}"
+    );
+}
+
+/// A recorded forward outlives the connection that asked for it, in the place
+/// it holds and with its carrier.
+#[test]
+fn a_recorded_forward_keeps_its_place_and_its_carrier_once_its_connection_ends() {
+    let mut scene = lending_adb();
+    let eight = u64::try_from(hedwig_core::adb::CARRIED).unwrap();
+    for knock in 1..=eight {
+        let port = 9000 + u16::try_from(knock).unwrap();
+        asks_forward(&mut scene, knock, port);
+        scene.relayed(knock, took(port));
+        let step = scene.relayed(knock, Relayed::Ended);
+        assert_eq!(acts(&step), Vec::<&Effect>::new());
+    }
+    // A later connection asking for a port the record holds lets nothing go
+    // of it when it ends.
+    let step = asks_forward(&mut scene, 50, 9001);
+    assert!(
+        matches!(acts(&step).as_slice(), [Effect::Place { .. }]),
+        "{step:?}"
+    );
+    let step = scene.relayed(50, Relayed::Ended);
+    assert_eq!(acts(&step), [&Effect::Withdraw { knock: Knock(50) }]);
+    let step = asks_forward(&mut scene, 100, 9100);
+    assert!(
+        matches!(
+            acts(&step).as_slice(),
+            [Effect::Withhold {
+                withheld: Withheld::Crowded,
+                ..
+            }]
+        ),
+        "{step:?}"
+    );
+}
+
+/// Two connections asking for one port hold one place, until both end.
+#[test]
+fn a_forward_two_connections_ask_for_keeps_its_place_until_both_end() {
+    let mut scene = adb();
+    let eight = u64::try_from(hedwig_core::adb::CARRIED).unwrap();
+    for knock in 1..=eight {
+        asks_forward(&mut scene, knock, 9000 + u16::try_from(knock).unwrap());
+    }
+    let last = 9000 + u16::try_from(eight).unwrap();
+    let step = asks_forward(&mut scene, 50, last);
+    assert!(
+        matches!(acts(&step).as_slice(), [Effect::Place { .. }]),
+        "the same place: {step:?}"
+    );
+    scene.relayed(eight, Relayed::Ended);
+    let step = asks_forward(&mut scene, 51, 9200);
+    assert!(
+        matches!(
+            acts(&step).as_slice(),
+            [Effect::Withhold {
+                withheld: Withheld::Crowded,
+                ..
+            }]
+        ),
+        "connection 50 still holds it: {step:?}"
+    );
+    scene.relayed(50, Relayed::Ended);
+    let step = asks_forward(&mut scene, 52, 9200);
+    assert!(
+        matches!(acts(&step).as_slice(), [Effect::Place { .. }]),
+        "{step:?}"
+    );
+}
+
+/// A forward from any port that ends unrecorded gives back its own place and
+/// no other connection's.
+#[test]
+fn a_forward_ended_unrecorded_gives_back_only_its_own_place() {
+    let mut scene = adb();
+    let eight = u64::try_from(hedwig_core::adb::CARRIED).unwrap();
+    for knock in 1..=eight {
+        asks_forward(&mut scene, knock, 0);
+    }
+    scene.relayed(1, Relayed::Ended);
+    let step = asks_forward(&mut scene, 100, 9100);
+    assert!(
+        matches!(acts(&step).as_slice(), [Effect::Place { .. }]),
+        "{step:?}"
+    );
+    let step = asks_forward(&mut scene, 101, 9101);
+    assert!(
+        matches!(
+            acts(&step).as_slice(),
+            [Effect::Withhold {
+                withheld: Withheld::Crowded,
+                ..
+            }]
+        ),
+        "{step:?}"
+    );
+}
+
+/// A forward nothing can place is told why; none is left unanswered.
+#[test]
+fn a_forward_nothing_can_place_is_told_why() {
+    use hedwig_model::capability::{Capability, Offer, ServiceHost, ServicePort, Source, Stream};
+
+    let forward = || Relayed::Forward {
+        port: 7100,
+        device: phone(),
+        socket: on_the_phone(),
+    };
+
+    let mut scene = adb();
+    scene.knock_on(1, "adb");
+    scene.relayed(1, Relayed::Reached(Ok(())));
+    channel_ended(&mut scene);
+    let step = scene.relayed(1, forward());
+    assert_eq!(
+        acts(&step),
+        [&Effect::NotPlaced {
+            knock: Knock(1),
+            why: "the remote's channel is down",
+        }]
+    );
+
+    let mut scene = two_adb_servers();
+    scene.knock_on(1, "adb-emulator");
+    scene.relayed(1, Relayed::Reached(Ok(())));
+    let port = Port::try_from(5038).unwrap();
+    let opaque = Capability {
+        id: name("adb-emulator"),
+        source: Source::Service {
+            host: ServiceHost::Workstation,
+            port: ServicePort::Fixed(port),
+            stream: Stream::Opaque,
+            remote: vec![Offer::Port(ServicePort::Fixed(port))],
+        },
+    };
+    let step = scene.ask(TERMINAL, Request::Change(Change::Define(opaque)));
+    assert_eq!(Scene::refused(&step, TERMINAL), None);
+    let step = scene.relayed(1, forward());
+    assert_eq!(
+        acts(&step),
+        [&Effect::NotPlaced {
+            knock: Knock(1),
+            why: "its capability no longer names an ADB server",
+        }]
+    );
+}
+
+/// Whatever has no carrier is recorded for the person in the words the remote
+/// read, and a carrier that gave no words is recorded as having given none.
+#[test]
+fn what_has_no_carrier_is_recorded_for_the_person() {
+    let turned_away = |why: &str| Event::TurnedAway {
+        remote: Some(remote()),
+        refusal: Refusal::Withheld {
+            capability: name("adb"),
+            request: Withheld::Unhauled(Words::try_from(why).unwrap()),
+        },
+    };
+    let mut scene = adb();
+    scene.knock_on(1, "adb");
+    scene.relayed(1, Relayed::Reached(Ok(())));
+    let step = scene.relayed(
+        1,
+        Relayed::Unhauled("the remote's ssh server would not listen".to_owned()),
+    );
+    assert_eq!(
+        events(&step),
+        [turned_away("the remote's ssh server would not listen")]
+    );
+    let step = scene.relayed(1, Relayed::Unhauled("  ".to_owned()));
+    assert_eq!(events(&step), [turned_away("no account was given")]);
+    channel_ended(&mut scene);
+    let step = scene.relayed(
+        1,
+        Relayed::Unhauled("the remote's channel is down".to_owned()),
+    );
+    assert_eq!(
+        events(&step),
+        [turned_away("the remote's channel is down")],
+        "still that remote's"
+    );
+}
+
+/// A forward the server took as its channel ended has nothing to record it
+/// by: the server's listener goes, and the connection's end takes the carrier.
+#[test]
+fn a_forward_the_server_took_as_its_channel_ended_has_its_listener_removed() {
+    let mut scene = adb();
+    asks_forward(&mut scene, 1, 7100);
+    channel_ended(&mut scene);
+    let step = scene.relayed(1, took(7100));
+    assert_eq!(events(&step), Vec::<Event>::new());
+    assert!(
+        matches!(
+            acts(&step).as_slice(),
+            [Effect::Unlisten {
+                id: PHONE_ID,
+                listener,
+                ..
+            }] if listener.number() == 58765
+        ),
+        "{step:?}"
+    );
+    let step = scene.relayed(1, Relayed::Ended);
+    assert_eq!(acts(&step), [&Effect::Withdraw { knock: Knock(1) }]);
 }
 
 /// The stand-in issuer a sign-in's tests open, at a port of its own.

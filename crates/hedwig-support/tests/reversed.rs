@@ -397,12 +397,17 @@ fn a_carrier_that_cannot_listen_is_told_to_the_remote_and_the_device_is_never_as
     assert!(!refused.status.success(), "{}", said(&refused));
     assert!(
         said(&refused)
-            .contains("error: Hedwig cannot carry the reverse on to the remote: bind [127.0.0.1]:"),
+            .contains("error: Hedwig cannot carry the reverse on to the remote: the workstation"),
         "{}",
         said(&refused)
     );
     assert_eq!(asked_of_the_device(&device), Vec::<String>::new());
     assert_eq!(run.reverses_carried(), Vec::<Target>::new());
+    let trail = fs::read_to_string(run.folder.path().join("trail.jsonl")).unwrap();
+    assert!(
+        trail.contains(r#""unhauled":"the workstation would not let the carrier listen"#),
+        "recorded for the person in the words the remote read: {trail}"
+    );
 }
 
 /// A carrier that stood when the device was asked and is gone when the

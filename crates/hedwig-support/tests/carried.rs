@@ -21,7 +21,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -35,16 +36,19 @@ use hedwig_model::config::{Activation, Change, Grant, Terms};
 use hedwig_model::platform::{AgentForwarding, Platform, Sockets};
 use hedwig_model::process::CoreState;
 use hedwig_model::protocol::Request;
+use hedwig_model::refusal::{Refusal, Withheld};
 use hedwig_model::remote::{Argument, Client, Granted, Identity, Listing, RemoteId, Route};
 use hedwig_model::text::{Address, DeviceSerial, Kernel, Name, Port, Program, Verbatim};
 use hedwig_model::trail::{Carriage, ClientKind, Dropped, Entry, Event};
 use hedwig_model::wire::read;
-use hedwig_support::Folder;
 use hedwig_support::android::{
-    CONSOLE_TOKEN, Console, Device, Server, client, executable, free_port, said,
+    CONSOLE_TOKEN, Console, Device, Server, client, executable, free_port, said, started,
 };
+use hedwig_support::{Folder, ended_within};
 
 const WAIT: Duration = Duration::from_secs(60);
+/// How long a channel may take to return to a port whose connections closed.
+const RETURN: Duration = Duration::from_secs(120);
 const SH: &str = r"C:\Program Files\Git\usr\bin\sh.exe";
 /// Where the stand-in route's remote listens.
 const REMOTE: &str = "127.0.0.2";
@@ -85,8 +89,13 @@ fn kernel() -> Kernel {
 }
 
 /// Waits until `done` gives something, or panics with `what`.
-fn until<T>(what: &str, mut done: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + WAIT;
+fn until<T>(what: &str, done: impl FnMut() -> Option<T>) -> T {
+    until_within(WAIT, what, done)
+}
+
+/// As [`until`], for `bound`.
+fn until_within<T>(bound: Duration, what: &str, mut done: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + bound;
     loop {
         if let Some(found) = done() {
             return found;
@@ -110,6 +119,11 @@ struct Run {
 
 impl Run {
     fn start(kernel: Kernel, server: &Server, lends: Lends) -> Run {
+        Run::start_on(kernel, server, lends, Sockets::Emulated)
+    }
+
+    /// As [`Run::start`], the remote's platform carrying `sockets`.
+    fn start_on(kernel: Kernel, server: &Server, lends: Lends, sockets: Sockets) -> Run {
         let folder = Folder::new("carried");
         let route = Folder::new("carried-route");
         fs::write(route.path().join("plan"), "carry").unwrap();
@@ -144,7 +158,7 @@ impl Run {
         run.ask(Request::Change(Change::DefinePlatform(Platform {
             family: name("git-bash"),
             kernel,
-            sockets: Sockets::Emulated,
+            sockets,
             agent_forwarding: AgentForwarding::Refused,
         })));
         run.ask(Request::Change(Change::DefineRoute(Route {
@@ -228,6 +242,54 @@ impl Run {
             .collect()
     }
 
+    /// The next carrier that listens on the remote waits before it asks,
+    /// until [`Run::release_placers`].
+    fn hold_placers(&self) {
+        fs::write(self.route.path().join("hold-place"), "").unwrap();
+    }
+
+    fn release_placers(&self) {
+        fs::remove_file(self.route.path().join("hold-place")).unwrap();
+    }
+
+    /// The process of the carrier waiting to ask, by number and creation.
+    fn placer_held(&self) -> (u32, u64) {
+        until("a carrier held before it asks", || {
+            let text = fs::read_to_string(self.route.path().join("placing")).ok()?;
+            let (process, created) = text.split_once(' ')?;
+            Some((process.parse().ok()?, created.parse().ok()?))
+        })
+    }
+
+    /// The workstation's endpoint of the placer asked to listen at `port`.
+    fn placers_endpoint(&self, port: u16) -> u16 {
+        until("the placer's endpoint", || {
+            fs::read_to_string(self.route.path().join("placers"))
+                .ok()?
+                .lines()
+                .find_map(|line| {
+                    let (listen, endpoint) = line.split_once(' ')?;
+                    (listen == port.to_string())
+                        .then(|| endpoint.parse().ok())
+                        .flatten()
+                })
+        })
+    }
+
+    /// The ports on the remote of the forwards the trail records as carried.
+    fn forwards_carried(&self) -> Vec<u16> {
+        self.trail()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Carried {
+                    carriage: Carriage::Forward { port, .. },
+                    ..
+                } => Some(port.number()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// platform-tools' client on the remote.
     fn remote_adb(&self, arguments: &[&str]) -> std::process::Output {
         client(&self.adb, REMOTE, self.at, arguments)
@@ -296,6 +358,20 @@ fn round_trip(at: u16, sent: &[u8]) -> Vec<u8> {
     }
     let _ = stream.shutdown(Shutdown::Both);
     back
+}
+
+/// Waits until nothing accepts at the workstation's endpoint.
+fn endpoint_ended(endpoint: u16) {
+    until("the placer's endpoint ended", || {
+        TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint))
+            .is_err()
+            .then_some(())
+    });
+}
+
+/// Whether nothing listens at `at` on the remote.
+fn unreachable_at(at: u16) -> bool {
+    TcpStream::connect((REMOTE.parse::<Ipv4Addr>().unwrap(), at)).is_err()
 }
 
 /// The server's own listing of its forwards, as the person reads it.
@@ -636,4 +712,167 @@ fn a_lent_emulators_console_is_reached_on_the_remote_authenticated_on_the_workst
             ..
         }
     )));
+}
+
+/// A forward placed again on a returning channel runs in that channel's job:
+/// its device leaving ends it there, where its carrier runs. The platform has
+/// Unix-domain sockets so the channel's return is surveyed with the POSIX
+/// shell, the only one the stand-in route runs.
+#[test]
+fn a_forward_placed_again_ends_with_its_device_on_the_channel_that_carries_it() {
+    let kernel = kernel();
+    let adb = executable();
+    let server = Server::start(&adb);
+    let device = Device::start("Pixel_Standin").unwrap();
+    attach(&adb, &server, &device.serial(), &device.serial());
+    let sockets = Sockets::Unix {
+        path_bytes: NonZeroU16::new(108).unwrap(),
+    };
+    let run = Run::start_on(kernel, &server, Lends::Every, sockets);
+
+    let named = free_port();
+    let fixed = run.remote_adb(&["forward", &format!("tcp:{named}"), "tcp:7001"]);
+    assert!(fixed.status.success(), "{}", said(&fixed));
+
+    run.ask(Request::Disconnect { remote: remote() });
+    until("the channel's carriers ended", || {
+        unreachable_at(named).then_some(())
+    });
+    run.ask(Request::Connect {
+        remote: remote(),
+        with: Vec::new(),
+        acknowledged: Exposure::NONE,
+        lends: Lends::none(),
+    });
+    // Windows keeps the closed connections' rows on the port, some of them
+    // reading as listening, for about half a minute: the survey finds it held
+    // and the channel tries again, on a backing-off pace.
+    until_within(RETURN, "the forward placed again", || {
+        (run.carried().iter().filter(|(at, _)| *at == named).count() == 2).then_some(())
+    });
+    assert_eq!(round_trip(named, b"carried again"), b"carried again");
+
+    // Gone for good: dropping its connection alone has the server reconnect
+    // it under the same transport id.
+    let left = client(
+        &adb,
+        "127.0.0.1",
+        server.port(),
+        &["disconnect", &device.serial()],
+    );
+    assert!(left.status.success(), "{}", said(&left));
+    until("the carrier placed again ended", || {
+        unreachable_at(named).then_some(())
+    });
+    let trail = run.trail();
+    assert!(
+        trail.iter().any(|event| matches!(event, Event::Dropped {
+            carriage: Carriage::Forward { port, .. },
+            why: Dropped::Gone,
+            ..
+        } if port.number() == named)),
+        "{trail:#?}"
+    );
+}
+
+/// A remote that leaves before its forward is placed leaves it to be finished,
+/// recorded and listed, as the workstation's server finishes one whose client
+/// left. The gate holds the carrier until the remote's client has ended. One
+/// order the suite does not drive: the client's close and the carrier's answer
+/// race to the relay, and correct code passes whichever wins; the case's power
+/// to catch a relay that stops as the remote leaves rests on the close
+/// crossing the stand-in route first.
+#[test]
+fn a_forward_whose_remote_left_is_finished_recorded_and_listed() {
+    let kernel = kernel();
+    let adb = executable();
+    let server = Server::start(&adb);
+    let device = Device::start("Pixel_Standin").unwrap();
+    attach(&adb, &server, &device.serial(), &device.serial());
+    let run = Run::start(kernel, &server, Lends::Every);
+
+    run.hold_placers();
+    let named = free_port();
+    let mut asking = started(
+        &adb,
+        REMOTE,
+        run.at,
+        &["forward", &format!("tcp:{named}"), "tcp:7006"],
+    );
+    run.placer_held();
+    asking.kill().unwrap();
+    asking.wait().unwrap();
+    run.release_placers();
+
+    until("the forward recorded", || {
+        run.forwards_carried().contains(&named).then_some(())
+    });
+    let listed = said(&run.remote_adb(&["forward", "--list"]));
+    assert!(
+        listed.contains(&format!("tcp:{named} tcp:7006")),
+        "{listed}"
+    );
+    assert_eq!(round_trip(named, b"finished"), b"finished");
+}
+
+/// A connection that ends before its forward is recorded ends the carrier
+/// placing it: here it writes past its request, as `adb` never does, and the
+/// relay turns it away while the gate holds the carrier.
+#[test]
+fn a_connection_ended_before_its_forward_is_recorded_ends_its_carrier() {
+    let kernel = kernel();
+    let adb = executable();
+    let server = Server::start(&adb);
+    let device = Device::start("Pixel_Standin").unwrap();
+    attach(&adb, &server, &device.serial(), &device.serial());
+    let run = Run::start(kernel, &server, Lends::Every);
+
+    run.hold_placers();
+    let named = free_port();
+    let mut raw = TcpStream::connect((REMOTE.parse::<Ipv4Addr>().unwrap(), run.at)).unwrap();
+    let request = format!("host:forward:tcp:{named};tcp:7007");
+    raw.write_all(format!("{:04x}{request}", request.len()).as_bytes())
+        .unwrap();
+    let (process, created) = run.placer_held();
+    let endpoint = run.placers_endpoint(named);
+    raw.write_all(b"0004more").unwrap();
+    assert!(ended_within(process, created, WAIT), "the carrier ended");
+    endpoint_ended(endpoint);
+    run.release_placers();
+    assert!(!run.forwards_carried().contains(&named));
+}
+
+/// A forward the remote's server will not listen for is told to the remote in
+/// ADB's words and recorded for the person in the same ones.
+#[test]
+fn a_forward_that_cannot_be_placed_is_told_to_the_remote_and_recorded_for_the_person() {
+    let kernel = kernel();
+    let adb = executable();
+    let server = Server::start(&adb);
+    let device = Device::start("Pixel_Standin").unwrap();
+    attach(&adb, &server, &device.serial(), &device.serial());
+    let run = Run::start(kernel, &server, Lends::Every);
+
+    let taken = TcpListener::bind((REMOTE.parse::<Ipv4Addr>().unwrap(), 0)).unwrap();
+    let named = taken.local_addr().unwrap().port();
+    let refused = run.remote_adb(&["forward", &format!("tcp:{named}"), "tcp:7008"]);
+    assert!(!refused.status.success(), "{}", said(&refused));
+    let words = format!("the remote's ssh server would not listen at port {named}");
+    assert!(
+        said(&refused).contains(&format!("cannot bind listener: {words}")),
+        "{}",
+        said(&refused)
+    );
+    endpoint_ended(run.placers_endpoint(named));
+    let trail = run.trail();
+    assert!(
+        trail.iter().any(|event| matches!(event, Event::TurnedAway {
+            refusal: Refusal::Withheld {
+                request: Withheld::Unhauled(why),
+                ..
+            },
+            ..
+        } if why.as_str() == words)),
+        "{trail:#?}"
+    );
 }

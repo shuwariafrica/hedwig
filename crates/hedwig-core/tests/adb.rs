@@ -843,9 +843,9 @@ fn a_forward_from_any_port_is_answered_with_the_port_bound_on_the_remote() {
 
 /// Where the remote's side cannot be bound the remote reads ADB's own words
 /// for it; where the server refuses after the remote's side was placed, the
-/// remote reads the server's refusal and the carrier is ended; and where the
-/// core cannot give the endpoint the server's listener, the remote reads
-/// ADB's words for a listener not installed and the carrier is ended.
+/// remote reads the server's refusal; and where the core cannot give the
+/// endpoint the server's listener, the remote reads ADB's words for a listener
+/// not installed.
 #[test]
 fn a_forward_that_cannot_be_placed_or_is_refused_is_told_in_adbs_words() {
     let mut talk = opened(every());
@@ -855,9 +855,12 @@ fn a_forward_that_cannot_be_placed_or_is_refused_is_told_in_adbs_words() {
         talk.placed(Err(
             "the remote's ssh server would not listen at port 9222".to_owned()
         )),
-        vec![Out::ToClient(fail(
-            "cannot bind listener: the remote's ssh server would not listen at port 9222"
-        ))]
+        vec![
+            Out::Unhauled("the remote's ssh server would not listen at port 9222".to_owned()),
+            Out::ToClient(fail(
+                "cannot bind listener: the remote's ssh server would not listen at port 9222"
+            ))
+        ]
     );
     let mut talk = opened(every());
     talk.from_client(&framed(b"host:forward:tcp:9222;tcp:9222"), &recorded_view())
@@ -867,10 +870,7 @@ fn a_forward_that_cannot_be_placed_or_is_refused_is_told_in_adbs_words() {
         .unwrap();
     assert_eq!(
         talk.server_closed(&recorded_view()).unwrap(),
-        vec![
-            Out::ToClient(fail("device offline (no transport)")),
-            Out::Unplaced(port(9222))
-        ]
+        vec![Out::ToClient(fail("device offline (no transport)"))]
     );
     let mut talk = opened(every());
     talk.from_client(&framed(b"host:forward:tcp:9222;tcp:9222"), &recorded_view())
@@ -882,10 +882,10 @@ fn a_forward_that_cannot_be_placed_or_is_refused_is_told_in_adbs_words() {
     assert_eq!(
         talk.listened(Err("the workstation's endpoint for it has ended".to_owned())),
         vec![
+            Out::Unhauled("the workstation's endpoint for it has ended".to_owned()),
             Out::ToClient(fail(
                 "cannot bind listener: the workstation's endpoint for it has ended"
-            )),
-            Out::Unplaced(port(9222))
+            ))
         ]
     );
     assert!(!talk.open());
@@ -1133,9 +1133,12 @@ fn a_reverse_whose_carrier_cannot_stand_is_refused_and_never_sent() {
     assert!(talk.holds());
     assert_eq!(
         talk.unhauled("bind [127.0.0.1]:50140: Permission denied"),
-        vec![Out::ToClient(fail(
-            "Hedwig cannot carry the reverse on to the remote: bind [127.0.0.1]:50140: Permission denied"
-        ))]
+        vec![
+            Out::Unhauled("bind [127.0.0.1]:50140: Permission denied".to_owned()),
+            Out::ToClient(fail(
+                "Hedwig cannot carry the reverse on to the remote: bind [127.0.0.1]:50140: Permission denied"
+            ))
+        ]
     );
     assert!(!talk.open());
     assert_eq!(talk.carry(port(50131)), Vec::new(), "never sent after");
@@ -1183,11 +1186,14 @@ fn a_device_refusal_comes_at_once_and_a_carrier_lost_meanwhile_is_told() {
     );
     assert_eq!(
         talk.stood(Err("the remote's route is no longer defined".to_owned())),
-        vec![Out::ToClient(fail(
-            "Hedwig cannot carry the reverse on to the remote now (the remote's route is no \
-             longer defined); the device keeps it, and Hedwig carries it once the remote's \
-             channel can"
-        ))]
+        vec![
+            Out::Unhauled("the remote's route is no longer defined".to_owned()),
+            Out::ToClient(fail(
+                "Hedwig cannot carry the reverse on to the remote now (the remote's route is no \
+                 longer defined); the device keeps it, and Hedwig carries it once the remote's \
+                 channel can"
+            ))
+        ]
     );
     assert!(!talk.open());
 
@@ -1198,9 +1204,12 @@ fn a_device_refusal_comes_at_once_and_a_carrier_lost_meanwhile_is_told() {
     talk.server_closed(&recorded_view()).unwrap();
     assert_eq!(
         talk.unhauled("the remote's channel is down"),
-        vec![Out::ToClient(fail(
-            "Hedwig cannot carry the reverse on to the remote: the remote's channel is down"
-        ))]
+        vec![
+            Out::Unhauled("the remote's channel is down".to_owned()),
+            Out::ToClient(fail(
+                "Hedwig cannot carry the reverse on to the remote: the remote's channel is down"
+            ))
+        ]
     );
     assert_eq!(talk.stood(Ok(())), Vec::new(), "answered once");
 }
@@ -1242,6 +1251,119 @@ fn a_reverse_answered_after_its_remote_left_is_still_read() {
     .unwrap();
     assert_eq!(talk.client_closed(), Ok(()));
     assert!(!talk.open());
+}
+
+/// A forward goes on after the remote that asked for it leaves, while it is
+/// placed and while the server answers, as the server finishes one whose
+/// client left.
+#[test]
+fn a_forward_goes_on_after_its_remote_left() {
+    let mut talk = opened(lent(&[RECORDED]));
+    let request = framed(
+        b"host-serial:127.0.0.1:15555:forward:tcp:9222;localabstract:chrome_devtools_remote",
+    );
+    talk.from_client(&request, &recorded_view()).unwrap();
+    assert_eq!(talk.client_closed(), Ok(()));
+    assert!(talk.finishes_unheard());
+    assert_eq!(
+        talk.placed(Ok(port(9222))),
+        vec![Out::ToServer(framed(
+            b"host-transport-id:1:forward:tcp:0;localabstract:chrome_devtools_remote"
+        ))]
+    );
+    assert_eq!(talk.client_closed(), Ok(()));
+    assert!(talk.finishes_unheard());
+    talk.from_server(b"OKAYOKAY000558765", &recorded_view())
+        .unwrap();
+    assert_eq!(
+        talk.server_closed(&recorded_view()).unwrap(),
+        vec![Out::Forwarded {
+            forward: chrome_forward(),
+            replaced: None,
+            id: 1,
+        }]
+    );
+    assert!(!talk.finishes_unheard(), "recorded from here");
+}
+
+/// `Forwards` gives back the channel a forward's carrier last ran in, so a
+/// forward placed again is ended where it runs.
+#[test]
+fn a_forward_is_released_from_the_channel_its_carrier_last_ran_in() {
+    use std::sync::{Arc, Mutex};
+
+    use hedwig_core::adb::{Forwarding, Forwards};
+    use hedwig_core::service::Service;
+    use hedwig_model::capability::ServiceHost;
+    use hedwig_model::remote::RemoteId;
+    use hedwig_model::text::{Address, Name};
+    use hedwig_model::trail::{ConnectionId, Seq};
+
+    let name = |text: &str| Name::try_from(text).unwrap();
+    let forwards = Forwards::default();
+    let server = Service {
+        host: ServiceHost::Workstation,
+        port: port(5037),
+    };
+    let jobs = Arc::new(Mutex::new(BTreeMap::new()));
+    let (listening, endpoint) = forwards.bind(server, &jobs).unwrap();
+    let forwarding = Forwarding {
+        remote: RemoteId {
+            route: name("ssh"),
+            address: Address::try_from("dev@build-7.example").unwrap(),
+        },
+        capability: name("adb"),
+        port: port(7100),
+    };
+    forwards.keep(forwarding.clone(), listening);
+    forwards.haul(&forwarding, ConnectionId(Seq(1)));
+    forwards.haul(&forwarding, ConnectionId(Seq(2)));
+    assert_eq!(
+        forwards.release(&forwarding),
+        Some((endpoint, ConnectionId(Seq(2))))
+    );
+    assert_eq!(forwards.release(&forwarding), None, "released once");
+}
+
+/// Client bytes while the server answers a forward leave it to finish, as the
+/// server finishes what it was asked; before the server is asked they break
+/// the conversation, as nothing of the server's is there to be left.
+#[test]
+fn a_forward_the_server_is_answering_is_finished_whatever_the_client_writes() {
+    let mut talk = opened(every());
+    talk.from_client(&framed(b"host:forward:tcp:9222;tcp:9222"), &recorded_view())
+        .unwrap();
+    assert_eq!(
+        talk.from_client(b"more", &recorded_view()),
+        Err(Breach::OutOfTurn(Side::Client)),
+    );
+    let mut talk = opened(every());
+    talk.from_client(&framed(b"host:forward:tcp:9222;tcp:9222"), &recorded_view())
+        .unwrap();
+    talk.placed(Ok(port(9222)));
+    assert_eq!(talk.from_client(b"more", &recorded_view()), Ok(Vec::new()));
+    assert!(talk.finishes_unheard());
+}
+
+/// A selected device unlent while the server answers a forward on it leaves
+/// the forward to finish: the core drops it once recorded.
+#[test]
+fn a_forward_the_server_is_answering_goes_on_when_its_device_is_unlent() {
+    let mut talk = opened(every());
+    talk.from_client(&framed(b"host:transport-any"), &recorded_view())
+        .unwrap();
+    talk.from_server(b"OKAY", &recorded_view()).unwrap();
+    talk.from_client(&framed(b"host:forward:tcp:9222;tcp:9222"), &recorded_view())
+        .unwrap();
+    talk.placed(Ok(port(9222)));
+    talk.relent(
+        Lending {
+            lends: Lends::none(),
+            network: false,
+        },
+        &recorded_view(),
+    );
+    assert!(talk.open(), "the server's answer is still read");
 }
 
 /// A reverse listing names each of this remote's endpoints as the target it

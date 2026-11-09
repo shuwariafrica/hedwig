@@ -127,8 +127,9 @@ pub enum Relayed {
         replaced: Option<crate::adb::Forward>,
         id: u64,
     },
-    /// A forward placed on the remote at this port that the server refused.
-    Unplaced(Port),
+    /// What the remote asked for has no carrier, for this reason, which it
+    /// was told.
+    Unhauled(String),
     /// The remote removed its forward at this port.
     Unforwarded(Port),
     /// What the remote sent is not the post its `curl` makes; it was told so

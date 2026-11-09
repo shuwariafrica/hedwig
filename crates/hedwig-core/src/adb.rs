@@ -184,10 +184,9 @@ pub enum Out {
         replaced: Option<Forward>,
         id: u64,
     },
-    /// A forward placed on the remote that the server refused, or whose
-    /// endpoint the core could not give the server's listener: its carrier
-    /// is ended.
-    Unplaced(Port),
+    /// What the remote asked for has no carrier, for this reason: the person
+    /// is told what the remote is.
+    Unhauled(String),
     /// The forward at this port on the remote is removed.
     Unforwarded(Port),
     /// Every forward of the remote's is removed by the relay, each on a
@@ -350,7 +349,6 @@ enum Turn {
     /// for the core to record it and give its endpoint the server's listener.
     Listening {
         answer: Vec<u8>,
-        port: Port,
     },
     /// A removal is with the server; its whole answer is read.
     Unforwarding(Port),
@@ -429,6 +427,7 @@ pub fn reason(withheld: &Withheld) -> &'static str {
         }
         Withheld::Unforwardable => "Hedwig carries a forward from a tcp port on the remote",
         Withheld::Crowded => "Hedwig carries no more for this remote",
+        Withheld::Unhauled(_) => UNHAULED,
         Withheld::Unlisted => "Hedwig cannot read which devices the workstation's adb server holds",
         Withheld::Outdated => {
             "Hedwig lends devices only from an adb server of platform-tools 35.0.0 or later, \
@@ -931,6 +930,15 @@ impl Conversation {
         )
     }
 
+    /// Whether what the client asked for is under way and is finished whoever
+    /// is left to hear: a device's answer to a reverse is still read, and a
+    /// forward goes on to the server, whose listener is installed before its
+    /// answer is sent (`adb.cpp`, `handle_forward_request`).
+    pub fn finishes_unheard(&self) -> bool {
+        self.reads_a_reverse()
+            || matches!(self.turn, Turn::Placing { .. } | Turn::Forwarding { .. })
+    }
+
     /// Whether a forward waits for its port on the remote.
     pub fn places(&self) -> bool {
         matches!(self.turn, Turn::Placing { .. })
@@ -958,7 +966,9 @@ impl Conversation {
     pub fn from_client(&mut self, bytes: &[u8], view: &View) -> Result<Vec<Out>, Breach> {
         match &mut self.turn {
             Turn::Spliced => return Ok(vec![Out::ToServer(bytes.to_vec())]),
-            Turn::Over => return Ok(Vec::new()),
+            // The server finishes what it was asked, whatever else arrives;
+            // to end in `Forwarding` would leave the listener it installs.
+            Turn::Over | Turn::Forwarding { .. } => return Ok(Vec::new()),
             Turn::Passing(remaining) => {
                 let now = bytes.len().min(*remaining);
                 *remaining -= now;
@@ -1352,8 +1362,11 @@ impl Conversation {
     /// now has it.
     pub fn relent(&mut self, lending: Lending, view: &View) -> Vec<Out> {
         self.lending = lending;
+        // A forward the server is answering is left to finish: the core drops
+        // it once recorded, and its listener with it.
         if let Some(selected) = &self.selected
             && !selected.lent(&self.lending.lends)
+            && !matches!(self.turn, Turn::Forwarding { .. })
         {
             self.turn = Turn::Over;
             return Vec::new();
@@ -1462,13 +1475,12 @@ impl Conversation {
         let port = match placed {
             Ok(port) => port,
             Err(words) => {
-                return vec![Out::ToClient(fail(&format!(
-                    "cannot bind listener: {words}"
-                )))];
+                let told = fail(&format!("cannot bind listener: {words}"));
+                return vec![Out::Unhauled(words), Out::ToClient(told)];
             }
         };
         let Some(serial) = device.named() else {
-            return vec![Out::Unplaced(port)];
+            return vec![Out::ToClient(fail("internal error"))];
         };
         let mut service = b"forward:tcp:0;".to_vec();
         service.extend_from_slice(socket.as_str().as_bytes());
@@ -1580,7 +1592,10 @@ impl Conversation {
             return Vec::new();
         }
         self.turn = Turn::Over;
-        vec![Out::ToClient(fail(&format!("{UNHAULED}: {why}")))]
+        vec![
+            Out::Unhauled(why.to_owned()),
+            Out::ToClient(fail(&format!("{UNHAULED}: {why}"))),
+        ]
     }
 
     /// The core recorded the reverse the device took and its carrier stands
@@ -1599,10 +1614,13 @@ impl Conversation {
         };
         match standing {
             Ok(()) => vec![Out::ToClient(answer)],
-            Err(why) => vec![Out::ToClient(fail(&format!(
-                "{UNHAULED} now ({why}); the device keeps it, and Hedwig carries it once the \
-                 remote's channel can"
-            )))],
+            Err(why) => {
+                let told = fail(&format!(
+                    "{UNHAULED} now ({why}); the device keeps it, and Hedwig carries it once the \
+                     remote's channel can"
+                ));
+                vec![Out::Unhauled(why), Out::ToClient(told)]
+            }
         }
     }
 
@@ -1793,11 +1811,7 @@ impl Conversation {
         id: u64,
     ) -> Vec<Out> {
         let Some(rest) = answer.strip_prefix(b"OKAYOKAY") else {
-            let mut outs = vec![Out::ToClient(answer.to_vec())];
-            if replaced.is_none() {
-                outs.push(Out::Unplaced(forward.port));
-            }
-            return outs;
+            return vec![Out::ToClient(answer.to_vec())];
         };
         if replaced.is_none() {
             let bound = rest
@@ -1808,10 +1822,7 @@ impl Conversation {
                 .and_then(|digits| digits.parse::<u16>().ok())
                 .and_then(|port| Port::try_from(port).ok());
             let Some(bound) = bound else {
-                return vec![
-                    Out::ToClient(fail("internal error")),
-                    Out::Unplaced(forward.port),
-                ];
+                return vec![Out::ToClient(fail("internal error"))];
             };
             forward.server = bound;
         }
@@ -1819,10 +1830,7 @@ impl Conversation {
         if zero {
             answer.extend(framed(forward.port.to_string().as_bytes()));
         }
-        self.turn = Turn::Listening {
-            answer,
-            port: forward.port,
-        };
+        self.turn = Turn::Listening { answer };
         vec![Out::Forwarded {
             forward,
             replaced,
@@ -1833,19 +1841,19 @@ impl Conversation {
     /// The core recorded the forward the server took and gave its endpoint
     /// the server's listener, or could not, in these words. Only now is the
     /// remote answered; where the endpoint has no listener, the remote reads
-    /// ADB's own words for a listener not installed and the carrier is ended.
+    /// ADB's own words for a listener not installed.
     pub fn listened(&mut self, listening: Result<(), String>) -> Vec<Out> {
-        let Turn::Listening { answer, port } = &self.turn else {
+        let Turn::Listening { answer } = &self.turn else {
             return Vec::new();
         };
-        let (answer, port) = (answer.clone(), *port);
+        let answer = answer.clone();
         self.turn = Turn::Over;
         match listening {
             Ok(()) => vec![Out::ToClient(answer)],
-            Err(words) => vec![
-                Out::ToClient(fail(&format!("cannot bind listener: {words}"))),
-                Out::Unplaced(port),
-            ],
+            Err(words) => {
+                let told = fail(&format!("cannot bind listener: {words}"));
+                vec![Out::Unhauled(words), Out::ToClient(told)]
+            }
         }
     }
 
@@ -1895,10 +1903,7 @@ impl Conversation {
     ///
     /// [`Breach::Cut`] where it closed in the middle of a request.
     pub fn client_closed(&mut self) -> Result<(), Breach> {
-        // The device may take a reverse it was asked for whoever is left to
-        // hear it: its answer is still read, so the core knows what the
-        // device holds.
-        if self.reads_a_reverse() {
+        if self.finishes_unheard() {
             return Ok(());
         }
         let cut = matches!(self.turn, Turn::Request) && !self.client.is_empty()
@@ -2513,7 +2518,7 @@ fn converse(ends: &Ends<'_>, early: Vec<u8>, opened: Opened, tell: &impl Fn(Rela
                 break 'carry;
             }
         }
-        if client_done && !talk.reads_a_reverse() {
+        if client_done && !talk.finishes_unheard() {
             if spliced.load(Ordering::Acquire) {
                 // The client's close is passed on; the server's answer still
                 // reaches the client until the server closes too.
@@ -2585,7 +2590,7 @@ fn relayed(out: Out) -> Relayed {
             replaced,
             id,
         },
-        Out::Unplaced(port) => Relayed::Unplaced(port),
+        Out::Unhauled(why) => Relayed::Unhauled(why),
         Out::Unforwarded(port) => Relayed::Unforwarded(port),
         // Carried out by the relay itself.
         Out::ToServer(_)
@@ -3009,12 +3014,13 @@ impl Forwards {
         true
     }
 
-    /// Ends `forwarding`'s endpoint, and gives the port its carrier was
-    /// known by.
-    pub fn release(&self, forwarding: &Forwarding) -> Option<Port> {
+    /// Ends `forwarding`'s endpoint, and gives the port its carrier is known
+    /// by and the channel [`Forwards::haul`] last put it in.
+    pub fn release(&self, forwarding: &Forwarding) -> Option<(Port, ConnectionId)> {
         let found = self.endpoints.lock().ok()?.remove(forwarding)?;
         found.end();
-        Some(found.endpoint)
+        let carrier = (*found.carrier.lock().ok()?)?;
+        Some((found.endpoint, carrier))
     }
 
     fn found(&self, forwarding: &Forwarding) -> Option<Arc<Listening>> {

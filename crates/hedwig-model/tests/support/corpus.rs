@@ -858,6 +858,7 @@ pub(crate) fn withheld() -> Vec<Withheld> {
         Withheld::Uncarriable,
         Withheld::Unforwardable,
         Withheld::Crowded,
+        Withheld::Unhauled(Words::try_from("the remote's channel is down").unwrap()),
         Withheld::Unlisted,
         Withheld::Outdated,
         Withheld::Unknown,

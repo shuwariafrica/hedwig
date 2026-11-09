@@ -17,6 +17,7 @@ use hedwig_model::trail::{
     Target, Tick, Timestamp, Uses, Write,
 };
 use hedwig_view::act::Act;
+use hedwig_view::card::Subject;
 use hedwig_view::define;
 use hedwig_view::exposure::{self, Board, Line, Shown, Window};
 use hedwig_view::glance::{self, Entry as Row};
@@ -1005,6 +1006,63 @@ fn a_request_the_adb_relay_withheld_is_on_adbs_line_and_in_the_menu() {
             .any(|need| need.sentence == format!("Refused 2 times for dev/build (coder): {ending}")),
         "{needs:?}"
     );
+}
+
+/// What Hedwig could not carry on to the remote is on the capability's line
+/// and in the menu with how often, is the refusal itself in the remote's
+/// activity, and waits for nobody's word, so no card raises it.
+#[test]
+fn a_request_with_no_carrier_is_said_on_its_line_in_the_menu_and_the_activity_and_on_no_card() {
+    let unhauled = |why: &str| Happened::TurnedAway {
+        remote: Some(workspace()),
+        refusal: Refusal::Withheld {
+            capability: name("adb"),
+            request: Withheld::Unhauled(Words::try_from(why).unwrap()),
+        },
+    };
+    let said = |why: &str| {
+        format!(
+            "a request to adb was refused because Hedwig could not carry it on to the remote: {why}"
+        )
+    };
+    let mut bench = granting("adb", Setup::Inspect, Exposure::SERVICE);
+    bench.desk.channel_up(&workspace(), "linux");
+    let taken = "the remote's ssh server would not listen at port 7100";
+    bench.desk.trail.push(unhauled(taken));
+    bench.desk.trail.push(unhauled(taken));
+    refresh(&mut bench);
+    let often = format!("{}, 2 times", said(taken));
+    assert_eq!(
+        line_of(&window(&bench), "adb").turned,
+        std::slice::from_ref(&often)
+    );
+    let listed = menu(&bench);
+    assert!(listed.contains(&often), "{listed:?}");
+    let attention = bench
+        .link
+        .seen()
+        .attached()
+        .and_then(|attached| attached.attention.as_ref())
+        .expect("what needs the person");
+    assert!(
+        attention
+            .iter()
+            .all(|needs| Subject::of(&needs.attention).is_none()),
+        "{attention:?}"
+    );
+
+    let denied = "dev@build-7.example: Permission denied (publickey).";
+    let entries = [Entry {
+        seq: Seq(1),
+        at: Timestamp(1),
+        tick: Tick(1),
+        event: unhauled(denied),
+    }];
+    let activity: Vec<String> = exposure::activity(&entries, &clock, Keyrings::default())
+        .into_iter()
+        .map(|(_, said)| said)
+        .collect();
+    assert_eq!(activity, [format!("t1: {}", said(denied))]);
 }
 
 /// What readiness finds is the line's state in the model's words

@@ -56,6 +56,9 @@ pub enum Withheld {
     /// Beyond what Hedwig carries on to one remote at once: reverses,
     /// forwards and consoles together.
     Crowded,
+    /// Its carrier could not stand, for this reason; the remote's tool read
+    /// the same.
+    Unhauled(Words),
     /// The server did not say which devices it holds in a form Hedwig
     /// reads, so no device could be judged lent.
     Unlisted,
@@ -115,6 +118,9 @@ impl fmt::Display for Withheld {
             ),
             Withheld::Crowded => {
                 f.write_str("it asked for more than Hedwig carries on to one remote at once")
+            }
+            Withheld::Unhauled(why) => {
+                write!(f, "Hedwig could not carry it on to the remote: {why}")
             }
             Withheld::Unlisted => f.write_str(
                 "the workstation's ADB server did not list its devices in a form Hedwig reads",

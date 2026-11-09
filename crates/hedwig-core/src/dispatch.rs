@@ -44,7 +44,7 @@ use hedwig_model::trail::{
 use crate::adb::Reverse;
 use crate::assuan::Breach;
 use crate::browse::Browse;
-use crate::channel::{asked, ended, words};
+use crate::channel::{Unplaced, asked, ended, words};
 use crate::keys::{Cards, Known, Read};
 use crate::relay::{Gnupg, Relayed, Relaying};
 use crate::serial::Serial;
@@ -190,10 +190,12 @@ pub enum Input {
     /// What Windows starts at sign-in for each start-up choice, as keeping
     /// their `Run` values found it.
     Startup([(Starts, AtSignIn); 2]),
-    /// A forward placed again when its remote's channel came back could not
-    /// listen at its port there: something on the remote took it.
-    Retaken {
+    /// A forward placed again in `connection`'s channel does not listen at
+    /// its port there, and why.
+    Unreplaced {
+        connection: ConnectionId,
         forwarding: crate::adb::Forwarding,
+        why: Unplaced,
     },
     /// A lent emulator's console is carried on to the remote through `endpoint`.
     Consoled {
@@ -429,8 +431,6 @@ pub enum Effect {
     /// none was.
     Place {
         knock: Knock,
-        remote: RemoteId,
-        capability: Name,
         port: u16,
         server: Service,
         carrier: Carrier,
@@ -450,12 +450,14 @@ pub enum Effect {
         listener: Port,
     },
     /// End a forward's carrier and let its endpoint go.
-    Unplace {
-        connection: ConnectionId,
-        forwarding: crate::adb::Forwarding,
-    },
-    /// Have the capability's server remove its forward at `listener`, on
-    /// device `id`.
+    Unplace { forwarding: crate::adb::Forwarding },
+    /// Nothing is placed for the forward `knock` holds, for this reason.
+    NotPlaced { knock: Knock, why: &'static str },
+    /// The connection `knock` ended with a forward the core never recorded:
+    /// its carrier ends and its endpoint goes, however far they had come.
+    Withdraw { knock: Knock },
+    /// Have `server`, the one that took it, remove its forward at `listener`,
+    /// on device `id`.
     Unlisten {
         server: Service,
         id: u64,
@@ -560,6 +562,16 @@ impl Added {
             with: Vec::new(),
             acknowledged: Exposure::NONE,
             lends: Lends::none(),
+        }
+    }
+
+    /// What the person last asked `remote`'s connection to carry.
+    fn asked(state: &State, remote: &RemoteId) -> Added {
+        let (acknowledged, lends) = state.asked_terms(remote);
+        Added {
+            with: state.asked(remote).into_iter().flatten().cloned().collect(),
+            acknowledged,
+            lends,
         }
     }
 }
@@ -741,6 +753,12 @@ struct Streamed {
     /// taken, whose place among its remote's [`crate::adb::CARRIED`] is given
     /// back where the connection ends holding it.
     reversing: Option<Reverse>,
+    /// For an ADB connection: the place among its remote's
+    /// [`crate::adb::CARRIED`] held by the forward it has not had recorded,
+    /// given back where the connection ends holding it.
+    placing: Option<Slot>,
+    /// Whose it is, known once its channel has ended too.
+    remote: RemoteId,
     /// For a serial connection: the port its capability names, the opening
     /// once it is settled, and whether the port was opened for it.
     port: Option<Taking>,
@@ -837,9 +855,13 @@ pub struct Core {
     /// capabilities' carriers, which [`crate::adb::CARRIED`] bounds.
     carrying: BTreeMap<RemoteId, BTreeSet<(Name, Slot)>>,
     /// Each forward the server took, by its remote, capability and port on
-    /// the remote: the channel it was asked on and its device's transport
-    /// id, which a forward ends with when the device leaves the server.
-    forwarded: BTreeMap<(RemoteId, Name, Port), (ConnectionId, u64)>,
+    /// the remote: its device's transport id, which a forward ends with when
+    /// the device leaves the server, and the server that took it, which holds
+    /// its listener whatever the capability names by the time it goes.
+    forwarded: BTreeMap<(RemoteId, Name, Port), (u64, Option<Service>)>,
+    /// What became of a forward while no connection could record it, where
+    /// nothing else says so; it is recorded at the first step with a connection.
+    unrecorded: BTreeMap<(RemoteId, Name, Port), Dropped>,
     /// The ADB capabilities whose servers' devices are watched because a
     /// channel carries them; a client listing one keeps its watch too.
     watched: BTreeSet<Name>,
@@ -933,6 +955,7 @@ impl Core {
             streams: BTreeMap::new(),
             carrying: BTreeMap::new(),
             forwarded: BTreeMap::new(),
+            unrecorded: BTreeMap::new(),
             watched: BTreeSet::new(),
             answered: BTreeMap::new(),
             viewed: BTreeMap::new(),
@@ -1338,8 +1361,22 @@ impl Core {
                 }
                 None
             }
-            Input::Retaken { forwarding } => {
-                self.retaken(&mut step, now, &forwarding);
+            Input::Unreplaced {
+                connection,
+                forwarding,
+                why,
+            } => {
+                // Only the remote's own refusal says something there took the
+                // port, and only for the channel it was placed in; a forward
+                // whose channel ended under it, or whose carrier never heard,
+                // is placed again on the next return.
+                let current = self
+                    .state
+                    .connection(&forwarding.remote)
+                    .is_some_and(|(live, _)| live == connection);
+                if current && matches!(why, Unplaced::Refused(_)) {
+                    self.retaken(&mut step, now, &forwarding);
+                }
                 None
             }
             Input::Consoled {
@@ -1670,7 +1707,8 @@ impl Core {
 
     /// What readiness found. Each capability's findings and what readiness
     /// changed for it are recorded, and a channel is started with what can
-    /// be carried, unless the survey was the person's check or a removal's.
+    /// be carried, unless the survey was a removal's or the person's check
+    /// of a remote nothing wants a channel to.
     #[allow(clippy::too_many_lines, reason = "one arm per finding and per purpose")]
     fn surveyed(
         &mut self,
@@ -2430,7 +2468,10 @@ impl Core {
     /// Hands an admitted connection to what serves its capability; one that
     /// nothing serves is closed with nothing written to it.
     fn relay(&mut self, step: &mut Step, knock: Knock, connection: ConnectionId, capability: Name) {
-        let Some(source) = self.relaying(connection, &capability) else {
+        let (Some(source), Some(remote)) = (
+            self.relaying(connection, &capability),
+            self.state.link(connection).map(|link| link.remote.clone()),
+        ) else {
             step.effects.push(Effect::Refuse { knock });
             return;
         };
@@ -2477,6 +2518,8 @@ impl Core {
                 used_card: false,
                 lending,
                 reversing: None,
+                placing: None,
+                remote,
                 port,
                 served: None,
             },
@@ -2603,8 +2646,16 @@ impl Core {
                 replaced,
                 id,
             } => self.forwarded_on(step, now, knock, &streamed, forward, replaced, id),
-            Relayed::Unplaced(port) => {
-                self.unplace(step, &streamed, port);
+            Relayed::Unhauled(why) => {
+                let why = words(&why)
+                    .or_else(|| words("no account was given"))
+                    .unwrap_or_else(|| unreachable!("fixed words are valid words"));
+                let refusal = Refusal::Withheld {
+                    capability: streamed.capability.clone(),
+                    request: Withheld::Unhauled(why),
+                };
+                let remote = Some(streamed.remote.clone());
+                self.record(step, now, Event::TurnedAway { remote, refusal });
             }
             Relayed::Unforwarded(port) => {
                 self.unforwarded(step, now, &streamed, port, Dropped::Removed);
@@ -2652,6 +2703,11 @@ impl Core {
                 let ended = self.streams.remove(&knock);
                 if let Some(reverse) = ended.as_ref().and_then(|ended| ended.reversing.clone()) {
                     self.unreverse(step, reverse);
+                }
+                if let Some(ended) = &ended
+                    && let Some(slot) = ended.placing.clone()
+                {
+                    self.abandon_forward(step, knock, &ended.remote, &ended.capability, slot);
                 }
                 if let Some(ended) = ended
                     .as_ref()
@@ -3243,30 +3299,37 @@ impl Core {
             .link(streamed.connection)
             .map(|link| link.remote.clone())
         else {
+            let why = "the remote's channel is down";
+            step.effects.push(Effect::NotPlaced { knock, why });
+            return;
+        };
+        let Some(server) = self.server(&streamed.capability) else {
+            let why = "its capability no longer names an ADB server";
+            step.effects.push(Effect::NotPlaced { knock, why });
+            return;
+        };
+        let Some(carrier) = self.carrier(streamed.connection, &remote) else {
+            let why = "the remote's route is no longer defined";
+            step.effects.push(Effect::NotPlaced { knock, why });
             return;
         };
         let slot = match Port::try_from(port) {
             Ok(port) => Slot::Forward(port),
             Err(_) => Slot::Placing(knock),
         };
-        let asked = (streamed.capability.clone(), slot);
+        let asked = (streamed.capability.clone(), slot.clone());
         if self.crowded(step, now, knock, &remote, &asked) {
             return;
         }
-        let (Some(server), Some(carrier)) = (
-            self.server(&streamed.capability),
-            self.carrier(streamed.connection, &remote),
-        ) else {
-            return;
-        };
         self.carrying
             .entry(remote.clone())
             .or_default()
             .insert(asked);
+        if let Some(held) = self.streams.get_mut(&knock) {
+            held.placing = Some(slot);
+        }
         step.effects.push(Effect::Place {
             knock,
-            remote,
-            capability: streamed.capability.clone(),
             port,
             server,
             carrier,
@@ -3275,7 +3338,11 @@ impl Core {
 
     /// The server took a forward: recorded, with the one it replaced
     /// dropped, and its endpoint given the server's listener once the record
-    /// is written, which is when the remote is answered.
+    /// is written, which is when the remote is answered. Where its channel
+    /// ended as the server took a new one there is nothing to record it by,
+    /// and the listener goes. A new target for a forward dropped while the
+    /// server answered has no record to join: its listener goes, and where the
+    /// connection lives the remote is told by the endpoint it no longer has.
     #[allow(
         clippy::too_many_arguments,
         reason = "what the relay told, and where it came from"
@@ -3290,17 +3357,41 @@ impl Core {
         replaced: Option<crate::adb::Forward>,
         id: u64,
     ) {
-        let Some(remote) = self
-            .state
-            .link(streamed.connection)
-            .map(|link| link.remote.clone())
-        else {
-            return;
-        };
+        let remote = streamed.remote.clone();
         let capability = streamed.capability.clone();
+        let key = (remote.clone(), capability.clone(), forward.port);
+        let lost = replaced.is_some() && !self.forwarded.contains_key(&key);
+        let linked = self.state.link(streamed.connection).is_some();
+        let goes = lost || (!linked && replaced.is_none());
+        if goes && let Some(server) = self.server(&capability) {
+            step.effects.push(Effect::Unlisten {
+                server,
+                id,
+                listener: forward.server,
+            });
+        }
+        if !linked {
+            return;
+        }
+        if lost {
+            step.effects.push(Effect::Listen {
+                knock,
+                forwarding: crate::adb::Forwarding {
+                    remote,
+                    capability,
+                    port: forward.port,
+                },
+                listener: forward.server,
+            });
+            return;
+        }
         if let Some(carrying) = self.carrying.get_mut(&remote) {
             carrying.remove(&(capability.clone(), Slot::Placing(knock)));
             carrying.insert((capability.clone(), Slot::Forward(forward.port)));
+        }
+        // Taken: its place is the record's from here.
+        if let Some(held) = self.streams.get_mut(&knock) {
+            held.placing = None;
         }
         if let Some(replaced) = replaced {
             let dropped = Event::Dropped {
@@ -3315,9 +3406,10 @@ impl Core {
             };
             self.record(step, now, dropped);
         }
+        let server = self.server(&capability);
         self.forwarded.insert(
             (remote.clone(), capability.clone(), forward.port),
-            (streamed.connection, id),
+            (id, server),
         );
         let carried = Event::Carried {
             connection: streamed.connection,
@@ -3341,31 +3433,31 @@ impl Core {
         });
     }
 
-    /// A forward placed on the remote that the server refused: its carrier
-    /// ends and its place is free.
-    fn unplace(&mut self, step: &mut Step, streamed: &Streamed, port: Port) {
-        let Some(remote) = self
-            .state
-            .link(streamed.connection)
-            .map(|link| link.remote.clone())
-        else {
-            return;
-        };
-        if let Some(carrying) = self.carrying.get_mut(&remote) {
-            carrying.retain(|(capability, slot)| {
-                *capability != streamed.capability
-                    || !matches!(slot, Slot::Forward(at) if *at == port)
-                        && !matches!(slot, Slot::Placing(_))
-            });
-        }
-        step.effects.push(Effect::Unplace {
-            connection: streamed.connection,
-            forwarding: crate::adb::Forwarding {
-                remote,
-                capability: streamed.capability.clone(),
-                port,
-            },
+    /// A connection ended holding a forward the core never recorded: its place
+    /// is given back unless the record or another connection's forward at that
+    /// port uses it, and its carrier and endpoint go.
+    fn abandon_forward(
+        &mut self,
+        step: &mut Step,
+        knock: Knock,
+        remote: &RemoteId,
+        capability: &Name,
+        slot: Slot,
+    ) {
+        let recorded = matches!(&slot, Slot::Forward(port)
+            if self.forwarded.contains_key(&(remote.clone(), capability.clone(), *port)));
+        let asked = self.streams.values().any(|streamed| {
+            streamed.capability == *capability
+                && streamed.remote == *remote
+                && streamed.placing.as_ref() == Some(&slot)
         });
+        if !recorded
+            && !asked
+            && let Some(carrying) = self.carrying.get_mut(remote)
+        {
+            carrying.remove(&(capability.clone(), slot));
+        }
+        step.effects.push(Effect::Withdraw { knock });
     }
 
     /// A forward the remote holds is not carried any more, and why.
@@ -3377,18 +3469,13 @@ impl Core {
         port: Port,
         why: Dropped,
     ) {
-        let Some(remote) = self
-            .state
-            .link(streamed.connection)
-            .map(|link| link.remote.clone())
-        else {
-            return;
-        };
+        let remote = streamed.remote.clone();
         self.drop_forward(step, now, &remote, &streamed.capability, port, why);
     }
 
     /// Drops `remote`'s forward at `port` of `capability`: recorded, its
-    /// carrier ended, its place free.
+    /// carrier ended, its place free. With no connection to `remote` there is
+    /// nothing to record it by: [`Self::drop_unrecorded`].
     fn drop_forward(
         &mut self,
         step: &mut Step,
@@ -3398,6 +3485,9 @@ impl Core {
         port: Port,
         why: Dropped,
     ) {
+        let Some((connection, _)) = self.state.connection(remote) else {
+            return self.drop_unrecorded(step, remote, capability, port, why);
+        };
         let held = self
             .state
             .carried(remote, capability)
@@ -3417,16 +3507,8 @@ impl Core {
         let Some((carriage, listener)) = held else {
             return;
         };
-        let connection = asked.map(|(connection, _)| connection).or_else(|| {
-            self.state
-                .connection(remote)
-                .map(|(connection, _)| connection)
-        });
-        let Some(connection) = connection else {
-            return;
-        };
-        if why == Dropped::Unlent
-            && let (Some(server), Some((_, id))) = (self.server(capability), asked)
+        if matches!(why, Dropped::Unlent | Dropped::Taken)
+            && let Some((id, Some(server))) = asked
         {
             step.effects.push(Effect::Unlisten {
                 server,
@@ -3442,7 +3524,54 @@ impl Core {
         };
         self.record(step, now, dropped);
         step.effects.push(Effect::Unplace {
-            connection,
+            forwarding: crate::adb::Forwarding {
+                remote: remote.clone(),
+                capability: capability.clone(),
+                port,
+            },
+        });
+    }
+
+    /// `why` a forward goes with no connection to record it by: what it holds
+    /// of the person's server and the workstation goes now, once, and its
+    /// drop is recorded at the first step with a connection ([`Self::relend`]).
+    /// A device that left is read again from the server's listing then, and
+    /// has nothing to take back.
+    fn drop_unrecorded(
+        &mut self,
+        step: &mut Step,
+        remote: &RemoteId,
+        capability: &Name,
+        port: Port,
+        why: Dropped,
+    ) {
+        if why == Dropped::Gone {
+            return;
+        }
+        let key = (remote.clone(), capability.clone(), port);
+        let Some((id, server)) = self.forwarded.remove(&key) else {
+            return;
+        };
+        self.unrecorded.insert(key, why);
+        let listener = self
+            .state
+            .carried(remote, capability)
+            .into_iter()
+            .flatten()
+            .find_map(|(carriage, endpoint)| match carriage {
+                Carriage::Forward { port: at, .. } if *at == port => Some(*endpoint),
+                _ => None,
+            });
+        if why == Dropped::Unlent
+            && let (Some(server), Some(listener)) = (server, listener)
+        {
+            step.effects.push(Effect::Unlisten {
+                server,
+                id,
+                listener,
+            });
+        }
+        step.effects.push(Effect::Unplace {
             forwarding: crate::adb::Forwarding {
                 remote: remote.clone(),
                 capability: capability.clone(),
@@ -3502,7 +3631,7 @@ impl Core {
         let gone: Vec<(RemoteId, Port)> = self
             .forwarded
             .iter()
-            .filter(|((_, held, _), (_, id))| held == capability && view.by_id(*id).is_none())
+            .filter(|((_, held, _), (id, _))| held == capability && view.by_id(*id).is_none())
             .map(|((remote, _, port), _)| (remote.clone(), *port))
             .collect();
         for (remote, port) in gone {
@@ -3642,8 +3771,19 @@ impl Core {
 
     /// What each live ADB connection's grant lends now is told to it where it
     /// changed; a forward whose device is no longer lent ends, and so does a
-    /// console.
+    /// console; and what no connection could record is recorded once one can.
     fn relend(&mut self, step: &mut Step, now: Now) {
+        let owed: Vec<((RemoteId, Name, Port), Dropped)> = self
+            .unrecorded
+            .iter()
+            .filter(|((remote, ..), _)| self.state.connection(remote).is_some())
+            .map(|(key, why)| (key.clone(), *why))
+            .collect();
+        for ((remote, capability, port), why) in owed {
+            self.unrecorded
+                .remove(&(remote.clone(), capability.clone(), port));
+            self.drop_forward(step, now, &remote, &capability, port, why);
+        }
         let streams: Vec<(Knock, ConnectionId, Name, Option<crate::adb::Lending>)> = self
             .streams
             .iter()
@@ -3695,10 +3835,9 @@ impl Core {
             .collect();
         for (remote, capability, port, device) in forwards {
             let lent = self
-                .state
-                .connection(&remote)
-                .and_then(|(_, link)| self.world().lending(link, &capability))
-                .is_some_and(|(lends, _)| lends.lends(&device));
+                .world()
+                .lending_carried(&remote, &capability)
+                .is_some_and(|lends| lends.lends(&device));
             if !lent {
                 self.drop_forward(step, now, &remote, &capability, port, Dropped::Unlent);
             }
@@ -4480,9 +4619,11 @@ impl Core {
     }
 
     /// The forwards each ADB capability the channel serves carried in this
-    /// run are placed again at their ports on the remote, and the capability's
-    /// server's devices are watched - or, where they are watched already, the
-    /// consoles of the emulators lent to the remote are carried.
+    /// run are placed again at their ports on the remote, but for any whose
+    /// device left the server while the channel was away, which are dropped
+    /// as the listing says; and the capability's server's devices are
+    /// watched - or, where they are watched already, the consoles of the
+    /// emulators lent to the remote are carried.
     fn replace(
         &mut self,
         step: &mut Step,
@@ -4513,6 +4654,11 @@ impl Core {
                 continue;
             };
             for port in forwards {
+                let key = (remote.clone(), capability.clone(), port);
+                if self.left_the_server(&key) {
+                    self.drop_forward(step, now, remote, &capability, port, Dropped::Gone);
+                    continue;
+                }
                 step.effects.push(Effect::Replace {
                     forwarding: crate::adb::Forwarding {
                         remote: remote.clone(),
@@ -4529,6 +4675,15 @@ impl Core {
                 self.consoles(step, now, &capability, Some(&view));
             }
         }
+    }
+
+    /// Whether the server, as last read, no longer holds a forward's device:
+    /// a listing read while the channel was away had nothing to record it by.
+    fn left_the_server(&self, key: &(RemoteId, Name, Port)) -> bool {
+        let (Some((id, _)), Some(view)) = (self.forwarded.get(key), self.viewed.get(&key.1)) else {
+            return false;
+        };
+        view.by_id(*id).is_none()
     }
 
     fn reply(
@@ -4960,8 +5115,8 @@ impl Core {
                 Reply::Done(Changed::Changed)
             }
             // Readiness runs again on a live channel, which runs on; with none
-            // live, a connection is opened for it alone. The row says where
-            // the grant stands meanwhile, and what is found marks it stale.
+            // live, a connection is opened to run it. The row says where the grant
+            // stands meanwhile, and what is found marks it stale.
             Request::Check { remote, capability } => {
                 let live = self
                     .state
@@ -4973,7 +5128,12 @@ impl Core {
                         self.survey(step, now, connection, dialect, Purpose::Recheck);
                     }
                     Some(_) => {}
-                    None => self.open(step, now, &remote, Added::nothing(), Opener::Check(client)),
+                    // The connection a check opens stays as the remote's channel
+                    // where one is wanted, so it carries what the person asked for.
+                    None => {
+                        let added = Added::asked(&self.state, &remote);
+                        self.open(step, now, &remote, added, Opener::Check(client));
+                    }
                 }
                 let row = self.world().rows(client, now.tick).into_iter().find(|row| {
                     row.capability == capability && row.remote.as_ref() == Some(&remote)

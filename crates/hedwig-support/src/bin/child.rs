@@ -651,7 +651,10 @@ const REMOTE_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 /// real, listening at [`REMOTE_LOOPBACK`] and carrying every connection on to
 /// the workstation's end, and appends `<port> <endpoint>` for each to
 /// `<dir>/carried`, the port the one it listens at; and holds each local
-/// forward as [`haul`] says.
+/// forward as [`haul`] says. A client with remote forwards and no local one
+/// appends `<port asked> <endpoint>` for each to `<dir>/placers`, and waits
+/// first while `<dir>/hold-place` is there, having written
+/// `<process> <created>` to `<dir>/placing`.
 fn carry(
     folder: &Path,
     given: &[String],
@@ -663,6 +666,25 @@ fn carry(
     }
     if given.ends_with(&["/bin/sh".to_owned(), "-s".to_owned()]) {
         return shell(folder);
+    }
+    if !forwards.is_empty()
+        && locals.is_empty()
+        && let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(folder.join("placers"))
+    {
+        for (listen, endpoint) in forwards {
+            let _ = writeln!(file, "{listen} {endpoint}");
+        }
+    }
+    let hold = folder.join("hold-place");
+    if !forwards.is_empty() && locals.is_empty() && hold.exists() {
+        let (process, created) = hedwig_win::process::own().unwrap_or_default();
+        let _ = fs::write(folder.join("placing"), format!("{process} {created}"));
+        while hold.exists() {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
     for (listen, endpoint) in forwards {
         let asked = listen.parse::<u16>().ok();
