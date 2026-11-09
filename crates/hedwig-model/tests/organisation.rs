@@ -26,8 +26,10 @@ use hedwig_model::setting::{
     Autostart, Bounded, Burst, CapScope, Diagnostics, Keep, Longest, Said, Settled, Span,
     Threshold, Workstation,
 };
-use hedwig_model::text::{AgentPipe, Host};
-use hedwig_model::trail::{ClientId, ClientKind, Event, Item, Opener, Outcome, Seq, Tick};
+use hedwig_model::text::{AgentPipe, DeviceSerial, Host};
+use hedwig_model::trail::{
+    ChannelEnd, ClientId, ClientKind, Event, Item, Opener, Outcome, Seq, Tick,
+};
 use hedwig_model::wire::line;
 
 mod support;
@@ -456,6 +458,139 @@ fn an_organisations_denial_beats_a_persons_grant_and_leaves_their_document_as_it
 
     desk.govern(&Policy::default());
     assert!(served(&desk.asks(connection, "gpg", Operation::Sign).1));
+}
+
+/// What a remote already carries on a capability the person added to the
+/// connection stays lent on the terms they asked for until either holder
+/// denies it, or they ask without it.
+#[test]
+fn what_is_carried_on_a_capability_added_to_a_connection_stays_lent_until_denied() {
+    let mut desk = Desk::new(catalogue());
+    let interface = desk.attend(ClientKind::Interface, DESKTOP);
+    let carried =
+        |desk: &Desk| desk.ask_world(|world| world.lending_carried(&host(), &name("adb")));
+    let lent = Lends::devices([DeviceSerial::try_from("TESTDEVICE01").unwrap()]);
+    let connect = |with: Vec<_>| Request::Connect {
+        remote: host(),
+        with,
+        acknowledged: Exposure::SERVICE,
+        lends: lent.clone(),
+    };
+    assert_eq!(carried(&desk), None, "never asked for");
+    desk.send(interface, connect(vec![name("adb")])).unwrap();
+    assert_eq!(carried(&desk), Some(lent.clone()));
+
+    let denial = Denial {
+        capability: Selector::Only(name("adb")),
+        remotes: Remotes::One(host()),
+    };
+    desk.send(interface, Request::Change(Change::Deny(denial.clone())))
+        .unwrap();
+    assert_eq!(carried(&desk), None, "the person's denial");
+    desk.send(interface, Request::Change(Change::Undeny(denial)))
+        .unwrap();
+    assert_eq!(carried(&desk), Some(lent.clone()));
+
+    let denial = Limit::Deny(Denial {
+        capability: Selector::Only(name("adb")),
+        remotes: Remotes::Route(name("ssh")),
+    });
+    desk.govern(&policy(&[limit(PERSON, denial)]));
+    assert_eq!(carried(&desk), None, "the organisation's denial");
+    desk.govern(&Policy::default());
+    assert_eq!(carried(&desk), Some(lent.clone()));
+
+    let (connection, _) = desk.trail.state().connection(&host()).unwrap();
+    desk.trail.push(Event::Down {
+        connection,
+        end: ChannelEnd::Closed,
+    });
+    assert_eq!(carried(&desk), Some(lent.clone()), "no connection");
+    desk.send(interface, connect(Vec::new())).unwrap();
+    assert_eq!(carried(&desk), None, "asked for without it");
+}
+
+/// A capability added to a connection owes what a grant owes: redefined to
+/// expose more than the connection named, it serves nothing there, nor on the
+/// connection a return or a check opens with it.
+#[test]
+fn a_capability_added_to_a_connection_serves_nothing_once_it_exposes_more_than_was_named() {
+    let service = |host| Capability {
+        id: name("database"),
+        source: Source::Service {
+            host,
+            port: ServicePort::Fixed(port(5432)),
+            stream: Stream::Opaque,
+            remote: vec![Offer::Port(ServicePort::Fixed(port(5432)))],
+        },
+    };
+    let asked_for = || Request::Connect {
+        remote: host(),
+        with: vec![name("database")],
+        acknowledged: Exposure::SERVICE,
+        lends: Lends::none(),
+    };
+    let mut desk = Desk::new(catalogue());
+    let interface = desk.attend(ClientKind::Interface, DESKTOP);
+    let on_the_workstation = service(ServiceHost::Workstation);
+    desk.send(
+        interface,
+        Request::Change(Change::Define(on_the_workstation)),
+    )
+    .unwrap();
+    desk.send(interface, asked_for()).unwrap();
+    let connection = desk.channel_up(&host(), "linux");
+    assert!(!matches!(
+        desk.asks(connection, "database", Operation::Connect).1,
+        Verdict::Refuse(_)
+    ));
+
+    let beyond = service(ServiceHost::Named(
+        Host::try_from("db.lab.example").unwrap(),
+    ));
+    desk.send(interface, Request::Change(Change::Define(beyond)))
+        .unwrap();
+    let unnamed = Refusal::ExposureNotAcknowledged {
+        capability: name("database"),
+        missing: Exposure::NETWORK,
+    };
+    assert_eq!(
+        desk.asks(connection, "database", Operation::Connect).1,
+        Verdict::Refuse(unnamed.clone())
+    );
+    let check = Request::Check {
+        remote: host(),
+        capability: name("database"),
+    };
+    assert_eq!(desk.send(interface, check).unwrap_err(), unnamed);
+
+    desk.trail.push(Event::Down {
+        connection,
+        end: ChannelEnd::Closed,
+    });
+    for opener in [Opener::Again, Opener::Check(interface)] {
+        let opened = hedwig_model::trail::ConnectionId(desk.trail.push(Event::Opening {
+            remote: host(),
+            with: vec![name("database")],
+            opener,
+            acknowledged: Exposure::SERVICE,
+            lends: Lends::none(),
+        }));
+        desk.trail.push(Event::Observed {
+            connection: opened,
+            platform: name("linux"),
+        });
+        let plan = desk.ask_world(|world| world.plan(opened)).unwrap();
+        assert!(!plan.contains_key(&name("database")), "{plan:?}");
+        assert_eq!(
+            desk.asks(opened, "database", Operation::Connect).1,
+            Verdict::Refuse(unnamed.clone())
+        );
+        desk.trail.push(Event::Down {
+            connection: opened,
+            end: ChannelEnd::Closed,
+        });
+    }
 }
 
 #[test]

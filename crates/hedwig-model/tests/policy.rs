@@ -600,7 +600,7 @@ fn a_capability_added_for_one_connection_lasts_as_long_as_it() {
         remote: other.clone(),
         with: vec![name("openocd")],
         opener: Opener::Grant,
-        acknowledged: Exposure::NONE,
+        acknowledged: Exposure::SERVICE,
         lends: Lends::none(),
     }));
     assert_eq!(scene.decide_on(with, "openocd", Operation::Connect), SERVED);

@@ -2167,7 +2167,10 @@ impl World<'_> {
             }
             // One added for the connection alone only ever inspects.
             None => match link.filter(|link| link.with.contains(id)) {
-                Some(link) => (Activation::OnRequest, Setup::Inspect, link.lends.clone()),
+                Some(link) => {
+                    acknowledged(&capability, link.acknowledged)?;
+                    (Activation::OnRequest, Setup::Inspect, link.lends.clone())
+                }
                 None => return Err(ungranted()),
             },
         };
@@ -2315,6 +2318,34 @@ impl World<'_> {
             .map_or(link.acknowledged, |terms| terms.acknowledged);
         let network = !acknowledged.common(Exposure::NETWORK).is_empty();
         Some((reached.lends, network))
+    }
+
+    /// What `remote` is lent of capability `id` for what it already carries,
+    /// whether or not a connection stands: what its grants lend, or for a
+    /// capability the person added to the connection, the terms they asked
+    /// for, which the channel comes back with. `None` where neither reaches
+    /// it, it is denied, or it exposes more than those terms name. A
+    /// connection's own terms add nothing: one opened for a withdrawal
+    /// carries none, and any other carries those asked for.
+    pub fn lending_carried(&self, remote: &RemoteId, id: &Name) -> Option<Lends> {
+        match self.reached(remote, None, id) {
+            Ok(reached) => Some(reached.lends),
+            Err(Refusal::NotGranted { .. })
+                if !self.configuration.denies(self.catalogue, id, remote)
+                    && self
+                        .state
+                        .asked(remote)
+                        .is_some_and(|asked| asked.contains(id))
+                    && self.configuration.capability(self.catalogue, id).is_ok_and(
+                        |capability| {
+                            acknowledged(&capability, self.state.asked_terms(remote).0).is_ok()
+                        },
+                    ) =>
+            {
+                Some(self.state.asked_terms(remote).1)
+            }
+            Err(_) => None,
+        }
     }
 
     fn granted(&self, link: &Link, id: &Name) -> Result<Capability, Refusal> {
