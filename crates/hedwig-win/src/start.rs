@@ -314,6 +314,9 @@ impl Environment {
 pub struct Held {
     process: OwnedHandle,
     id: u32,
+    /// The job of its own a client started by [`held`] has inside its
+    /// channel's.
+    own: Option<Job>,
 }
 
 impl Held {
@@ -333,13 +336,17 @@ impl Held {
         Ok(status)
     }
 
-    /// Ends the process with `status`, leaving the rest of its job running.
-    /// A process that has already ended is left as it is.
+    /// Ends the process with `status`, and where [`held`] started it what it
+    /// started too, leaving the rest of its channel's job running. A process
+    /// that has already ended is left as it is.
     ///
     /// # Errors
     ///
     /// What the system said.
     pub fn end(&self, status: u32) -> io::Result<()> {
+        if let Some(own) = &self.own {
+            return own.end_with(status);
+        }
         // SAFETY: the handle is the process this value owns, opened with every
         // right its creator has, terminate among them.
         if unsafe { TerminateProcess(self.process.as_raw_handle(), status) } == 0 {
@@ -368,7 +375,8 @@ impl Held {
 ///
 /// The process is created in the job: it never exists outside it, so nothing
 /// it starts can, and nothing is left behind if this process ends between
-/// two calls.
+/// two calls. It has a job of its own inside `job`, so [`Held::end`] ends what
+/// it started with it, and the end of `job` ends both.
 ///
 /// # Errors
 ///
@@ -381,7 +389,18 @@ pub fn held(
 ) -> io::Result<(Held, PipeReader)> {
     let (errors, errs) = io::pipe()?;
     let nowhere = OpenOptions::new().read(true).write(true).open("NUL")?;
-    let held = within(program, arguments, environment, job, &nowhere, &errs)?;
+    // The system assigns the list in order, which nests the later job in the
+    // earlier.
+    let own = job.within()?;
+    let mut held = within(
+        program,
+        arguments,
+        environment,
+        &[job, &own],
+        &nowhere,
+        &errs,
+    )?;
+    held.own = Some(own);
     Ok((held, errors))
 }
 
@@ -400,7 +419,7 @@ pub fn consulted(
 ) -> io::Result<(Held, PipeReader, PipeReader)> {
     let (said, says) = io::pipe()?;
     let (errors, errs) = io::pipe()?;
-    let held = within(program, arguments, environment, job, &says, &errs)?;
+    let held = within(program, arguments, environment, &[job], &says, &errs)?;
     Ok((held, said, errors))
 }
 
@@ -424,7 +443,7 @@ pub fn fed(
         program,
         arguments,
         environment,
-        Some(job),
+        &[job],
         CREATE_NO_WINDOW,
         [&reads, &says, &errs],
     )?;
@@ -453,20 +472,20 @@ pub fn given(
         program,
         arguments,
         environment,
-        None,
+        &[],
         flags,
         [&reads, &says, &nowhere],
     )?;
     Ok((held, input, said))
 }
 
-/// Creates `program` inside `job` with `output` and `errors` as its standard
+/// Creates `program` inside `jobs` with `output` and `errors` as its standard
 /// handles, nothing to read, and no other handle of this process's.
 fn within(
     program: &Path,
     arguments: &[OsString],
     environment: &Environment,
-    job: &Job,
+    jobs: &[&Job],
     output: &impl AsRawHandle,
     errors: &impl AsRawHandle,
 ) -> io::Result<Held> {
@@ -477,32 +496,32 @@ fn within(
         program,
         arguments,
         environment,
-        Some(job),
+        jobs,
         CREATE_NO_WINDOW,
         handles,
     )
 }
 
 /// Creates `program` with `standard` - its input, output and errors - and no
-/// other handle of this process's, inside `job` where one is given, with
+/// other handle of this process's, inside `jobs` where any are given, with
 /// the creation `flags`.
 fn created(
     program: &Path,
     arguments: &[OsString],
     environment: &Environment,
-    job: Option<&Job>,
+    jobs: &[&Job],
     flags: u32,
     standard: [&dyn AsRawHandle; 3],
 ) -> io::Result<Held> {
     let handles = standard.map(AsRawHandle::as_raw_handle);
-    created_from(program, arguments, environment, job, flags, handles)
+    created_from(program, arguments, environment, jobs, flags, handles)
 }
 
 fn created_from(
     program: &Path,
     arguments: &[OsString],
     environment: &Environment,
-    job: Option<&Job>,
+    jobs: &[&Job],
     flags: u32,
     handles: [HANDLE; 3],
 ) -> io::Result<Held> {
@@ -510,10 +529,7 @@ fn created_from(
         inheritable(handle)?;
     }
     let [input, output, errors] = handles;
-    let jobs: Box<[HANDLE]> = match job {
-        Some(job) => Box::new([job.raw()]),
-        None => Box::new([]),
-    };
+    let jobs: Box<[HANDLE]> = jobs.iter().map(|job| job.raw()).collect();
     let mut only = Only::new(Box::new(handles), jobs)?;
 
     // SAFETY: all-zero is a valid value of the structure, filled in below.
@@ -559,5 +575,6 @@ fn created_from(
     Ok(Held {
         process: owned(started.hProcess)?,
         id: started.dwProcessId,
+        own: None,
     })
 }

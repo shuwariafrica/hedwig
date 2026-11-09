@@ -8,14 +8,17 @@
     reason = "tests"
 )]
 
+use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader, PipeReader};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hedwig_win::clock::elapsed;
 use hedwig_win::power::{Turn, watch};
-use hedwig_win::process::{EndError, Job, end, instance, own};
+use hedwig_win::process::{EndError, Job, Process, end, instance, own};
+use hedwig_win::start::{Environment, held};
 use hedwig_win::token::{Sid, Token};
 use windows_sys::Win32::System::WindowsProgramming::{
     QueryInterruptTime, QueryUnbiasedInterruptTime,
@@ -272,4 +275,69 @@ fn a_job_ends_everything_in_it() {
         "this process is in a job of its starter's: {}",
         hedwig_win::process::in_a_job().unwrap()
     );
+}
+
+fn powershell() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// `-Command` arguments for a client that starts a child of half a minute,
+/// says the child's process number on its errors, and sleeps.
+fn starts_a_child() -> Vec<OsString> {
+    let script = concat!(
+        "$c = Start-Process -FilePath ping.exe -ArgumentList '-n','31','127.0.0.1' ",
+        "-NoNewWindow -PassThru; [Console]::Error.WriteLine($c.Id); Start-Sleep 30",
+    );
+    ["-NoProfile", "-NonInteractive", "-Command", script]
+        .map(OsString::from)
+        .to_vec()
+}
+
+/// The child's process number, which the client said once the child was
+/// started.
+fn childs_number(errors: PipeReader) -> u32 {
+    let mut line = String::new();
+    BufReader::new(errors).read_line(&mut line).unwrap();
+    line.trim().parse().unwrap()
+}
+
+/// Whether the process numbered `child` is gone within the bound.
+fn gone_soon(child: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if Process::open(child).is_err() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// A client ended alone takes what it started with it and leaves the rest of
+/// its channel's job running, all of it still in that job and ended by that
+/// job's end.
+#[test]
+fn a_client_ended_alone_takes_what_it_started_and_leaves_the_rest_of_its_job() {
+    let job = Job::new().unwrap();
+    let environment = Environment::own();
+    let (first, errors) = held(&powershell(), &starts_a_child(), &environment, &job).unwrap();
+    let (second, others) = held(&powershell(), &starts_a_child(), &environment, &job).unwrap();
+    let child = childs_number(errors);
+    let other = childs_number(others);
+    for number in [child, other] {
+        let process = Process::open(number).unwrap();
+        assert!(job.includes(&process).unwrap(), "in the channel's job");
+    }
+
+    first.end(1).unwrap();
+    assert_eq!(first.wait().unwrap(), 1);
+    assert!(gone_soon(child), "what it started ended with it");
+    assert!(!second.finished(), "the rest of the job runs on");
+    assert!(Process::open(other).is_ok(), "the other's child runs on");
+    first.end(1).unwrap();
+
+    job.end().unwrap();
+    assert_eq!(second.wait().unwrap(), hedwig_win::process::ENDED);
+    assert!(gone_soon(other), "the job's end reaches what it nests");
 }

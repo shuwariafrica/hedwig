@@ -58,10 +58,17 @@ pub const LEAVING: u32 = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
 /// not answering.
 pub const ENDED: u32 = 0xc000_013a;
 
-/// A job that ends every process in it when its last handle closes, and that
-/// nothing started inside can leave.
+/// As [`Job::new`] makes one, a job ends every process in it when its last
+/// handle closes, and nothing started inside can leave.
 #[derive(Debug)]
-pub struct Job(OwnedHandle);
+pub struct Job(OwnedHandle, Leaving);
+
+/// Whether a process in a job may start one outside it by asking to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leaving {
+    Refused,
+    Allowed,
+}
 
 impl Job {
     pub fn new() -> io::Result<Job> {
@@ -72,6 +79,18 @@ impl Job {
     /// asking to ([`LEAVING`]). Nothing leaves without asking.
     pub fn leavable() -> io::Result<Job> {
         Job::limited(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+    }
+
+    /// A job to hold one process and what it starts inside this one, to be
+    /// ended apart from it. It ends nothing when its last handle closes. It
+    /// allows leaving as this job does, since the system reads that limit
+    /// from the job a process is immediately in: allowed there, a process
+    /// that asks is moved up only as far as the first job refusing it.
+    pub(crate) fn within(&self) -> io::Result<Job> {
+        Job::limited(match self.1 {
+            Leaving::Allowed => JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            Leaving::Refused => 0,
+        })
     }
 
     fn limited(flags: u32) -> io::Result<Job> {
@@ -94,7 +113,12 @@ impl Job {
         if set == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Job(job))
+        let leaving = if flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK == 0 {
+            Leaving::Refused
+        } else {
+            Leaving::Allowed
+        };
+        Ok(Job(job, leaving))
     }
 
     pub(crate) fn raw(&self) -> HANDLE {
@@ -146,8 +170,13 @@ impl Job {
 
     /// Ends every process in the job with [`ENDED`].
     pub fn end(&self) -> io::Result<()> {
+        self.end_with(ENDED)
+    }
+
+    /// Ends every process in the job with `status`.
+    pub(crate) fn end_with(&self, status: u32) -> io::Result<()> {
         // SAFETY: the handle is a job this value owns.
-        if unsafe { TerminateJobObject(self.0.as_raw_handle(), ENDED) } == 0 {
+        if unsafe { TerminateJobObject(self.0.as_raw_handle(), status) } == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
