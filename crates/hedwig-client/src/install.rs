@@ -242,15 +242,24 @@ pub fn install(framed: &[u8], place: &Place, choices: Choices) -> Result<Install
         .map(|version| version.to_string_lossy().into_owned());
     let installed = place.program.is_dir();
     if installed {
-        if let Err(error) = let_go(place) {
+        let aside = let_go(place)
+            .and_then(|()| fs::rename(&place.program, &previous).map_err(SetupError::Files));
+        if let Err(error) = aside {
             // Nothing was replaced: the version installed runs again.
             let _ = remove_folder(&next);
             let _ = start(place);
             return Err(error);
         }
-        fs::rename(&place.program, &previous).map_err(SetupError::Files)?;
     }
-    fs::rename(&next, &place.program).map_err(SetupError::Files)?;
+    if let Err(error) = fs::rename(&next, &place.program) {
+        // The version installed goes back and runs again.
+        if installed {
+            let _ = fs::rename(&previous, &place.program);
+            let _ = start(place);
+        }
+        let _ = remove_folder(&next);
+        return Err(SetupError::Files(error));
+    }
 
     let started = start_and_verify(place, &index);
     if let Err(error) = started {

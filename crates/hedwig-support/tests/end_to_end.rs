@@ -11,18 +11,20 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hedwig_client::install::{Choices, Place, SetupError, install};
 use hedwig_client::{
     LaunchError, OpenError, Session, SessionError, Standing, launch, look, released_within, stop,
 };
 use hedwig_core::record::{Claim, ClaimError};
 use hedwig_core::store::Places;
 use hedwig_model::config::{Catalogue, Change, Configuration, Effect};
-use hedwig_model::install::{AtSignIn, Names, Starts};
+use hedwig_model::install::{AtSignIn, Index, Names, Packed, Starts, frame};
 use hedwig_model::process::{CoreState, Diagnostic, Exit, Instance, Running};
 use hedwig_model::protocol::{Attention, Bundle, Needs, Notice, Reply, Request, Status};
 use hedwig_model::remote::Remotes;
@@ -36,9 +38,13 @@ use hedwig_support::Folder;
 use hedwig_support::lower::{Level, Lowered, as_restricted};
 use hedwig_support::met;
 use hedwig_win::Signal;
+use hedwig_win::pack::compress;
 use hedwig_win::pipe::{Listener, Moved};
 use hedwig_win::registry::{RUN, own, remove_value};
 use hedwig_win::token::{Sid, Token};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 
 /// An executable built beside the suite's own.
 fn built(name: &str) -> PathBuf {
@@ -1082,4 +1088,61 @@ fn a_supporter_is_given_what_hedwig_knows_in_one_bundle() {
     assert_eq!(own(RUN, &names.run_value(Starts::Hedwig)).unwrap(), None);
 
     stopped(folder.path());
+}
+
+/// Something holding the folder of the version installed as setup moves it
+/// aside - a scanner reading it after nothing was found holding a file -
+/// leaves that version in place, started again.
+#[test]
+#[ignore = "needs a session at medium integrity"]
+fn a_version_installed_that_cannot_be_moved_aside_is_started_again() {
+    let folder = Folder::new("aside");
+    let program = folder.path().join("Hedwig");
+    let data = folder.path().join("data");
+    fs::create_dir_all(&program).unwrap();
+    let hedwig = program.join(Starts::Hedwig.program());
+    fs::copy(built("hedwig.exe"), &hedwig).unwrap();
+    let names = Names::keyed(&data.to_string_lossy());
+    let _taken = Taken(names.clone());
+    let arguments = [
+        OsString::from("supervise"),
+        OsString::from("--folder"),
+        data.clone().into_os_string(),
+    ];
+    launch(&hedwig, &arguments).unwrap();
+    until(&data, |standing| serving(standing).is_some());
+    let place = Place {
+        names,
+        program: program.clone(),
+        data: Some(data.clone()),
+    };
+    let placed = b"placed";
+    let index = Index {
+        version: "0.0.0".to_owned(),
+        files: vec![Packed {
+            path: Starts::Hedwig.program().to_owned(),
+            bytes: u64::try_from(placed.len()).unwrap(),
+        }],
+    };
+    let payload = frame(&index, &compress(placed).unwrap());
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&program)
+        .unwrap();
+
+    let refused = install(&payload, &place, Choices { at_logon: false });
+    drop(held);
+
+    assert!(matches!(refused, Err(SetupError::Files(_))), "{refused:?}");
+    until(&data, |standing| serving(standing).is_some());
+    assert_eq!(
+        fs::read(&hedwig).unwrap(),
+        fs::read(built("hedwig.exe")).unwrap()
+    );
+    for beside in ["Hedwig.next", "Hedwig.previous"] {
+        assert!(!folder.path().join(beside).exists(), "{beside}");
+    }
+    stopped(&data);
 }
