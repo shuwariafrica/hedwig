@@ -35,8 +35,9 @@ pub enum Exit {
     Link,
     /// The control pipe could not be created.
     Pipe,
-    /// Hedwig was removed and left something on a remote it could not reach,
-    /// which the removal named.
+    /// Hedwig was removed, and something it wrote may still be on a remote:
+    /// what it could not take back, which the removal named, or anything at
+    /// all where it could not be asked what it wrote.
     Unreached,
 }
 

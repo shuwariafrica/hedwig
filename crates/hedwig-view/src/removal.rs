@@ -146,11 +146,7 @@ pub fn removed(remotes: &[Withdrawal], aside: &str) -> Card {
              it by hand. ",
         );
     }
-    let _ = write!(
-        says,
-        "Nothing of Hedwig's is left on this workstation but {aside}, the program that removed \
-         it, in your temporary folder, which Windows' own clean-up removes."
-    );
+    says.push_str(&workstation(aside));
     let facts = left
         .iter()
         .map(|remote| {
@@ -171,6 +167,30 @@ pub fn removed(remotes: &[Withdrawal], aside: &str) -> Card {
         "Hedwig is removed, and some remotes still hold what it wrote"
     };
     card(heading, says, facts, choices)
+}
+
+/// What removal says when it is done after Hedwig could not be asked what it
+/// wrote and the person removed it anyway: nothing on a remote was taken
+/// back, and what is left there is not known.
+pub fn removed_unasked(aside: &str) -> Card {
+    card(
+        "Hedwig is removed, and nothing on your remotes was taken back",
+        format!(
+            "Hedwig could not be asked what it wrote on your remotes, so none of it was taken \
+             back and what is left there is not known. {}",
+            workstation(aside)
+        ),
+        Vec::new(),
+        vec![choice("Close", Does::Cancel)],
+    )
+}
+
+/// The one file removal leaves on this workstation, `aside`.
+fn workstation(aside: &str) -> String {
+    format!(
+        "Nothing of Hedwig's is left on this workstation but {aside}, the program that removed \
+         it, in your temporary folder, which Windows' own clean-up removes."
+    )
 }
 
 /// What is left on each remote, as the person copies it: a remote a line,

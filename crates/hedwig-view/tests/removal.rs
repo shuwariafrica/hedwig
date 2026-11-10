@@ -130,8 +130,9 @@ fn nothing_is_offered_while_hedwig_works() {
 }
 
 /// At the end, what was not taken back is named per remote with why, and
-/// can be copied; where everything was, closing is the one answer. Either
-/// way the one file left on this workstation is named.
+/// can be copied; where everything was, closing is the one answer; where
+/// Hedwig could not be asked, nothing was taken back and nothing is known to
+/// copy. Each way the one file left on this workstation is named.
 #[test]
 fn what_could_not_be_taken_back_is_named_with_why_and_copied() {
     let mut taken = remotes();
@@ -187,6 +188,26 @@ fn what_could_not_be_taken_back_is_named_with_why_and_copied() {
         removal::left_text(&left),
         "gone.example (ssh)\n  no-autostart in /home/ops/.gnupg/common.conf\n\
          slow.example (ssh)\n  no-autostart in /home/slow/.gnupg/common.conf\n"
+    );
+
+    let unasked = removal::removed_unasked("hedwig-removed-4120.exe");
+    assert_eq!(
+        unasked.heading,
+        "Hedwig is removed, and nothing on your remotes was taken back"
+    );
+    assert!(unasked.facts.is_empty(), "{:?}", unasked.facts);
+    assert_eq!(answers(&unasked), [("Close", &Does::Cancel)]);
+    let says = unasked.says.as_deref().unwrap();
+    assert!(
+        says.starts_with(
+            "Hedwig could not be asked what it wrote on your remotes, so none of it was taken \
+             back and what is left there is not known. "
+        ),
+        "{says}"
+    );
+    assert!(
+        says.contains("but hedwig-removed-4120.exe, the program that removed it"),
+        "{says}"
     );
 }
 
