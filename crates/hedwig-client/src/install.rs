@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hedwig_model::install::{
-    Index, Names, PackError, Placement, Starts, files, placement, unframe,
+    Index, Names, PackError, Placement, Starts, files, placement, starts_from, unframe,
 };
 use hedwig_model::process::{CoreState, Exit, RECORD};
 use hedwig_model::protocol::{PROTOCOL, Reply, Request, Withdrawal};
@@ -589,10 +589,10 @@ pub fn withdraw(place: &Place, kind: ClientKind) -> Result<Removed, SetupError> 
 
 /// The last part of a removal, run by the installed `hedwig.exe` itself:
 /// stops Hedwig, asks its icon and window to close, and removes the `Run`
-/// values, the Start entry, the entry Windows lists it under, its folders
-/// and its program folder. Its own file, which Windows does not let a
-/// running program remove, is moved into the person's temporary folder,
-/// where it stays as a temporary file.
+/// values that start it, the Start entry, the entry Windows lists it under,
+/// its folders and its program folder. Its own file, which Windows does not
+/// let a running program remove, is moved into the person's temporary
+/// folder, where it stays as a temporary file.
 ///
 /// # Errors
 ///
@@ -628,8 +628,16 @@ pub fn finish(place: &Place) -> Result<PathBuf, SetupError> {
             thread::sleep(Duration::from_millis(100));
         }
     }
+    // An earlier release starts under the same value name, from its own
+    // folder.
+    let folder = place.program.to_str();
     for starts in Starts::ALL {
-        remove_value(RUN, &place.names.run_value(starts)).map_err(SetupError::Registry)?;
+        let value = place.names.run_value(starts);
+        let current = own(RUN, &value).map_err(SetupError::Registry)?;
+        if current.is_some_and(|command| folder.is_some_and(|folder| starts_from(&command, folder)))
+        {
+            remove_value(RUN, &value).map_err(SetupError::Registry)?;
+        }
     }
     remove_key(&place.entry()).map_err(SetupError::Registry)?;
     if let Ok(start) = hedwig_win::folder::start_menu() {
@@ -753,6 +761,37 @@ mod tests {
         );
         let theirs = Path::new(r"D:\work\hedwig-data");
         assert_eq!(vendor(&place(program, Some(theirs)), theirs), None);
+    }
+
+    /// A `Run` value of this installation's name that starts a program in
+    /// another folder - an earlier release's, under the same name - is that
+    /// program's, and outlives the removal.
+    #[test]
+    fn removal_takes_away_only_the_run_values_that_start_this_installation() {
+        let root = std::env::temp_dir().join(format!("hedwig-client-run-{}", std::process::id()));
+        let program = root.join("Hedwig");
+        fs::create_dir_all(&program).expect("a folder");
+        fs::write(program.join(Starts::Hedwig.program()), b"").expect("a file");
+        let place = place(&program, Some(&root.join("data")));
+        let elsewhere = OsString::from(r#""C:\Tools\hedwig-0.1.0\hedwig.exe" tray"#);
+        let ours = place
+            .names
+            .run_command(program.to_str().expect("text"), Starts::Icon);
+        let [hedwig, icon] = Starts::ALL.map(|starts| place.names.run_value(starts));
+        set_text(RUN, &hedwig, &elsewhere).expect("written");
+        set_text(RUN, &icon, OsStr::new(&ours)).expect("written");
+
+        let finished = finish(&place);
+        let left = [own(RUN, &hedwig), own(RUN, &icon)];
+        for value in [&hedwig, &icon] {
+            let _ = remove_value(RUN, value);
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        finished.expect("removed");
+        let [hedwig, icon] = left.map(|value| value.expect("read"));
+        assert_eq!(hedwig, Some(elsewhere));
+        assert_eq!(icon, None);
     }
 
     /// A setup program built with nothing to install says so, whatever runs

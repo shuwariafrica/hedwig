@@ -2,6 +2,7 @@
 //! one. No Windows call: the setup program and the core resolve the folders
 //! and write the values; this module says what they are.
 
+use std::ffi::OsStr;
 use std::fmt;
 
 use crate::text::Words;
@@ -163,6 +164,16 @@ pub fn key(folder: &str) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// Whether `command`, a `Run` value's, starts a program in the folder
+/// `program` as [`Names::run_command`] writes one, the folder's name compared
+/// without case as Windows compares it.
+pub fn starts_from(command: &OsStr, program: &str) -> bool {
+    let quoted = format!("\"{program}\\").to_lowercase();
+    command
+        .to_str()
+        .is_some_and(|command| command.to_lowercase().starts_with(&quoted))
 }
 
 /// Why a program folder cannot hold Hedwig.

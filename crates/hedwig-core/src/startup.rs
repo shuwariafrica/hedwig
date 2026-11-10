@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 
-use hedwig_model::install::{AtSignIn, Names, Placement, Starts, placement};
+use hedwig_model::install::{AtSignIn, Names, Placement, Starts, placement, starts_from};
 use hedwig_model::setting::Autostart;
 use hedwig_model::text::Words;
 use hedwig_win::registry::{RUN, own, remove_value, set_text};
@@ -111,7 +111,7 @@ fn kept(
         return Ok(AtSignIn::AsChosen);
     }
     match current {
-        Some(command) if !names_folder(&command, folder) => {
+        Some(command) if !starts_from(&command, folder) => {
             Ok(AtSignIn::Another(words(&command.to_string_lossy())))
         }
         Some(_) => {
@@ -129,13 +129,4 @@ fn unstarted(chosen: Autostart) -> AtSignIn {
         Autostart::AtLogon => AtSignIn::Absent,
         Autostart::Off => AtSignIn::AsChosen,
     }
-}
-
-/// Whether `command` starts a program in `folder`, as [`Names::run_command`]
-/// writes one.
-fn names_folder(command: &OsStr, folder: &str) -> bool {
-    let quoted = format!("\"{folder}\\").to_lowercase();
-    command
-        .to_str()
-        .is_some_and(|command| command.to_lowercase().starts_with(&quoted))
 }
