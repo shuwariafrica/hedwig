@@ -33,7 +33,8 @@ jobs:
 
       # A tag release.ps1 made: annotated, and signed by a key GitHub
       # verifies. main's checks are not strict, so main's head may be a merge
-      # no run tested; the full ci run below tests this commit itself.
+      # no run tested; the full ci run below tests this commit itself. Every
+      # job builds the commit the push named, so the tag must still name it.
       - name: Verify the tag
         id: tag
         env:
@@ -41,7 +42,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          : "${GH_TOKEN:?}" "${REPOSITORY:?}" "${TAG:?}" "${GITHUB_OUTPUT:?}"
+          : "${GH_TOKEN:?}" "${REPOSITORY:?}" "${TAG:?}" "${GITHUB_OUTPUT:?}" "${GITHUB_SHA:?}"
           ref=$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha')
           read -r kind object <<<"${ref}"
           if [[ "${kind}" != tag ]]; then
@@ -54,6 +55,10 @@ jobs:
             exit 1
           fi
           commit=$(gh api "repos/${REPOSITORY}/git/tags/${object}" --jq '.object.sha')
+          if [[ "${commit}" != "${GITHUB_SHA}" ]]; then
+            printf '::error title=tag::%s names %s, but this run was started for %s\n' "${TAG}" "${commit}" "${GITHUB_SHA}"
+            exit 1
+          fi
           printf 'commit=%s\n' "${commit}" >>"${GITHUB_OUTPUT}"
 
       # On main's first-parent line, so never a commit of a branch main merged,

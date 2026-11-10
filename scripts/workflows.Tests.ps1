@@ -59,6 +59,11 @@ Describe 'release.yml' {
         ($steps | Where-Object { $_.name -eq 'Check out' }).with['fetch-depth'] | Should -Be 0
         ($steps | Where-Object { $_.name -eq 'Verify the commit' }).run | Should -Match 'assert-release-commit\.ps1'
     }
+
+    It 'admits only the commit the run builds, which the tag names when the run starts' {
+        $verify = $jobs['tag'].steps | Where-Object { $_.name -eq 'Verify the tag' }
+        $verify.run | Should -Match '"\$\{commit\}" != "\$\{GITHUB_SHA\}"'
+    }
 }
 
 Describe 'every workflow' {
