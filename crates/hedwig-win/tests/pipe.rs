@@ -14,7 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hedwig_win::Signal;
-use hedwig_win::pipe::{INSTANCES, Listener, Moved, OpenError, Pipe, open};
+use hedwig_win::pipe::{
+    INSTANCES, Listener, Moved, OpenError, Pipe, canonical, exists, name_in, open, same_name,
+};
 use hedwig_win::token::{Sid, Token};
 
 fn path(purpose: &str) -> String {
@@ -236,4 +238,102 @@ fn the_server_reads_the_client_and_cannot_act_as_it() {
     // After reading the client the thread is itself again: it can still do
     // what only its own identity may.
     assert_eq!(Token::own().unwrap().user().unwrap(), me());
+}
+
+/// A path reads as the name of the pipe Windows would make of it; nothing
+/// where it is no pipe's.
+#[test]
+fn a_path_names_the_pipe_windows_would_make_of_it() {
+    for (path, name) in [
+        (r"\\.\pipe\x", "x"),
+        ("//./pipe/x", "x"),
+        (r"\\?\pipe\y", "y"),
+        (r"\\.\PIPE\Mixed", "Mixed"),
+        (r"\\.\pipe\\z", "z"),
+        (r"\\.\pipe\v.", "v"),
+        (r"\\.\pipe\s ", "s"),
+        (r"\\.\pipe\a/b", r"a\b"),
+    ] {
+        assert_eq!(name_in(path).unwrap().as_deref(), Some(name), "{path}");
+    }
+    for path in [r"C:\not-a-pipe", "", r"\\.\pipe\"] {
+        assert_eq!(name_in(path).unwrap(), None, "{path:?}");
+    }
+    assert_eq!(canonical("a/b"), r"a\b");
+    assert_eq!(canonical("x."), "x");
+    assert_eq!(
+        canonical("../x"),
+        "../x",
+        "what makes no pipe stays as it is spelt"
+    );
+}
+
+#[test]
+fn a_path_through_the_object_namespace_names_its_pipe() {
+    assert_eq!(name_in(r"\??\pipe\x").unwrap().as_deref(), Some("x"));
+    assert_eq!(name_in(r"\??\PIPE\X").unwrap().as_deref(), Some("X"));
+}
+
+#[test]
+fn a_global_root_path_through_the_device_namespace_names_its_pipe() {
+    let path = r"\\.\GLOBALROOT\Device\NamedPipe\x";
+    assert_eq!(name_in(path).unwrap().as_deref(), Some("x"));
+    let folded = r"\\.\globalroot\device\namedpipe\x";
+    assert_eq!(name_in(folded).unwrap().as_deref(), Some("x"));
+}
+
+#[test]
+fn a_global_root_path_through_the_literal_namespace_names_its_pipe() {
+    let path = r"\\?\GLOBALROOT\Device\NamedPipe\x";
+    assert_eq!(name_in(path).unwrap().as_deref(), Some("x"));
+    let folded = r"\\?\globalroot\device\namedpipe\x";
+    assert_eq!(name_in(folded).unwrap().as_deref(), Some("x"));
+}
+
+#[test]
+fn a_path_windows_will_not_read_is_told_from_one_that_is_no_pipes() {
+    assert!(name_in(&format!(r"\\.\pipe\{}", "x".repeat(40_000))).is_err());
+}
+
+/// Windows folds case a character at a time, never one character into two.
+#[test]
+fn a_pipe_name_is_compared_as_windows_compares_one() {
+    assert!(same_name("Mixed", "mIXED"));
+    assert!(same_name("\u{e9}a", "\u{c9}A"), "case beyond ASCII");
+    assert!(
+        !same_name("\u{df}", "SS"),
+        "one character is never two when folded"
+    );
+    assert!(!same_name("mine", "other"));
+}
+
+/// The system's table decides, where Rust's would differ from it either way.
+#[test]
+fn a_pipe_name_is_folded_by_the_systems_own_table() {
+    assert!(same_name("\u{1fb3}", "\u{1fbc}"), "one pipe to the system");
+    assert!(!same_name("\u{131}", "I"), "two pipes to the system");
+}
+
+/// The list of pipes finds a pipe under every spelling Windows reads as its
+/// name, and only those.
+#[test]
+fn a_pipe_is_found_under_every_spelling_windows_reads_as_its_name() {
+    let plain = path("spell\u{e9}");
+    let (_listener, _server) = Listener::bind(&plain, &me()).unwrap();
+    let name = plain.strip_prefix(r"\\.\pipe\").unwrap();
+    for spelt in [
+        name.to_owned(),
+        name.to_uppercase(),
+        format!("{name}."),
+        format!("{name} "),
+    ] {
+        assert!(exists(&spelt).unwrap(), "{spelt}");
+    }
+    assert!(!exists(&format!("{name}-other")).unwrap());
+    // Windows refuses a name beneath a pipe that exists, so this parent is none.
+    let parent = path("spelling-parent");
+    let inner = format!(r"{parent}\sub");
+    let (_inner_listener, _inner_server) = Listener::bind(&inner, &me()).unwrap();
+    let parent = parent.strip_prefix(r"\\.\pipe\").unwrap();
+    assert!(exists(&format!("{parent}/sub")).unwrap());
 }

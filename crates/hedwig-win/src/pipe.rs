@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA,
-    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
-    ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE, TRUE, WAIT_OBJECT_0,
+    ERROR_NO_MORE_FILES, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
 };
+use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
@@ -27,8 +29,9 @@ use windows_sys::Win32::Security::{
     RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FindClose, FindFirstFileW,
+    FindNextFileW, GetFullPathNameW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
+    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WIN32_FIND_DATAW, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -486,9 +489,9 @@ pub const RETRY: Duration = Duration::from_millis(50);
 /// every [`RETRY`]. A server that makes one instance after another and takes
 /// a client arriving between making an instance and waiting on it for an
 /// error stops serving the name altogether - gpg-agent 2.5.24's Win32-OpenSSH
-/// thread does (`agent/gpg-agent.c:2805-2811`) - and that gap is exactly when
+/// thread does (`agent/gpg-agent.c:2804-2809`) - and that gap is exactly when
 /// a waiting client wakes. The same server closes each instance before it
-/// makes the next (`agent/gpg-agent.c:2856`, then `:2789`), so for a moment
+/// makes the next (`agent/gpg-agent.c:2856`, then `:2791`), so for a moment
 /// the name does not exist: a pipe found absent is tried once more after
 /// [`RETRY`], far longer than that gap, before it is said to be absent.
 pub fn open_unwaited(path: &str, patience: Duration) -> Result<Pipe, OpenError> {
@@ -522,6 +525,152 @@ pub fn open_unwaited(path: &str, patience: Duration) -> Result<Pipe, OpenError> 
                 _ => return Err(OpenError::Other(error)),
             },
         }
+    }
+}
+
+/// Forms of a pipe's path the system opens as that pipe and
+/// `GetFullPathNameW` does not read as one.
+const NATIVE_PREFIXES: [&str; 3] = [
+    r"\??\pipe\",
+    r"\\.\GLOBALROOT\Device\NamedPipe\",
+    r"\\?\GLOBALROOT\Device\NamedPipe\",
+];
+
+/// What follows `prefix` in `path`, the prefix's case ignored, where anything
+/// does.
+fn after_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    path.get(..prefix.len())
+        .filter(|start| start.eq_ignore_ascii_case(prefix))?;
+    path.get(prefix.len()..).filter(|name| !name.is_empty())
+}
+
+/// The name of the pipe `path` makes, as Windows itself reads `path`, or
+/// nothing where `path` is no pipe's. No pipe is looked at.
+///
+/// # Errors
+///
+/// What the system said where it would not read `path`.
+pub fn name_in(path: &str) -> io::Result<Option<String>> {
+    if let Some(name) = NATIVE_PREFIXES
+        .iter()
+        .find_map(|prefix| after_prefix(path, prefix))
+    {
+        return Ok(Some(name.to_owned()));
+    }
+    // The call refuses an empty path, which names nothing.
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let path = wide(path);
+    // SAFETY: `path` is NUL-terminated; a length of zero writes nothing.
+    let needed =
+        unsafe { GetFullPathNameW(path.as_ptr(), 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut full = vec![0u16; needed as usize];
+    // SAFETY: `path` is NUL-terminated and `full` holds `needed` units.
+    let written = unsafe {
+        GetFullPathNameW(
+            path.as_ptr(),
+            needed,
+            full.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    let full = full
+        .get(..written as usize)
+        .filter(|full| !full.is_empty())
+        .ok_or_else(io::Error::last_os_error)?;
+    let full = String::from_utf16_lossy(full);
+    Ok([r"\\.\pipe\", r"\\?\pipe\"]
+        .iter()
+        .find_map(|prefix| after_prefix(&full, prefix).map(str::to_owned)))
+}
+
+/// `name`, as it follows `\\.\pipe\`, as Windows reads it there.
+#[must_use]
+pub fn canonical(name: &str) -> String {
+    name_in(&format!(r"\\.\pipe\{name}"))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// Whether two names in the form [`canonical`] gives are one pipe's, by the
+/// operating system's own table of case.
+#[must_use]
+pub fn same_name(one: &str, other: &str) -> bool {
+    let units = |name: &str| name.encode_utf16().collect::<Vec<u16>>();
+    let (one, other) = (units(one), units(other));
+    let length = |name: &[u16]| i32::try_from(name.len()).unwrap_or(i32::MAX);
+    // SAFETY: each pointer and length describe a live run of UTF-16 units.
+    let compared = unsafe {
+        CompareStringOrdinal(
+            one.as_ptr(),
+            length(&one),
+            other.as_ptr(),
+            length(&other),
+            TRUE,
+        )
+    };
+    compared == CSTR_EQUAL
+}
+
+/// Whether a pipe named `name` exists now, by the file system's list of
+/// pipes. Nothing connects to it, so a server that treats a client it did not
+/// wait for as an error is not disturbed by the asking.
+///
+/// # Errors
+///
+/// What the system said when the list could not be read.
+pub fn exists(name: &str) -> io::Result<bool> {
+    let name = canonical(name);
+    let pattern = wide(r"\\.\pipe\*");
+    // SAFETY: all-zero is a valid record, written by the calls below.
+    let mut found: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    // SAFETY: `pattern` is NUL-terminated and `found` a valid out pointer.
+    let handle = unsafe { FindFirstFileW(pattern.as_ptr(), &raw mut found) };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        return if code(&error) == ERROR_FILE_NOT_FOUND {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let listing = Listing(handle);
+    loop {
+        let units = &found.cFileName;
+        let length = units
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(units.len());
+        if same_name(
+            &String::from_utf16_lossy(units.get(..length).unwrap_or_default()),
+            &name,
+        ) {
+            return Ok(true);
+        }
+        // SAFETY: the listing is open and `found` a valid out pointer.
+        if unsafe { FindNextFileW(listing.0, &raw mut found) } == 0 {
+            let error = io::Error::last_os_error();
+            return if code(&error) == ERROR_NO_MORE_FILES {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+    }
+}
+
+/// An open listing of the pipes, closed when dropped.
+struct Listing(HANDLE);
+
+impl Drop for Listing {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `FindFirstFileW` and is closed once.
+        unsafe { FindClose(self.0) };
     }
 }
 

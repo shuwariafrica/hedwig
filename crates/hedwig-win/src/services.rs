@@ -9,11 +9,15 @@
 
 use std::io;
 
+use crate::raw::{code, wide};
 use crate::token::wide_length;
 
+use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW, OpenSCManagerW,
-    SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_ACTIVE, SERVICE_WIN32,
+    OpenServiceW, QueryServiceStatus, SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_CONNECT,
+    SC_MANAGER_ENUMERATE_SERVICE, SERVICE_ACTIVE, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+    SERVICE_STATUS, SERVICE_WIN32,
 };
 
 /// The service control manager, opened to list services and closed when
@@ -25,6 +29,42 @@ impl Drop for Manager {
         // SAFETY: the handle was opened by `OpenSCManagerW` and is closed once.
         unsafe { CloseServiceHandle(self.0) };
     }
+}
+
+/// Whether the service named `service` is running now; `false` for one not
+/// installed. Asked with the rights any account holds.
+///
+/// # Errors
+///
+/// What the system said when it could not be asked.
+pub fn is_running(service: &str) -> io::Result<bool> {
+    // SAFETY: null names the local machine and its active database; the
+    // right asked for is the one any account holds.
+    let opened = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if opened.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let manager = Manager(opened);
+    let name = wide(service);
+    // SAFETY: the manager is open and `name` NUL-terminated.
+    let opened = unsafe { OpenServiceW(manager.0, name.as_ptr(), SERVICE_QUERY_STATUS) };
+    if opened.is_null() {
+        let error = io::Error::last_os_error();
+        return if code(&error) == ERROR_SERVICE_DOES_NOT_EXIST {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let service = Manager(opened);
+    // SAFETY: all-zero is a valid status, overwritten below.
+    let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    // SAFETY: the service is open with the right to query it, and `status`
+    // a valid place for the answer.
+    if unsafe { QueryServiceStatus(service.0, &raw mut status) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(status.dwCurrentState == SERVICE_RUNNING)
 }
 
 /// The services the service control manager runs in `process` now, by

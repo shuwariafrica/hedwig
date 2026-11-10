@@ -257,6 +257,21 @@ fn a_process_is_told_from_another_with_the_same_number() {
 }
 
 #[test]
+fn a_process_opened_has_ended_only_once_it_has() {
+    let mut child = Command::new(std::env::var_os("ComSpec").unwrap())
+        .args(["/c", "pause"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let process = Process::open(child.id()).unwrap();
+    assert!(!process.has_ended());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(process.has_ended());
+}
+
+#[test]
 fn a_job_ends_everything_in_it() {
     let job = Job::new().unwrap();
     let mut child = Command::new(std::env::var_os("ComSpec").unwrap())

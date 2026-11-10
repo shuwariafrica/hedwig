@@ -11,9 +11,12 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::process::Child;
 
+use windows_sys::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessCommandLineInformation,
+};
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    SetHandleInformation,
+    ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES, FILETIME, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, RtlNtStatusToDosError, SetHandleInformation, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
 use windows_sys::Win32::System::Console::{
@@ -21,6 +24,9 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
@@ -33,9 +39,10 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     QueryFullProcessImageNameW, TerminateProcess,
 };
+use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
-use crate::raw::{code, owned};
-use crate::token::Token;
+use crate::raw::{Local, code, owned};
+use crate::token::{Token, wide_length};
 
 /// Creation flags for a process that must outlive the terminal that starts
 /// it: no console of its parent's, no share in its parent's Ctrl+C.
@@ -220,6 +227,98 @@ impl Process {
         Ok(PathBuf::from(OsString::from_wide(units)))
     }
 
+    /// The moment the process was created, which with its number names it
+    /// and no other.
+    ///
+    /// # Errors
+    ///
+    /// What the system said when the process's times could not be read.
+    pub fn started(&self) -> io::Result<u64> {
+        created(self.0.as_raw_handle())
+    }
+
+    /// Whether the process has ended, known only where the system says so.
+    #[must_use]
+    pub fn has_ended(&self) -> bool {
+        status_of(&self.0).is_some_and(|status| status != STILL_ACTIVE)
+    }
+
+    /// The arguments it was started with, the program's name first, split as
+    /// a Windows program splits its own.
+    ///
+    /// # Errors
+    ///
+    /// What the system said: the process has ended, or Windows does not let
+    /// this one read them.
+    pub fn arguments(&self) -> io::Result<Vec<String>> {
+        // The size is asked first: a command line is at most 32,767 units,
+        // but a process may have been given a longer block of its own.
+        let mut needed = 0u32;
+        // SAFETY: a null buffer of no length, with a valid place for the
+        // length the system needs.
+        unsafe {
+            NtQueryInformationProcess(
+                self.0.as_raw_handle(),
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &raw mut needed,
+            );
+        }
+        // In eight-byte units, so the structure at its start is aligned.
+        let mut block = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        let size = u32::try_from(block.len() * 8).unwrap_or(u32::MAX);
+        // SAFETY: `block` is `size` writable bytes, aligned for the
+        // `UNICODE_STRING` the system writes at its start.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.0.as_raw_handle(),
+                ProcessCommandLineInformation,
+                block.as_mut_ptr().cast(),
+                size,
+                &raw mut needed,
+            )
+        };
+        if status < 0 {
+            // SAFETY: a plain conversion of a status code.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(code.cast_signed()));
+        }
+        // SAFETY: on success the block starts with a `UNICODE_STRING`.
+        let text = unsafe { &*block.as_ptr().cast::<UNICODE_STRING>() };
+        if text.Buffer.is_null() {
+            return Ok(Vec::new());
+        }
+        // SAFETY: the buffer, not null, holds `Length` bytes inside the block.
+        let line = unsafe { std::slice::from_raw_parts(text.Buffer, usize::from(text.Length) / 2) };
+        let line: Vec<u16> = line.iter().copied().chain([0]).collect();
+        let mut count = 0;
+        // SAFETY: `line` is NUL-terminated and `count` a valid out pointer;
+        // the memory returned is freed by `Local`.
+        let split = unsafe { CommandLineToArgvW(line.as_ptr(), &raw mut count) };
+        if split.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let held = Local(split.cast());
+        let count = usize::try_from(count).unwrap_or_default();
+        // SAFETY: `split` points at `count` pointers, alive until `held` is
+        // dropped.
+        let pointers = unsafe { std::slice::from_raw_parts(split, count) };
+        let arguments = pointers
+            .iter()
+            .map(|&argument| {
+                // SAFETY: a NUL-terminated string, alive until `held` is
+                // dropped.
+                let length = unsafe { wide_length(argument) };
+                // SAFETY: the `length` units before its NUL.
+                let units = unsafe { std::slice::from_raw_parts(argument, length) };
+                String::from_utf16_lossy(units)
+            })
+            .collect();
+        drop(held);
+        Ok(arguments)
+    }
+
     /// The token the process runs with, to be read.
     pub fn token(&self) -> io::Result<Token> {
         let mut handle: HANDLE = std::ptr::null_mut();
@@ -272,6 +371,54 @@ fn created(process: HANDLE) -> io::Result<u64> {
     Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
 }
 
+/// The number of each process running from a file named `image`, its case
+/// ignored as a file's name is, the system's own list read once.
+///
+/// # Errors
+///
+/// What the system said when the list could not be taken.
+pub fn instances_of(image: &str) -> io::Result<Vec<u32>> {
+    // SAFETY: a snapshot of every process, tied to no process of ours.
+    let snapshot = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
+    // SAFETY: all-zero is a valid entry; its size is set before it is used.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = u32::try_from(size_of::<PROCESSENTRY32W>()).unwrap_or(u32::MAX);
+    let mut found = Vec::new();
+    // SAFETY: `snapshot` is open and `entry` valid, its size set.
+    let mut more = unsafe { Process32FirstW(snapshot.as_raw_handle(), &raw mut entry) } != 0;
+    if !more {
+        at_its_end(io::Error::last_os_error())?;
+    }
+    while more {
+        let name = entry.szExeFile;
+        let length = name
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(name.len());
+        if String::from_utf16_lossy(name.get(..length).unwrap_or_default())
+            .eq_ignore_ascii_case(image)
+        {
+            found.push(entry.th32ProcessID);
+        }
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot.as_raw_handle(), &raw mut entry) } != 0;
+        if !more {
+            at_its_end(io::Error::last_os_error())?;
+        }
+    }
+    Ok(found)
+}
+
+/// `Ok` where the walk of a snapshot stopped because there is no more of it:
+/// a list cut short by anything else would read as agents not running.
+fn at_its_end(error: io::Error) -> io::Result<()> {
+    if error.raw_os_error() == i32::try_from(ERROR_NO_MORE_FILES).ok() {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 /// This process's number and the moment it was created, which together name
 /// it and no other.
 pub fn own() -> io::Result<(u32, u64)> {
@@ -285,14 +432,20 @@ pub fn instance(child: &Child) -> io::Result<(u32, u64)> {
     Ok((child.id(), created(child.as_raw_handle())?))
 }
 
-/// Whether the process behind `handle` has yet to end.
-fn running(handle: &OwnedHandle) -> bool {
-    /// What the system reports as the status of a process that has not ended.
-    const STILL_ACTIVE: u32 = 259;
+/// What the system reports as the status of a process that has not ended.
+const STILL_ACTIVE: u32 = 259;
+
+/// The status of the process behind `handle`, where it can be asked.
+fn status_of(handle: &OwnedHandle) -> Option<u32> {
     let mut status = 0u32;
     // SAFETY: the handle may query the process; `status` is writable.
     let asked = unsafe { GetExitCodeProcess(handle.as_raw_handle(), &raw mut status) };
-    asked != 0 && status == STILL_ACTIVE
+    (asked != 0).then_some(status)
+}
+
+/// Whether the process behind `handle` has yet to end.
+fn running(handle: &OwnedHandle) -> bool {
+    status_of(handle) == Some(STILL_ACTIVE)
 }
 
 /// Why a process could not be ended.
@@ -382,4 +535,15 @@ pub fn take_output() -> Option<File> {
     // SAFETY: the handle is open, and with the slot cleared the file is its
     // only owner.
     Some(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_walk_of_a_snapshot_cut_short_is_an_error_and_its_end_is_not() {
+        assert!(at_its_end(io::Error::from_raw_os_error(18)).is_ok());
+        assert!(at_its_end(io::Error::from_raw_os_error(5)).is_err());
+    }
 }
