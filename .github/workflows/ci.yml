@@ -74,6 +74,17 @@ jobs:
         id: build
         run: cargo build --workspace --release --locked --target $env:TARGET
 
+      # Before any step runs what the build placed: the suites start
+      # hedwig-window.exe beside the runtime this checks.
+      - name: Lay out setup's payload
+        run: |
+          Set-StrictMode -Version Latest
+          $payload = @{
+              Build       = Join-Path -Path 'target' -ChildPath $env:TARGET -AdditionalChildPath 'release'
+              Destination = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'payload'
+          }
+          ./scripts/stage-payload.ps1 @payload
+
       # Every test binary runs, so one failing suite cannot hide another's.
       - name: Test
         id: test
@@ -132,15 +143,6 @@ jobs:
               cargo test --release --locked --target $env:TARGET -p $one.Package --test $one.Suite -- --ignored --exact $one.Test
               if ($LASTEXITCODE -ne 0) { throw "$($one.Test) failed (exit code $LASTEXITCODE)" }
           }
-
-      - name: Lay out setup's payload
-        run: |
-          Set-StrictMode -Version Latest
-          $payload = @{
-              Build       = Join-Path -Path 'target' -ChildPath $env:TARGET -AdditionalChildPath 'release'
-              Destination = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'payload'
-          }
-          ./scripts/stage-payload.ps1 @payload
 
       - name: Build setup
         env:

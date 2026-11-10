@@ -16,8 +16,9 @@
     - every file and folder of the extracted runtime that the crate's own list
       names, and WebView2's core library, is in the build's folder.
 
-    Run after `cargo build --release` for the target, before building
-    hedwig-setup with HEDWIG_PAYLOAD set to -Destination.
+    Run after `cargo build --release` for the target and before anything runs
+    from its folder, then build hedwig-setup with HEDWIG_PAYLOAD set to
+    -Destination.
 
 .PARAMETER Build
     The release build's folder: target\<triple>\release.
