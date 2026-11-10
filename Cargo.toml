@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -24,12 +24,12 @@ keywords = ["gpg", "ssh-agent", "adb", "yubikey", "forwarding"]
 categories = ["network-programming", "os::windows-apis"]
 
 [workspace.dependencies]
-hedwig-model = { path = "crates/hedwig-model", version = "0.1.0" }
-hedwig-win = { path = "crates/hedwig-win", version = "0.1.0" }
-hedwig-core = { path = "crates/hedwig-core", version = "0.1.0" }
-hedwig-client = { path = "crates/hedwig-client", version = "0.1.0" }
-hedwig-view = { path = "crates/hedwig-view", version = "0.1.0" }
-hedwig-shell = { path = "crates/hedwig-shell", version = "0.1.0" }
+hedwig-model = { path = "crates/hedwig-model", version = "0.2.0-alpha.1" }
+hedwig-win = { path = "crates/hedwig-win", version = "0.2.0-alpha.1" }
+hedwig-core = { path = "crates/hedwig-core", version = "0.2.0-alpha.1" }
+hedwig-client = { path = "crates/hedwig-client", version = "0.2.0-alpha.1" }
+hedwig-view = { path = "crates/hedwig-view", version = "0.2.0-alpha.1" }
+hedwig-shell = { path = "crates/hedwig-shell", version = "0.2.0-alpha.1" }
 serde_json = "1.0.151"
 windows-reactor = "0.100.0"
 windows-reactor-setup = "0.100.0"

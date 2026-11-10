@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "hedwig"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-client",
  "hedwig-core",
@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "hedwig-client"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-model",
  "hedwig-win",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "hedwig-core"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-model",
  "hedwig-win",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "hedwig-interface"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-client",
  "hedwig-model",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "hedwig-model"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "serde_json",
  "zeroize",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "hedwig-setup"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-client",
  "hedwig-model",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "hedwig-shell"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-model",
  "hedwig-view",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "hedwig-support"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-client",
  "hedwig-core",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "hedwig-view"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-client",
  "hedwig-model",
@@ -95,14 +95,14 @@ dependencies = [
 
 [[package]]
 name = "hedwig-win"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "windows-sys",
 ]
 
 [[package]]
 name = "hedwig-window"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "hedwig-client",
  "hedwig-model",
