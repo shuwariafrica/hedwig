@@ -5,16 +5,26 @@ BeforeAll {
     # version is bound only because the script declares it mandatory.
     . (Join-Path -Path $PSScriptRoot -ChildPath 'release.ps1') -Version '0.0.0'
 
+    # The commit HEAD names in the fixture repository.
+    $commit = '0123456789abcdef0123456789abcdef01234567'
+
     function Initialize-Crate {
         param([string] $ManifestVersion, [string] $LockfileVersion)
 
         $manifest = @(
-            '[package]'
-            'name = "hedwig"'
+            '[workspace]'
+            'members = ["crates/hedwig"]'
+            ''
+            '[workspace.package]'
             "version = `"$ManifestVersion`""
             ''
-            '[dependencies.windows-sys]'
+            '[workspace.dependencies.windows-sys]'
             'version = "0.61"'
+        )
+        $member = @(
+            '[package]'
+            'name = "hedwig"'
+            'version.workspace = true'
         )
         $lockfile = @(
             'version = 4'
@@ -29,6 +39,10 @@ BeforeAll {
         )
         Set-Content -LiteralPath (Join-Path -Path $fakeGit.Repository -ChildPath 'Cargo.toml') -Value $manifest
         Set-Content -LiteralPath (Join-Path -Path $fakeGit.Repository -ChildPath 'Cargo.lock') -Value $lockfile
+        # HEAD's commit holds the files the working tree does.
+        $fakeGit.Output["show ${commit}:Cargo.toml"] = $manifest
+        $fakeGit.Output["show ${commit}:crates/hedwig/Cargo.toml"] = $member
+        $fakeGit.Output["show ${commit}:Cargo.lock"] = $lockfile
     }
 }
 
@@ -66,6 +80,8 @@ Describe 'Publish-ReleaseTag' {
         $fakeGit.Output['fetch --prune origin'] = @()
         $fakeGit.Output['fetch --tags --prune origin'] = @()
         $fakeGit.Output['rev-list --left-right --count HEAD...@{u}'] = @("0`t0")
+        $fakeGit.Output['rev-parse --verify HEAD^{commit}'] = @($commit)
+        $fakeGit.Output['rev-list --first-parent origin/main'] = @($commit, 'fedcba9876543210fedcba9876543210fedcba98')
         $fakeGit.Output['tag --list v1.2.3'] = @()
         $fakeGit.Output['ls-remote --tags origin refs/tags/v1.2.3'] = @()
         $fakeGit.Output['tag --sign --annotate v1.2.3 -m Release version v1.2.3'] = @()
@@ -105,6 +121,11 @@ Describe 'Publish-ReleaseTag' {
             'fetch --prune origin'
             'fetch --tags --prune origin'
             'rev-list --left-right --count HEAD...@{u}'
+            'rev-parse --verify HEAD^{commit}'
+            'rev-list --first-parent origin/main'
+            "show ${commit}:Cargo.toml"
+            "show ${commit}:Cargo.lock"
+            "show ${commit}:crates/hedwig/Cargo.toml"
             'tag --list v1.2.3'
             'ls-remote --tags origin refs/tags/v1.2.3'
             'tag --sign --annotate v1.2.3 -m Release version v1.2.3'
@@ -122,6 +143,9 @@ Describe 'Publish-ReleaseTag' {
     It 'passes -WhatIf from the script to the release, which checks its own checkout' {
         $copy = Join-Path -Path $fakeGit.Repository -ChildPath 'release.ps1'
         Copy-Item -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath 'release.ps1') -Destination $copy
+        $scripts = New-Item -ItemType Directory -Path (Join-Path -Path $fakeGit.Repository -ChildPath 'scripts')
+        $admit = Join-Path -Path $PSScriptRoot -ChildPath 'scripts' -AdditionalChildPath 'assert-release-commit.ps1'
+        Copy-Item -LiteralPath $admit -Destination $scripts.FullName
 
         $result = & $copy 1.2.3 -WhatIf -InformationAction Ignore
 
@@ -272,6 +296,12 @@ Describe 'Publish-ReleaseTag' {
             ErrorId = 'BranchAhead'
         }
         @{
+            Case    = 'HEAD is off main''s first-parent line'
+            Command = 'rev-list --first-parent origin/main'
+            Output  = @('fedcba9876543210fedcba9876543210fedcba98')
+            ErrorId = 'NotOnFirstParentLine'
+        }
+        @{
             Case    = 'the tag exists locally'
             Command = 'tag --list v1.2.3'
             Output  = @('v1.2.3')
@@ -295,6 +325,7 @@ Describe 'Publish-ReleaseTag' {
         @{ Command = 'remote get-url --all fork' }
         @{ Command = 'fetch --prune origin' }
         @{ Command = 'fetch --tags --prune origin' }
+        @{ Command = 'rev-list --first-parent origin/main' }
         @{ Command = 'tag --sign --annotate v1.2.3 -m Release version v1.2.3' }
         @{ Command = 'push origin v1.2.3' }
     ) {

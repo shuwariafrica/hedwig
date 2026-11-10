@@ -11,8 +11,9 @@
     Every check runs before anything is tagged: notes for a pre-release, a clean
     working tree, Cargo.toml and Cargo.lock both at the version, a remote
     pointing at the repository, a branch level with that remote after a fetch,
-    and no existing tag. -WhatIf runs all of them, the fetch included, and
-    stops short of the tag.
+    HEAD admitted as the release workflow admits a tag's commit
+    (scripts/assert-release-commit.ps1), and no existing tag. -WhatIf runs all
+    of them, the fetch included, and stops short of the tag.
 
     MAIN_REPO_OWNER and MAIN_REPO_NAME name a fork to release from instead.
 
@@ -329,6 +330,16 @@ function Publish-ReleaseTag {
         }
         Write-Error @refusal -ErrorAction Stop
     }
+
+    # The release workflow admits a tag by this check, once it is public.
+    $admission = @{
+        Commit  = 'HEAD'
+        Version = $Version
+        Branch  = "$remote/main"
+        Path    = $Path
+    }
+    $admit = Join-Path -Path $PSScriptRoot -ChildPath 'scripts' -AdditionalChildPath 'assert-release-commit.ps1'
+    $null = & $admit @admission
 
     if (Invoke-Git -Repository $Path -Argument 'tag', '--list', $tag) {
         $refusal = @{
