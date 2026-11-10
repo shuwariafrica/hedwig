@@ -676,6 +676,11 @@ pub enum Failure {
     /// service, so the remote's connection is not carried to it. A holder
     /// started in the core's own logon is always read.
     Unidentified,
+    /// Whether a gpg-agent serves an agent's pipe could not be told: the
+    /// system's list of processes, or what a running gpg-agent of the
+    /// person's was started with, could not be read. Connecting can stop
+    /// such an agent's pipe, so nothing connects to it.
+    Undetermined,
     /// The program a capability opens addresses with is not on the search
     /// path, or Windows would not start it.
     Unstartable,
@@ -694,7 +699,8 @@ pub enum Failure {
     /// devices in the form a lent device is judged by.
     Outdated,
     /// Every instance of an agent's pipe stayed in use for as long as the
-    /// core waits: gpg-agent's pipe serves one program at a time.
+    /// core waits: an agent that serves one program at a time does this
+    /// while another holds it.
     Occupied,
     /// Windows' provider for the workstation's TPM would not open or answer
     /// for this logon: there is no TPM, or none it can use.
@@ -2242,8 +2248,8 @@ impl State {
         self.sources.get(capability).copied()
     }
 
-    /// What last held `capability`'s source, `Some(None)` where nothing
-    /// answered; `None` where it was never read.
+    /// What last held `capability`'s source, `Some(None)` where nothing is
+    /// known to answer; `None` where it was never read.
     pub fn held_by(&self, capability: &Name) -> Option<Option<&SourceHolder>> {
         self.holders.get(capability).map(Option::as_ref)
     }

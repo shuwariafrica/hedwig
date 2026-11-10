@@ -24,7 +24,7 @@ use crate::config::{
     HeardEntry, KeepaliveEntry, Reach, Reference, ReturnsEntry, RuleEntry, Terms,
 };
 use crate::gate::Capped;
-use crate::holder::{Rights, SignedIn, SourceHolder, Whose};
+use crate::holder::{Rights, SignedIn, SourceHolder, StoppedPipe, Whose};
 use crate::install::{AtSignIn, Index, Packed, Starts};
 use crate::json::{self, Json, JsonError, Layout};
 use crate::organisation::{
@@ -1483,6 +1483,7 @@ choice!(Failure {
         "foreign" => Foreign,
         "confined" => Confined,
         "unidentified" => Unidentified,
+        "undetermined" => Undetermined,
         "unstartable" => Unstartable,
         "unopened" => Unopened,
         "absent" => Absent,
@@ -1902,8 +1903,10 @@ record!(Workstation {
 record!(SourceHolder {
     program,
     session,
-    whose
+    whose,
+    stopped
 });
+record!(StoppedPipe { pipe, home });
 choice!(SignedIn { unit { "locally" => Locally, "over-the-network" => OverTheNetwork } });
 choice!(Rights { unit { "standard" => Standard, "administrator" => Administrator } });
 choice!(Whose {

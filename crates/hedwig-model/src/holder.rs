@@ -10,7 +10,8 @@
 
 use std::fmt;
 
-use crate::text::{Location, ServiceName};
+use crate::capability::Home;
+use crate::text::{AgentPipe, Location, ServiceName};
 use crate::trail::Failure;
 
 /// What a holder's token is to the person, as Windows' own access check
@@ -115,6 +116,19 @@ pub struct SourceHolder {
     /// over the network, which has no desktop.
     pub session: u32,
     pub whose: Whose,
+    /// The pipe this holder, a gpg-agent, is set to serve and no pipe of
+    /// that name exists: what the person's own programs reach it by has
+    /// stopped, though Hedwig still reaches it at its socket.
+    pub stopped: Option<StoppedPipe>,
+}
+
+/// A gpg-agent's pipe that is gone though the agent is running and set to
+/// serve it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StoppedPipe {
+    pub pipe: AgentPipe,
+    /// The home of the agent, which the command that starts it again names.
+    pub home: Home,
 }
 
 impl SourceHolder {
@@ -138,6 +152,20 @@ impl SourceHolder {
 /// where it runs, each only as read.
 impl fmt::Display for SourceHolder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.whose_clause(f)?;
+        if let Some(stopped) = &self.stopped {
+            write!(
+                f,
+                ", set to serve {} and not serving it",
+                stopped.pipe.to_path()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl SourceHolder {
+    fn whose_clause(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let session = self.session;
         match &self.whose {
             Whose::Person {

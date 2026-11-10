@@ -16,7 +16,7 @@ use hedwig_model::config::{
     HeardEntry, KeepaliveEntry, Reach, ReturnsEntry, RuleEntry,
 };
 use hedwig_model::gate::Capped;
-use hedwig_model::holder::{Rights, SignedIn, SourceHolder, Whose};
+use hedwig_model::holder::{Rights, SignedIn, SourceHolder, StoppedPipe, Whose};
 use hedwig_model::install::{AtSignIn, Starts};
 use hedwig_model::organisation::{
     GrantScope, Holding, Limit, Misread, Part, Place, Start, Statement, Unread,
@@ -768,6 +768,7 @@ fn refusals_of_the_relay() -> Vec<Refusal> {
         ("adb", Failure::Foreign),
         ("adb", Failure::Confined),
         ("adb", Failure::Unidentified),
+        ("gpg-ssh", Failure::Undetermined),
         ("selenium-grid", Failure::NoAddress),
         ("gpg", Failure::Unserved),
         ("browser", Failure::Unstartable),
@@ -1691,6 +1692,23 @@ pub(crate) fn events() -> Vec<Event> {
                     signed_in: SignedIn::Locally,
                     rights: Rights::Standard,
                 },
+                stopped: None,
+            }),
+        },
+        Event::HeldBy {
+            capability: name("gpg-ssh"),
+            holder: Some(SourceHolder {
+                program: Location::try_from(r"C:\GnuPG\bin\gpg-agent.exe").unwrap(),
+                session: 2,
+                whose: Whose::Person {
+                    logon: 0x04ef_6c7c,
+                    signed_in: SignedIn::Locally,
+                    rights: Rights::Standard,
+                },
+                stopped: Some(StoppedPipe {
+                    pipe: AgentPipe::well_known(),
+                    home: Home::At(Folder::try_from(r"D:\keys").unwrap()),
+                }),
             }),
         },
         Event::HeldBy {
@@ -1706,6 +1724,7 @@ pub(crate) fn events() -> Vec<Event> {
                     signed_in: SignedIn::OverTheNetwork,
                     rights: Rights::Administrator,
                 },
+                stopped: None,
             }),
         },
         Event::HeldBy {
@@ -1719,6 +1738,7 @@ pub(crate) fn events() -> Vec<Event> {
                         ServiceName::try_from("RpcSs").unwrap(),
                     ],
                 },
+                stopped: None,
             }),
         },
         Event::HeldBy {
@@ -1727,6 +1747,7 @@ pub(crate) fn events() -> Vec<Event> {
                 program: Location::try_from("adb.exe").unwrap(),
                 session: 0,
                 whose: Whose::Unread,
+                stopped: None,
             }),
         },
         Event::HeldBy {
@@ -1735,6 +1756,7 @@ pub(crate) fn events() -> Vec<Event> {
                 program: Location::try_from(r"C:\Users\ali\AppData\Local\Temp\squat.exe").unwrap(),
                 session: 2,
                 whose: Whose::Confined,
+                stopped: None,
             }),
         },
         Event::HeldBy {
@@ -1743,6 +1765,7 @@ pub(crate) fn events() -> Vec<Event> {
                 program: Location::try_from("openocd.exe").unwrap(),
                 session: 3,
                 whose: Whose::Another,
+                stopped: None,
             }),
         },
         Event::HeldBy {
@@ -2643,6 +2666,7 @@ fn workstation() -> Workstation {
                         signed_in: SignedIn::Locally,
                         rights: Rights::Standard,
                     },
+                    stopped: None,
                 }),
             },
             Found {
@@ -2660,6 +2684,7 @@ fn workstation() -> Workstation {
                     whose: Whose::Service {
                         services: vec![ServiceName::try_from("ssh-agent").unwrap()],
                     },
+                    stopped: None,
                 }),
             },
         ],

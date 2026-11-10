@@ -645,6 +645,12 @@ impl fmt::Display for Refusal {
                      this workstation, and it is no service an administrator installed, so Hedwig \
                      does not carry the remote's connection to it"
                 ),
+                Failure::Undetermined => write!(
+                    f,
+                    "Hedwig could not tell whether a gpg-agent serves the pipe {capability} \
+                     names, so it does not connect to that pipe, since a connection can stop a \
+                     gpg-agent's pipe; it looks again when a remote next asks"
+                ),
                 Failure::Unstartable => write!(
                     f,
                     "{capability} names a program that is not on this workstation's search path, \
@@ -1182,9 +1188,10 @@ pub fn kind_words(kind: KeyKind) -> &'static str {
     }
 }
 
-/// What the person can do about a program of theirs that holds a source
-/// where Hedwig will not carry a remote's connection to it: the source's own
-/// tool, never an act of Hedwig's on a program that may be another person's.
+/// What the person can do about a program of theirs that holds a source,
+/// where Hedwig will not carry a remote's connection to it or the program
+/// has let a pipe of its own stop: the source's own tool, never an act of
+/// Hedwig's on a program that may be another person's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remedy {
     /// ADB's own `kill-server` stops whatever server answers at `port`; the
@@ -1196,12 +1203,27 @@ pub enum Remedy {
     /// Anything else: stopped where it was started, and started again in the
     /// sign-in Hedwig runs in.
     Restart,
+    /// A gpg-agent of `home` no longer serves the pipe it is set to serve:
+    /// started again as it was, it makes the pipe again.
+    StoppedPipe { home: Home },
+    /// What a running gpg-agent serves could not be read. Ended, the pipe can
+    /// be opened, unless that agent was what served it.
+    UnreadAgent,
 }
 
 impl Remedy {
     /// What the person can do about `failure` of `source`'s holder; `None`
     /// for a failure no act of the person's own on their program mends.
     pub fn of(source: &Source, failure: Failure) -> Option<Remedy> {
+        if failure == Failure::Undetermined {
+            return matches!(
+                source,
+                Source::Agent {
+                    at: AgentAt::Pipe(_)
+                }
+            )
+            .then_some(Remedy::UnreadAgent);
+        }
         if !matches!(failure, Failure::Unidentified | Failure::Confined) {
             return None;
         }
@@ -1248,6 +1270,27 @@ impl fmt::Display for Remedy {
             Remedy::Restart => f.write_str(
                 "if it is yours, stop it where it was started and start it again in the sign-in \
                  Hedwig runs in",
+            ),
+            Remedy::StoppedPipe { home } => {
+                let homedir = match home {
+                    Home::Default => String::new(),
+                    Home::At(folder) => format!("--homedir \"{folder}\" "),
+                };
+                write!(
+                    f,
+                    "starting it again as you started it makes its pipe again, at the cost of \
+                     its PIN cache and any card session; where gpg-agent.conf sets the pipe that \
+                     is gpgconf {homedir}--kill gpg-agent, then gpgconf {homedir}--launch \
+                     gpg-agent; until then a program of yours that reaches gpg-agent by that pipe \
+                     finds nothing there"
+                )
+            }
+            Remedy::UnreadAgent => f.write_str(
+                "if a gpg-agent of yours is running, it may be the one that serves this pipe, and \
+                 ending that one ends the pipe; if it is not, ending it, which loses its PIN \
+                 cache and any card session, lets Hedwig connect to the pipe when a remote next \
+                 asks, unless something starts it again: gpgconf --kill gpg-agent for one in \
+                 your default home, or Task Manager for any other",
             ),
         }
     }

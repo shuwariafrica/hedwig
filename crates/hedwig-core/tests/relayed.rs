@@ -965,6 +965,7 @@ fn a_server_held_by_what_hedwig_will_not_serve_fails_its_source_saying_whose_it_
         program: Location::try_from("adb.exe").unwrap(),
         session: 0,
         whose: Whose::Unread,
+        stopped: None,
     };
     let theirs = SourceHolder {
         program: Location::try_from(
@@ -977,6 +978,7 @@ fn a_server_held_by_what_hedwig_will_not_serve_fails_its_source_saying_whose_it_
             signed_in: SignedIn::Locally,
             rights: Rights::Standard,
         },
+        stopped: None,
     };
     let told = |listing: Listing, holder: &SourceHolder| Input::Devices {
         capability: name("adb"),
@@ -4872,6 +4874,187 @@ fn an_agent_protocol_breach_is_the_remote_s_or_the_agent_s() {
     );
 }
 
+/// A holder of the person's, with nothing said of a pipe unless `stopped`.
+fn ssh_holder(stopped: Option<hedwig_model::holder::StoppedPipe>) -> SourceHolder {
+    SourceHolder {
+        program: Location::try_from(r"C:\Program Files\GnuPG\bin\gpg-agent.exe").unwrap(),
+        session: 2,
+        whose: Whose::Person {
+            logon: 7,
+            signed_in: SignedIn::Locally,
+            rights: Rights::Standard,
+        },
+        stopped,
+    }
+}
+
+/// A pipe found by name, nothing having connected to it, says nothing of
+/// whether its source answers, and an answer does.
+#[test]
+fn a_name_in_a_list_says_nothing_of_the_source_until_an_answer_does() {
+    let mut scene = ssh_agent(Lends::none());
+    scene.knock_on(1, "ssh-agent");
+    let step = scene.relayed(1, Relayed::Listed);
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::Source { .. })),
+        "{step:?}"
+    );
+    assert!(
+        events(&step).iter().any(|event| matches!(
+            event,
+            Event::Asked {
+                operation: Operation::Connect,
+                ..
+            }
+        )),
+        "{step:?}"
+    );
+    let answered = scene.relayed(1, Relayed::Answered);
+    assert!(
+        events(&answered).iter().any(|event| matches!(
+            event,
+            Event::Source {
+                health: Health::Sound,
+                ..
+            }
+        )),
+        "{answered:?}"
+    );
+    let again = scene.relayed(1, Relayed::Answered);
+    assert!(
+        !events(&again)
+            .iter()
+            .any(|event| matches!(event, Event::Source { .. })),
+        "{again:?}"
+    );
+}
+
+/// A pipe's name there again ends what was said of it having gone, and
+/// leaves a holder of whom nothing was said.
+#[test]
+fn a_name_found_again_ends_what_was_said_of_the_pipe_having_gone() {
+    let mut scene = ssh_agent(Lends::none());
+    scene.knock_on(1, "ssh-agent");
+    let stopped = hedwig_model::holder::StoppedPipe {
+        pipe: hedwig_model::text::AgentPipe::well_known(),
+        home: Home::Default,
+    };
+    scene.relayed(1, Relayed::Held(Some(ssh_holder(Some(stopped)))));
+    let step = scene.relayed(1, Relayed::Listed);
+    assert!(
+        events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::HeldBy { holder: None, .. })),
+        "{step:?}"
+    );
+    scene.relayed(1, Relayed::Held(Some(ssh_holder(None))));
+    let step = scene.relayed(1, Relayed::Listed);
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::HeldBy { .. })),
+        "{step:?}"
+    );
+}
+
+/// A pipe's holder is first read at a request, past the opening's own
+/// refusal: a holder Hedwig will not carry a remote to is a connection turned
+/// away, recorded as it was when the refusal came at the opening.
+#[test]
+fn a_holder_refused_at_a_first_request_is_recorded_as_a_refusal() {
+    let mut scene = ssh_agent(Lends::none());
+    for (knock, failure) in (1u64..).zip([
+        Failure::Foreign,
+        Failure::Confined,
+        Failure::Unidentified,
+        Failure::Undetermined,
+    ]) {
+        scene.knock_on(knock, "ssh-agent");
+        let step = scene.relayed(knock, Relayed::Lost(failure));
+        assert!(
+            events(&step).iter().any(|event| matches!(
+                event,
+                Event::TurnedAway {
+                    refusal: Refusal::SourceUnavailable { failure: said, .. },
+                    ..
+                } if *said == failure
+            )),
+            "{failure:?}: {step:?}"
+        );
+    }
+}
+
+/// A busy pipe is the source's own state, over which Hedwig refused nothing.
+#[test]
+fn a_busy_pipe_is_no_refusal_of_a_holder() {
+    let mut scene = ssh_agent(Lends::none());
+    scene.knock_on(1, "ssh-agent");
+    let step = scene.relayed(1, Relayed::Lost(Failure::Occupied));
+    assert!(
+        !events(&step)
+            .iter()
+            .any(|event| matches!(event, Event::TurnedAway { .. })),
+        "{step:?}"
+    );
+}
+
+/// A connection stands after a holder is refused at a request, and each of
+/// its requests meets that holder: one refusal stands for them.
+#[test]
+fn a_connection_is_turned_away_once_however_many_of_its_requests_meet_that_holder() {
+    let mut scene = ssh_agent(Lends::none());
+    scene.knock_on(1, "ssh-agent");
+    let first = scene.relayed(1, Relayed::Lost(Failure::Confined));
+    assert!(
+        events(&first)
+            .iter()
+            .any(|event| matches!(event, Event::TurnedAway { .. })),
+        "{first:?}"
+    );
+    let again = scene.relayed(1, Relayed::Lost(Failure::Confined));
+    assert!(
+        !events(&again)
+            .iter()
+            .any(|event| matches!(event, Event::TurnedAway { .. })),
+        "{again:?}"
+    );
+}
+
+/// How many refusals of a connection `step` recorded.
+fn turned_away(step: &Step) -> usize {
+    events(step)
+        .iter()
+        .filter(|event| matches!(event, Event::TurnedAway { .. }))
+        .count()
+}
+
+/// A refusal for another reason is recorded too: one mark stands only for the
+/// reason it was made for.
+#[test]
+fn a_connection_is_turned_away_again_for_another_reason() {
+    let mut scene = ssh_agent(Lends::none());
+    scene.knock_on(1, "ssh-agent");
+    let first = scene.relayed(1, Relayed::Lost(Failure::Undetermined));
+    assert_eq!(turned_away(&first), 1, "{first:?}");
+    let other = scene.relayed(1, Relayed::Lost(Failure::Foreign));
+    assert_eq!(turned_away(&other), 1, "{other:?}");
+}
+
+/// An answer ends what was recorded: a refusal after it is recorded again,
+/// though for the same reason.
+#[test]
+fn a_connection_answered_between_two_refusals_records_each() {
+    let mut scene = ssh_agent(Lends::none());
+    scene.knock_on(1, "ssh-agent");
+    let first = scene.relayed(1, Relayed::Lost(Failure::Confined));
+    assert_eq!(turned_away(&first), 1, "{first:?}");
+    scene.relayed(1, Relayed::Answered);
+    let again = scene.relayed(1, Relayed::Lost(Failure::Confined));
+    assert_eq!(turned_away(&again), 1, "{again:?}");
+}
+
 /// What holds the agent's pipe is recorded where it changed, and a key
 /// listing asked for by a grant surface is answered from the agent once.
 #[test]
@@ -4886,6 +5069,7 @@ fn the_pipe_s_holder_is_recorded_once_and_its_keys_are_listed_on_request() {
             signed_in: SignedIn::Locally,
             rights: Rights::Standard,
         },
+        stopped: None,
     };
     let step = scene.relayed(1, Relayed::Held(Some(holder.clone())));
     assert!(
@@ -5383,6 +5567,7 @@ fn a_holders_change_is_in_the_activity_of_the_remote_it_serves() {
         program: Location::try_from(r"C:\Android\platform-tools\adb.exe").unwrap(),
         session: 0,
         whose: Whose::Unread,
+        stopped: None,
     };
     let mut scene = adb();
     scene.attach(VIEWER, ClientKind::Viewer);
@@ -5451,6 +5636,7 @@ fn the_client_whose_listing_read_a_holder_is_told_the_workstation_changed() {
             signed_in: SignedIn::Locally,
             rights: Rights::Standard,
         },
+        stopped: None,
     };
     let step = scene.step(Input::Keys {
         link: VIEWER,

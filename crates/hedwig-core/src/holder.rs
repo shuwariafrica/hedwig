@@ -56,5 +56,6 @@ pub fn of(process: u32) -> Option<SourceHolder> {
         program,
         session,
         whose,
+        stopped: None,
     })
 }

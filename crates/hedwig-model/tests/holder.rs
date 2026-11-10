@@ -16,7 +16,9 @@ use hedwig_model::capability::{
 };
 use hedwig_model::config::Configuration;
 use hedwig_model::gate::World;
-use hedwig_model::holder::{Reading, Rights, SignedIn, SourceHolder, Standing, Whose, whose};
+use hedwig_model::holder::{
+    Reading, Rights, SignedIn, SourceHolder, Standing, StoppedPipe, Whose, whose,
+};
 use hedwig_model::refusal::{Refusal, Remedy};
 use hedwig_model::text::{AgentPipe, Folder, Location, Name, ServiceName};
 use hedwig_model::trail::{Event, Failure, Health};
@@ -45,6 +47,7 @@ fn holder(program: &str, session: u32, whose: Whose) -> SourceHolder {
         program: Location::try_from(program).unwrap(),
         session,
         whose,
+        stopped: None,
     }
 }
 
@@ -225,6 +228,12 @@ fn each_refusal_says_what_was_read() {
          it is no service an administrator installed, so Hedwig does not carry the remote's \
          connection to it"
     );
+    assert_eq!(
+        words(Failure::Undetermined),
+        "Hedwig could not tell whether a gpg-agent serves the pipe adb names, so it does not \
+         connect to that pipe, since a connection can stop a gpg-agent's pipe; it looks again \
+         when a remote next asks"
+    );
 }
 
 #[test]
@@ -285,7 +294,70 @@ fn a_remedy_is_the_sources_own_tool_and_only_for_a_program_that_may_be_the_perso
         for failure in [Failure::Foreign, Failure::Unreachable, Failure::Mismatched] {
             assert_eq!(Remedy::of(&source, failure), None);
         }
+        assert_eq!(
+            Remedy::of(&source, Failure::Undetermined),
+            matches!(
+                source,
+                Source::Agent {
+                    at: AgentAt::Pipe(_)
+                }
+            )
+            .then_some(Remedy::UnreadAgent),
+            "what could not be read is told only at a pipe, where the read happens"
+        );
     }
+}
+
+#[test]
+fn what_could_not_be_read_warns_of_what_ending_that_agent_costs() {
+    assert_eq!(
+        Remedy::UnreadAgent.to_string(),
+        "if a gpg-agent of yours is running, it may be the one that serves this pipe, and ending \
+         that one ends the pipe; if it is not, ending it, which loses its PIN cache and any card \
+         session, lets Hedwig connect to the pipe when a remote next asks, unless something \
+         starts it again: gpgconf --kill gpg-agent for one in your default home, or Task Manager \
+         for any other"
+    );
+}
+
+/// A gpg-agent whose own pipe has gone, though it runs and is set to serve
+/// it, says so as what was read, and what starts it again is the source's
+/// own tool, naming the agent's home where it is not the default.
+#[test]
+fn a_pipe_a_gpg_agent_is_set_to_serve_and_has_stopped_is_said_with_what_starts_it_again() {
+    let person = Whose::Person {
+        logon: 7,
+        signed_in: SignedIn::Locally,
+        rights: Rights::Standard,
+    };
+    let mut held = holder(r"C:\GnuPG\bin\gpg-agent.exe", 2, person);
+    assert_eq!(
+        held.to_string(),
+        r"C:\GnuPG\bin\gpg-agent.exe, yours, in session 2"
+    );
+    held.stopped = Some(StoppedPipe {
+        pipe: AgentPipe::well_known(),
+        home: Home::Default,
+    });
+    assert_eq!(
+        held.to_string(),
+        r"C:\GnuPG\bin\gpg-agent.exe, yours, in session 2, set to serve \\.\pipe\openssh-ssh-agent and not serving it"
+    );
+    assert_eq!(
+        Remedy::StoppedPipe {
+            home: Home::Default
+        }
+        .to_string(),
+        "starting it again as you started it makes its pipe again, at the cost of its PIN \
+         cache and any card session; where gpg-agent.conf sets the pipe that is gpgconf --kill \
+         gpg-agent, then gpgconf --launch gpg-agent; until then a program of yours that \
+         reaches gpg-agent by that pipe finds nothing there"
+    );
+    let home = Home::At(Folder::try_from(r"D:\keys").unwrap());
+    assert_eq!(
+        Remedy::StoppedPipe { home }.to_string(),
+        r#"starting it again as you started it makes its pipe again, at the cost of its PIN cache and any card session; where gpg-agent.conf sets the pipe that is gpgconf --homedir "D:\keys" --kill gpg-agent, then gpgconf --homedir "D:\keys" --launch gpg-agent; until then a program of yours that reaches gpg-agent by that pipe finds nothing there"#
+    );
 }
 
 #[test]

@@ -7,15 +7,15 @@ use std::time::Instant;
 
 use std::collections::BTreeSet;
 
-use hedwig_model::capability::{Exposure, Lends, Operation, Setup};
+use hedwig_model::capability::{Exposure, Home, Lends, Operation, Setup};
 use hedwig_model::config::{Activation, Change};
-use hedwig_model::holder::{Rights, SignedIn, SourceHolder, Whose};
+use hedwig_model::holder::{Rights, SignedIn, SourceHolder, StoppedPipe, Whose};
 use hedwig_model::policy::{ConnectionScope, KeyName, Keys, Mode, RuleScope, Selector};
 use hedwig_model::protocol::{Notice, Request, Row, Topic};
 use hedwig_model::refusal::Refusal;
 use hedwig_model::remote::{Granted, RemoteId, Remotes};
 use hedwig_model::text::{
-    Fingerprint, Grip, Location, Mark, RemotePath, Serial, ServiceName, TextError, Words,
+    AgentPipe, Fingerprint, Grip, Location, Mark, RemotePath, Serial, ServiceName, TextError, Words,
 };
 use hedwig_model::trail::{
     self, Card, ChannelEnd, ClientKind, Entry, Event as Happened, Failure, Finding, Health, Held,
@@ -1173,6 +1173,7 @@ fn holder(program: &str, session: u32, whose: Whose) -> SourceHolder {
         program: Location::try_from(program).unwrap(),
         session,
         whose,
+        stopped: None,
     }
 }
 
@@ -1258,6 +1259,36 @@ fn what_answers_for_each_source_is_said_where_the_workstation_is_listed() {
     }
 }
 
+/// Where Hedwig could not read an agent for a capability at a pipe, the line
+/// says what ending that agent may cost as well as what it could not tell.
+#[test]
+fn an_agent_not_read_for_a_pipe_is_said_with_what_ending_it_costs() {
+    let mut bench = Bench::attached();
+    bench.desk.trail.push(Happened::HeldBy {
+        capability: name("ssh-agent"),
+        holder: None,
+    });
+    bench.desk.trail.push(Happened::Source {
+        capability: name("ssh-agent"),
+        health: Health::Failing(Failure::Undetermined),
+    });
+    bench.feed(Event::Window(true));
+    let Board::First(first) = window(&bench).board else {
+        unreachable!("nothing is granted")
+    };
+    let has = first.has.unwrap();
+    let said = "Hedwig could not tell whether a gpg-agent serves the pipe ssh-agent names, so it \
+                does not connect to that pipe, since a connection can stop a gpg-agent's pipe; \
+                it looks again when a remote next asks. If a gpg-agent of yours is running, it \
+                may be the one that serves this pipe, and ending that one ends the pipe; if it \
+                is not, ending it, which loses its PIN cache and any card session, lets Hedwig \
+                connect to the pipe when a remote next asks, unless something starts it again: \
+                gpgconf --kill gpg-agent for one in your default home, or Task Manager for any \
+                other."
+        .to_owned();
+    assert!(has.contains(&said), "{said}\n{has:#?}");
+}
+
 /// A change of what answers for a capability reads in an activity that holds
 /// it, from then on: whose program, or that nothing answered.
 #[test]
@@ -1297,7 +1328,7 @@ fn a_change_of_what_answers_reads_in_an_activity() {
     assert_eq!(
         said,
         [
-            "t2: nothing answered for adb on this workstation",
+            "t2: nothing is known to answer for adb on this workstation",
             r"t1: adb is answered by C:\platform-tools\adb.exe, yours, in session 0, signed in over the network, as administrator",
         ]
     );
@@ -1441,6 +1472,70 @@ fn a_holder_read_before_its_source_is_tried_is_said_alone() {
             .all(|line| line.starts_with("ssh-agent is answered by ")
                 && !line.contains("answers on this workstation")),
         "{said:?}"
+    );
+}
+
+/// Where a gpg-agent's pipe has gone though it is set to serve it, the
+/// capability's line says so as what was read, and what starts it again; no
+/// other line says either.
+#[test]
+fn a_gpg_agents_stopped_pipe_is_said_with_what_starts_it_again_on_its_capabilitys_line() {
+    let mut bench = Bench::attached();
+    bench.feed(Event::Window(true));
+    let mut held = holder(
+        r"C:\GnuPG\bin\gpg-agent.exe",
+        2,
+        Whose::Person {
+            logon: 7,
+            signed_in: SignedIn::Locally,
+            rights: Rights::Standard,
+        },
+    );
+    held.stopped = Some(StoppedPipe {
+        pipe: AgentPipe::try_from("mine").unwrap(),
+        home: Home::Default,
+    });
+    bench.desk.trail.push(Happened::HeldBy {
+        capability: name("ssh-agent"),
+        holder: Some(held),
+    });
+    bench.desk.trail.push(Happened::HeldBy {
+        capability: name("gpg"),
+        holder: Some(holder(
+            r"C:\GnuPG\bin\gpg-agent.exe",
+            2,
+            Whose::Person {
+                logon: 7,
+                signed_in: SignedIn::Locally,
+                rights: Rights::Standard,
+            },
+        )),
+    });
+    bench.told();
+    let Board::First(first) = window(&bench).board else {
+        unreachable!()
+    };
+    let has = first.has.unwrap();
+    assert_eq!(
+        has.iter()
+            .filter(|line| line.contains(r"set to serve \\.\pipe\mine and not serving it"))
+            .count(),
+        1,
+        "{has:?}"
+    );
+    assert_eq!(
+        has.iter()
+            .filter(|line| line.contains("Starting it again as you started it makes its pipe again"))
+            .count(),
+        1,
+        "the one capability whose pipe has gone says what to do: {has:?}"
+    );
+    assert!(
+        has.iter()
+            .filter(|line| line.contains("Starting it again"))
+            .all(|line| line.starts_with("ssh-agent is answered by ")
+                && line.contains("and not serving it. Starting it again")),
+        "on that capability's own line: {has:?}"
     );
 }
 

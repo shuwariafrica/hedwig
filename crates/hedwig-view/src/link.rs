@@ -1145,7 +1145,7 @@ fn mendable(needs: &Needs) -> bool {
         needs.attention,
         Attention::Refused {
             refusal: Refusal::SourceUnavailable {
-                failure: Failure::Unidentified | Failure::Confined,
+                failure: Failure::Unidentified | Failure::Confined | Failure::Undetermined,
                 ..
             },
             ..

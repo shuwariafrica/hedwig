@@ -729,6 +729,15 @@ struct Began {
     overtaken: bool,
 }
 
+/// What a connection was last recorded as turned away for, by a holder Hedwig
+/// will not carry a remote to; an answer, or a refusal of another kind, ends
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnedAway {
+    Unrecorded,
+    Recorded(Failure),
+}
+
 /// A connection a relay carries: what it reaches, and the request it holds
 /// for a decision, where it holds one.
 #[derive(Debug, Clone)]
@@ -762,6 +771,7 @@ struct Streamed {
     /// For a serial connection: the port its capability names, the opening
     /// once it is settled, and whether the port was opened for it.
     port: Option<Taking>,
+    turned_away: TurnedAway,
     /// The request last served on it, which what came of serving it is told
     /// of.
     served: Option<RequestId>,
@@ -2521,6 +2531,7 @@ impl Core {
                 placing: None,
                 remote,
                 port,
+                turned_away: TurnedAway::Unrecorded,
                 served: None,
             },
         );
@@ -2559,6 +2570,21 @@ impl Core {
                     self.source(step, now, &streamed.capability, Health::Sound);
                 }
                 self.ask(step, now, knock, Operation::Connect, None);
+            }
+            Relayed::Listed => {
+                // A name there again ends what was said of the pipe having
+                // gone; what serves it now is read at the first request.
+                let held = self.state.held_by(&streamed.capability).flatten();
+                if held.is_some_and(|holder| holder.stopped.is_some()) {
+                    self.held(step, now, &streamed.capability, None);
+                }
+                self.ask(step, now, knock, Operation::Connect, None);
+            }
+            Relayed::Answered => {
+                if let Some(held) = self.streams.get_mut(&knock) {
+                    held.turned_away = TurnedAway::Unrecorded;
+                }
+                self.source(step, now, &streamed.capability, Health::Sound);
             }
             Relayed::Reached(Err(failure)) => {
                 let capability = streamed.capability.clone();
@@ -2685,6 +2711,28 @@ impl Core {
             }
             Relayed::Lost(failure) => {
                 self.source(step, now, &streamed.capability, Health::Failing(failure));
+                // A holder Hedwig will not carry a remote to is read at a
+                // request, past the opening's own refusal. The connection
+                // stands, so one refusal stands for the requests turned away
+                // for the same reason in a row.
+                if streamed.turned_away != TurnedAway::Recorded(failure)
+                    && matches!(
+                        failure,
+                        Failure::Foreign
+                            | Failure::Confined
+                            | Failure::Unidentified
+                            | Failure::Undetermined
+                    )
+                {
+                    if let Some(held) = self.streams.get_mut(&knock) {
+                        held.turned_away = TurnedAway::Recorded(failure);
+                    }
+                    let refusal = Refusal::SourceUnavailable {
+                        capability: streamed.capability.clone(),
+                        failure,
+                    };
+                    self.record(step, now, Event::TurnedAway { remote, refusal });
+                }
             }
             Relayed::Released => {
                 if let Some(Taking {

@@ -23,7 +23,7 @@ mod support;
 use support::corpus::{self, SECTIONS};
 use support::name;
 
-const FAILURES: [Failure; 12] = [
+const FAILURES: [Failure; 13] = [
     Failure::Unresolved,
     Failure::Unreachable,
     Failure::Mismatched,
@@ -31,6 +31,7 @@ const FAILURES: [Failure; 12] = [
     Failure::NoAddress,
     Failure::Foreign,
     Failure::Unidentified,
+    Failure::Undetermined,
     Failure::Unstartable,
     Failure::Unopened,
     Failure::Absent,

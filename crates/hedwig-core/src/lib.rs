@@ -32,6 +32,7 @@ pub mod credential;
 pub mod devices;
 pub mod diagnostics;
 pub mod dispatch;
+pub(crate) mod gpg_agent_pipe;
 pub mod holder;
 pub mod keys;
 pub mod listing;

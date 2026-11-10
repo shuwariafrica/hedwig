@@ -3,11 +3,14 @@
 //!
 //! The agent is reached anew for each request it is given, and the
 //! connection to it closed once its answer is read, so no remote holds it
-//! between requests: gpg-agent's pipe serves one program at a time, and a
+//! between requests: an agent's pipe may serve one program at a time, and a
 //! remote's client may keep its connection for as long as its session lasts.
 //! gpg-agent is reached at its own SSH socket, which it serves on Windows with
-//! nothing configured; another agent at its pipe; and a key the workstation's
-//! TPM holds is answered for by the core itself ([`crate::machine`]).
+//! nothing configured - by a pipe it is set to serve as well as by its own
+//! capability, since connecting to that pipe can end it
+//! (`gpg_agent_pipe`); another agent at its pipe, opened only to
+//! give it a request; and a key the workstation's TPM holds is answered for
+//! by the core itself ([`crate::machine`]).
 //!
 //! Three threads carry a connection: one reads the remote, one owns the
 //! [`Conversation`] and writes to the remote, and one at a time asks the
@@ -22,15 +25,17 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 use hedwig_model::capability::{AgentAt, Home, Installation, Lends};
+use hedwig_model::holder::StoppedPipe;
 use hedwig_model::protocol::AgentKey;
 use hedwig_model::text::{AgentPipe, Words};
 use hedwig_model::trail::Failure;
-use hedwig_win::pipe::{Moved, OpenError, Pipe, open_unwaited};
+use hedwig_win::pipe::{Moved, OpenError, Pipe, RETRY, exists, open_unwaited};
 use hedwig_win::process::UNSEEN;
 use zeroize::Zeroize;
 
 use crate::agent::{self, Conversation, LIMIT, Out};
 use crate::assuan::SocketFile;
+use crate::gpg_agent_pipe::{Certainty, Serving, serving};
 use crate::relay::{
     Event, QUEUED, Reach, Relayed, Settle, admitted, gpgconf, home_arguments, launch,
 };
@@ -140,13 +145,69 @@ fn open_pipe(name: &AgentPipe) -> Reach<Line> {
     }
 }
 
+/// Connects to the gpg-agent set to serve `name` at its own socket, the pipe
+/// left alone; its holder says where that pipe is gone though the agent is
+/// set to serve it.
+fn at_its_socket(serving: &Serving, name: &AgentPipe) -> Reach<Line> {
+    let mut reached = open_socket(&serving.socket);
+    if let Some(holder) = reached.holder.as_mut() {
+        holder.stopped = stopped_pipe(serving, name, || pipe_present(name));
+    }
+    reached
+}
+
+/// What is said of `name` being gone: only for a pipe the agent is set to
+/// serve for certain, and where `present` does not find it. One that counts
+/// only for a doubt may never have been made.
+fn stopped_pipe(
+    serving: &Serving,
+    name: &AgentPipe,
+    present: impl FnOnce() -> bool,
+) -> Option<StoppedPipe> {
+    (serving.certainty == Certainty::Set && !present()).then(|| StoppedPipe {
+        pipe: name.clone(),
+        home: serving.home.clone(),
+    })
+}
+
+/// Whether a pipe of that name exists now, looked for a second time a moment
+/// later where it does not: a server between two instances leaves the name
+/// free for an instant.
+fn pipe_present(name: &AgentPipe) -> bool {
+    on_a_second_look(|| found_by(exists(name.as_str())), || thread::sleep(RETRY))
+}
+
+/// What one look at the list of pipes found: a list that cannot be read
+/// counts as finding the name, so nothing is said of a pipe not looked at.
+fn found_by(listing: std::io::Result<bool>) -> bool {
+    listing.unwrap_or(true)
+}
+
+/// `look`, and `look` again after `pause` where it found nothing.
+fn on_a_second_look(look: impl Fn() -> bool, pause: impl FnOnce()) -> bool {
+    look() || {
+        pause();
+        look()
+    }
+}
+
+/// A connection to the agent behind the pipe `name`, by what [`serving`]
+/// found: nothing connects to the pipe unless it found nothing that serves it.
+fn at_pipe(found: Result<Option<Serving>, Failure>, name: &AgentPipe) -> Reach<Line> {
+    match found {
+        Ok(Some(agent)) => at_its_socket(&agent, name),
+        Ok(None) => open_pipe(name),
+        Err(failure) => Reach::failed(failure),
+    }
+}
+
 /// A connection to the agent at `at`, nothing sent on it, or the failure
 /// that stands after gpg-agent was started once; with what held the pipe or
 /// the socket. gpg-agent is started once, outside every job Hedwig holds,
 /// where it does not answer: an SSH client never starts it.
 pub(crate) fn reach(at: &AgentAt) -> Reach<Line> {
     let (installation, home) = match at {
-        AgentAt::Pipe(name) => return open_pipe(name),
+        AgentAt::Pipe(name) => return at_pipe(serving(name), name),
         AgentAt::Machine => {
             return Reach {
                 result: crate::machine::reach().map(|()| Line::Machine),
@@ -290,6 +351,9 @@ pub fn request(at: &AgentAt, framed: &[u8]) -> Reach<Vec<u8>> {
                 };
             }
         };
+        // Whichever way gpg-agent's socket is reached, its handler reads
+        // nothing when no byte waits (see [`ATTEMPTS`]).
+        let a_socket = matches!(line, Line::Socket { .. });
         match exchange(&mut line, framed) {
             Ok(answer) => {
                 return Reach {
@@ -297,7 +361,7 @@ pub fn request(at: &AgentAt, framed: &[u8]) -> Reach<Vec<u8>> {
                     holder,
                 };
             }
-            Err(Unanswered::Silent) if matches!(at, AgentAt::Gnupg { .. }) => {}
+            Err(Unanswered::Silent) if a_socket => {}
             Err(_) => break,
         }
     }
@@ -332,6 +396,22 @@ pub fn keys(at: &AgentAt) -> Reach<Vec<AgentKey>> {
     }
 }
 
+/// What the deciding thread is told of the agent at `at` before it decides
+/// an opening. A pipe with no gpg-agent behind it is looked for by name and
+/// not opened: an open that gives a server nothing to answer can only wake
+/// it, so the first of Hedwig a pipe server sees is the first request.
+fn tell_opening(at: &AgentAt, tell: &impl Fn(Relayed)) {
+    let AgentAt::Pipe(name) = at else {
+        reach(at).tell(tell);
+        return;
+    };
+    match serving(name) {
+        Ok(None) if pipe_present(name) => tell(Relayed::Listed),
+        Ok(None) => Reach::<Line>::failed(Failure::Unreachable).tell(tell),
+        found => at_pipe(found, name).tell(tell),
+    }
+}
+
 /// Carries one admitted connection to the agent. `tell` reaches the deciding
 /// thread. Returns where the deciding thread settles what the connection
 /// asks; the connection itself runs on threads of its own.
@@ -359,11 +439,9 @@ fn run(
     queue: &Receiver<Event>,
     settle: &Settle,
 ) {
-    // The agent is reached before the opening is decided, so an opening it
-    // cannot serve is refused saying so, and gpg-agent is started for it.
-    let reached = reach(&agent.at);
-    reached.tell(tell.as_ref());
-    drop(reached);
+    // Told before the opening is decided, so an opening that cannot be served
+    // is refused saying so, and a home's gpg-agent is started for it.
+    tell_opening(&agent.at, tell.as_ref());
     let gate = Arc::new(Gate::default());
     let Ok(reader) = client.try_clone() else {
         return;
@@ -471,17 +549,112 @@ fn ask(
 ) {
     let tell = Arc::clone(tell);
     thread::spawn(move || {
-        let answered = request(&at, &message);
-        if at != AgentAt::Machine {
-            tell(Relayed::Held(answered.holder));
-        }
-        let event = match answered.result {
-            Ok(answer) => Event::Agent(answer),
-            Err(failure) => {
-                tell(Relayed::Lost(failure));
-                Event::AgentClosed
-            }
-        };
+        let event = told_of(&at, request(&at, &message), tell.as_ref());
         let _ = events.send(event);
     });
+}
+
+/// What the deciding thread is told of what a request to `at` came to, and
+/// what the conversation is given. A key the core itself holds has no holder
+/// to tell of, and its answer heals its source as any other's does.
+fn told_of(at: &AgentAt, answered: Reach<Vec<u8>>, tell: &impl Fn(Relayed)) -> Event {
+    if *at != AgentAt::Machine {
+        tell(Relayed::Held(answered.holder));
+    }
+    match answered.result {
+        Ok(answer) => {
+            tell(Relayed::Answered);
+            Event::Agent(answer)
+        }
+        Err(failure) => {
+            tell(Relayed::Lost(failure));
+            Event::AgentClosed
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests")]
+
+    use std::cell::{Cell, RefCell};
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// What [`on_a_second_look`] found, with the name there from look
+    /// `there`, and the looks and pauses it took.
+    fn looked(there: u32) -> (bool, u32, u32) {
+        let (looks, pauses) = (Cell::new(0), Cell::new(0));
+        let found = on_a_second_look(
+            || {
+                looks.set(looks.get() + 1);
+                looks.get() >= there
+            },
+            || pauses.set(pauses.get() + 1),
+        );
+        (found, looks.get(), pauses.get())
+    }
+
+    #[test]
+    fn a_name_is_said_gone_only_when_two_looks_a_moment_apart_find_nothing() {
+        assert_eq!(looked(1), (true, 1, 0), "there at once");
+        assert_eq!(looked(2), (true, 2, 1), "between two instances");
+        assert_eq!(looked(3), (false, 2, 1), "gone");
+    }
+
+    #[test]
+    fn a_list_of_pipes_not_read_counts_as_finding_the_name() {
+        assert!(found_by(Ok(true)));
+        assert!(!found_by(Ok(false)));
+        assert!(found_by(Err(std::io::Error::other("no list"))));
+    }
+
+    #[test]
+    fn a_pipe_only_perhaps_set_is_never_said_to_have_stopped() {
+        let name = AgentPipe::try_from("hedwig-test-perhaps").unwrap();
+        let agent = |certainty| Serving {
+            socket: PathBuf::from("s"),
+            home: Home::Default,
+            certainty,
+        };
+        assert_eq!(
+            stopped_pipe(&agent(Certainty::Perhaps), &name, || unreachable!(
+                "the list of pipes is not read"
+            )),
+            None
+        );
+        assert_eq!(stopped_pipe(&agent(Certainty::Set), &name, || true), None);
+        assert_eq!(
+            stopped_pipe(&agent(Certainty::Set), &name, || false),
+            Some(StoppedPipe {
+                pipe: name.clone(),
+                home: Home::Default,
+            })
+        );
+    }
+
+    #[test]
+    fn an_answer_for_a_key_the_core_holds_says_its_source_answers() {
+        let told = RefCell::new(Vec::new());
+        let event = told_of(
+            &AgentAt::Machine,
+            Reach {
+                result: Ok(vec![1]),
+                holder: None,
+            },
+            &|relayed| told.borrow_mut().push(relayed),
+        );
+        assert!(matches!(event, Event::Agent(answer) if answer == [1]));
+        let told = told.into_inner();
+        assert!(matches!(told.as_slice(), [Relayed::Answered]), "{told:?}");
+    }
+
+    #[test]
+    fn a_pipe_whose_server_could_not_be_told_is_refused_with_nothing_connected_to_it() {
+        let name = AgentPipe::try_from("hedwig-test-no-such-pipe").unwrap();
+        let reached = at_pipe(Err(Failure::Undetermined), &name);
+        assert_eq!(reached.result.err(), Some(Failure::Undetermined));
+        assert_eq!(reached.holder, None);
+    }
 }

@@ -788,6 +788,7 @@ fn an_adb_server_hedwig_cannot_read_is_said_with_what_stops_it_wherever_it_fails
                 program: Location::try_from("adb.exe").unwrap(),
                 session: 0,
                 whose: Whose::Unread,
+                stopped: None,
             }),
         });
         bench.desk.trail.push(Happened::Source {
@@ -870,4 +871,49 @@ fn an_adb_server_hedwig_cannot_read_is_said_with_what_stops_it_wherever_it_fails
         form(&bench, &draft).lending.unwrap().listing,
         Some(format!("The devices could not be read: {refusal}. {mend}."))
     );
+}
+
+/// What could not be read of an agent has a remedy the person can act on too,
+/// so the presence reads what the capability is defined as once such a
+/// refusal is counted.
+#[test]
+fn an_agent_hedwig_could_not_read_makes_the_presence_read_what_it_is_defined_as() {
+    let refusal = Refusal::SourceUnavailable {
+        capability: name("ssh-agent"),
+        failure: Failure::Undetermined,
+    };
+    let definitions = |bench: &Bench| {
+        bench
+            .sent
+            .iter()
+            .filter(|frame| matches!(frame.request, Request::Catalogue))
+            .count()
+    };
+    let mut presence = Bench::attached();
+    presence.feed(Event::Wish(
+        Place::Window,
+        Request::Change(Change::Grant {
+            grant: grant("ssh-agent", Granted::One(workspace())),
+            terms: terms(Activation::OnRequest, Exposure::SERVICE),
+        }),
+    ));
+    assert_eq!(definitions(&presence), 0);
+    presence.desk.channel_up(&workspace(), "linux");
+    presence.desk.trail.push(Happened::Source {
+        capability: name("ssh-agent"),
+        health: Health::Failing(Failure::Undetermined),
+    });
+    presence.desk.trail.push(Happened::TurnedAway {
+        remote: Some(workspace()),
+        refusal,
+    });
+    for topic in [
+        Topic::Status,
+        Topic::Exposure,
+        Topic::Attention,
+        Topic::Workstation,
+    ] {
+        presence.notice(Notice::Stale(topic));
+    }
+    assert_eq!(definitions(&presence), 1);
 }

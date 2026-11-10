@@ -1952,7 +1952,7 @@ fn happened(
         // this workstation, from then on.
         Event::HeldBy { capability, holder } => match holder {
             Some(holder) => words::answered(capability, holder),
-            None => format!("nothing answered for {capability} on this workstation"),
+            None => format!("nothing is known to answer for {capability} on this workstation"),
         },
         Event::Kept { dropped, cut } => words::kept(*dropped, *cut),
         // Said with the request they hold or settle, and the workstation's

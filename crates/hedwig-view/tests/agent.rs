@@ -1041,6 +1041,7 @@ fn what_answers_for_an_agent_is_said_where_it_is_granted() {
                 signed_in: SignedIn::Locally,
                 rights: Rights::Standard,
             },
+            stopped: None,
         }),
     });
     bench.told();

@@ -89,6 +89,12 @@ pub enum Relayed {
     /// The workstation's side answered, or why it did not: the connection's
     /// own request to be served.
     Reached(Result<(), Failure>),
+    /// A pipe no gpg-agent serves has its name in the system's list, nothing
+    /// having connected to it: whether it answers is its first request's to
+    /// say.
+    Listed,
+    /// An agent answered a request carried to it.
+    Answered,
     /// A request the conversation holds for a decision.
     Asks(Ask),
     /// A signature an SSH agent's conversation holds for a decision.
@@ -98,7 +104,8 @@ pub enum Relayed {
     /// What held the workstation's side when it was reached: the process
     /// listening at its port or serving its pipe, `None` where nothing
     /// answered. Told before [`Relayed::Reached`], and again for each request
-    /// an agent's conversation reaches the agent for.
+    /// an agent's conversation reaches the agent for; a pipe told
+    /// [`Relayed::Listed`] has its holder first read at its first request.
     Held(Option<SourceHolder>),
     /// An end broke the dialect's rules, and the connection was closed.
     Breached(Breach),

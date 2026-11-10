@@ -213,7 +213,7 @@ fn relay(at: AgentAt, lends: Lends, answer: Answer) -> (u16, Receiver<Relayed>) 
             std::thread::spawn(move || {
                 while let Ok(said) = heard.recv_timeout(WAIT) {
                     let verdict = match &said {
-                        Relayed::Reached(Ok(())) => Some(Ok(())),
+                        Relayed::Reached(Ok(())) | Relayed::Listed => Some(Ok(())),
                         Relayed::Reached(Err(_)) => Some(Err(Refusal::Paused)),
                         Relayed::Signs(_) => Some(answer.lock().unwrap().clone()),
                         _ => None,
@@ -551,6 +551,24 @@ fn what_is_not_lent_and_what_would_change_the_agent_never_reach_it() {
     );
 }
 
+/// A signature request for `key` over data in `git`'s namespace, framed.
+fn signature_request(key: &SshKey) -> Vec<u8> {
+    let mut data = b"SSHSIG".to_vec();
+    for field in [&b"git"[..], b"", b"sha512", &[3; 64]] {
+        data.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
+        data.extend_from_slice(field);
+    }
+    let mut body = vec![13];
+    for field in [key.blob().as_slice(), data.as_slice()] {
+        body.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(field);
+    }
+    body.extend_from_slice(&[0; 4]);
+    let mut framed = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+    framed.extend_from_slice(&body);
+    framed
+}
+
 /// A remote that keeps its connection open holds nothing of the agent's:
 /// another connection signs meanwhile, and so does the first, afterwards.
 #[test]
@@ -558,25 +576,7 @@ fn a_connection_held_open_holds_nothing_of_the_agent() {
     let pipe = unique("gpg-held");
     let scratch = Scratch::new("ssh-held", Some(&pipe));
     let (one, _) = held(&scratch);
-    let data = {
-        let mut data = b"SSHSIG".to_vec();
-        for field in [&b"git"[..], b"", b"sha512", &[3; 64]] {
-            data.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
-            data.extend_from_slice(field);
-        }
-        data
-    };
-    let sign = {
-        let mut body = vec![13];
-        for field in [one.blob().as_slice(), data.as_slice()] {
-            body.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
-            body.extend_from_slice(field);
-        }
-        body.extend_from_slice(&[0; 4]);
-        let mut framed = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
-        framed.extend_from_slice(&body);
-        framed
-    };
+    let sign = signature_request(&one);
     let answered = |stream: &mut TcpStream| {
         stream.write_all(&sign).unwrap();
         let mut length = [0u8; 4];
@@ -585,8 +585,8 @@ fn a_connection_held_open_holds_nothing_of_the_agent() {
         stream.read_exact(&mut body).unwrap();
         body[0]
     };
-    // gpg-agent's pipe serves one connection at a time; through Hedwig the
-    // remote never holds it.
+    // gpg-agent's pipe serves one connection at a time; a pipe it is set to
+    // serve is not opened at all, so the remote holds nothing of it.
     let at = AgentAt::Pipe(AgentPipe::try_from(pipe.as_str()).unwrap());
 
     let (port, _told) = relay(at, lending(&[&one]), served());
@@ -744,6 +744,466 @@ fn an_agent_nobody_serves_is_unreachable() {
     let _ = stream.read_to_end(&mut nothing);
     assert_eq!(nothing, Vec::<u8>::new());
     assert!(said(&told).contains(&Relayed::Reached(Err(Failure::Unreachable))));
+}
+
+/// What the server of [`OneInstance`] found when it came to wait on its
+/// instance.
+#[derive(Debug, PartialEq, Eq)]
+enum Waited {
+    /// A client had already connected, by the error Windows gave, which this
+    /// server, as gpg-agent's Win32-OpenSSH thread does, takes for one it
+    /// does not recover from.
+    Stopped(u32),
+    /// The wait is pending: nothing had connected.
+    Listening,
+}
+
+/// A pipe server shaped like gpg-agent's Win32-OpenSSH thread, whose two
+/// steps the test drives: [`OneInstance::new`] makes the pipe's one instance
+/// and [`OneInstance::wait`] waits on it, so whatever connects between them
+/// lands exactly where a client lands between gpg-agent's `CreateNamedPipeA`
+/// and its `ConnectNamedPipe`. The name admits no second instance, so a
+/// gpg-agent set to serve the same name makes none of its own.
+struct OneInstance {
+    instance: windows_sys::Win32::Foundation::HANDLE,
+    waiting: Box<windows_sys::Win32::System::IO::OVERLAPPED>,
+    /// A wait is pending on `waiting`: one that failed at once never
+    /// completes, and nothing may wait for it.
+    pending: bool,
+}
+
+impl OneInstance {
+    fn new(name: &str) -> OneInstance {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+        };
+        use windows_sys::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+            PIPE_WAIT,
+        };
+        let path: Vec<u16> = format!(r"\\.\pipe\{name}")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: `path` is NUL-terminated; no security attributes are given.
+        let instance = unsafe {
+            CreateNamedPipeW(
+                path.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(
+            !instance.is_null() && instance != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        OneInstance {
+            instance,
+            // SAFETY: all-zero is a valid `OVERLAPPED`.
+            waiting: Box::new(unsafe { std::mem::zeroed() }),
+            pending: false,
+        }
+    }
+
+    fn wait(&mut self) -> Waited {
+        use windows_sys::Win32::Foundation::{
+            ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GetLastError,
+        };
+        use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+        // SAFETY: the instance is open and the `OVERLAPPED` lives in `self`
+        // until `Drop` has cancelled what is pending on it.
+        let connected = unsafe { ConnectNamedPipe(self.instance, &raw mut *self.waiting) };
+        assert_eq!(connected, 0, "an overlapped wait never completes at once");
+        // SAFETY: no arguments.
+        match unsafe { GetLastError() } {
+            code @ (ERROR_PIPE_CONNECTED | ERROR_NO_DATA) => Waited::Stopped(code),
+            ERROR_IO_PENDING => {
+                self.pending = true;
+                Waited::Listening
+            }
+            other => panic!("ConnectNamedPipe: {other}"),
+        }
+    }
+}
+
+impl Drop for OneInstance {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
+        if self.pending {
+            let mut moved = 0;
+            // SAFETY: cancelling what is pending on an open instance.
+            unsafe { CancelIoEx(self.instance, &raw const *self.waiting) };
+            // SAFETY: stays until the system is done with the `OVERLAPPED`.
+            unsafe {
+                GetOverlappedResult(self.instance, &raw const *self.waiting, &raw mut moved, 1)
+            };
+        }
+        // SAFETY: the instance is open and nothing is pending on it now.
+        unsafe { CloseHandle(self.instance) };
+    }
+}
+
+/// A client that opens gpg-agent's pipe between its making an instance and
+/// waiting on it ends the server, whether the client is still there or has
+/// closed again: what every case below is guarding, and the proof that
+/// [`OneInstance`] behaves as the agent does.
+#[test]
+fn a_server_shaped_like_gpg_agent_stops_when_a_client_opens_first() {
+    use windows_sys::Win32::Foundation::{ERROR_NO_DATA, ERROR_PIPE_CONNECTED};
+    let name = unique("loop-first");
+    let mut server = OneInstance::new(&name);
+    let client = hedwig_win::pipe::open_unwaited(&format!(r"\\.\pipe\{name}"), WAIT).unwrap();
+    assert_eq!(server.wait(), Waited::Stopped(ERROR_PIPE_CONNECTED));
+    drop(client);
+
+    let name = unique("loop-first-closed");
+    let mut server = OneInstance::new(&name);
+    drop(hedwig_win::pipe::open_unwaited(&format!(r"\\.\pipe\{name}"), WAIT).unwrap());
+    assert_eq!(server.wait(), Waited::Stopped(ERROR_NO_DATA));
+}
+
+/// The socket a request goes to in place of a pipe's name is asked again
+/// where it ended the connection having read nothing, as gpg-agent's handler
+/// does, however it was reached: here the file at the socket's place is a
+/// stand-in's that ends its first two connections silently.
+#[test]
+fn the_socket_of_a_gpg_agent_set_to_serve_a_pipe_is_asked_again_when_it_read_nothing() {
+    let name = unique("loop-silent");
+    let claimed = OneInstance::new(&name);
+    let scratch = Scratch::new("ssh-silent", Some(&name));
+    assert_eq!(
+        keys(&AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap()))
+            .result
+            .unwrap()
+            .len(),
+        2,
+        "answered at its socket, and its path read"
+    );
+    let printed = scratch.run("gpgconf.exe", &["--list-dirs"]);
+    let socket = PathBuf::from(
+        String::from_utf8(hedwig_core::relay::listed(&printed.stdout, "agent-ssh-socket").unwrap())
+            .unwrap(),
+    );
+    let (port, nonce, taken) = silent_stand_in(2);
+    let mut file = format!("{port}\n").into_bytes();
+    file.extend_from_slice(&nonce);
+    std::fs::write(&socket, file).unwrap();
+    let at = AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap());
+    let answer = request(&at, &[0, 0, 0, 1, 11]).result.unwrap();
+    assert_eq!(answer, agent::identities([]));
+    assert_eq!(taken.load(Ordering::SeqCst), 3, "asked three times");
+    drop(claimed);
+}
+
+/// A listener that reads the socket file's sixteen bytes and ends its first
+/// `silent` connections with nothing more read, then answers an empty list:
+/// the port, the bytes its file carries, and how many connections it took.
+fn silent_stand_in(silent: u32) -> (u16, [u8; 16], Arc<AtomicU32>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let nonce: [u8; 16] = *b"0123456789abcdef";
+    let taken = Arc::new(AtomicU32::new(0));
+    let counting = Arc::clone(&taken);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let number = counting.fetch_add(1, Ordering::SeqCst);
+            let mut presented = [0u8; 16];
+            if stream.read_exact(&mut presented).is_err() {
+                continue;
+            }
+            assert_eq!(presented, nonce);
+            if number < silent {
+                continue;
+            }
+            let mut length = [0u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0u8; usize::try_from(u32::from_be_bytes(length)).unwrap()];
+            stream.read_exact(&mut body).unwrap();
+            stream.write_all(&agent::identities([])).unwrap();
+        }
+    });
+    (port, nonce, taken)
+}
+
+/// A pipe a running gpg-agent is set to serve is never connected to: its
+/// server, however it is shaped, is left alone while the request is answered
+/// from the agent's own socket.
+#[test]
+fn a_pipe_a_running_gpg_agent_is_set_to_serve_is_left_alone_and_its_agent_answers_at_its_socket() {
+    let name = unique("loop-left-alone");
+    let mut server = OneInstance::new(&name);
+    // The agent started here is set to serve the name; the server above holds
+    // its one instance, so the agent makes none of its own and only its own
+    // SSH socket can answer.
+    let scratch = Scratch::new("ssh-left-alone", Some(&name));
+    assert!(
+        std::fs::read_to_string(scratch.path().join("agent.log"))
+            .unwrap()
+            .contains("cannot create pipe"),
+        "the agent made no instance of the pipe"
+    );
+    let at = AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap());
+    // On a thread of its own: this server never reads, so a request given to
+    // the pipe would wait on it for ever.
+    let (answered, answer) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = answered.send(keys(&at));
+    });
+    let reached = answer.recv_timeout(WAIT).expect("answered at its socket");
+    assert_eq!(reached.result.unwrap().len(), 2, "answered at its socket");
+    let holder = reached.holder.expect("what listens at the socket is read");
+    assert!(
+        holder.program.as_str().ends_with("gpg-agent.exe"),
+        "{holder:?}"
+    );
+    assert_eq!(holder.stopped, None, "the name exists, whoever holds it");
+    assert_eq!(server.wait(), Waited::Listening, "nothing connected to it");
+}
+
+/// A stand-in agent at a pipe, answering each client's one request with an
+/// empty list and counting its clients. Stops when the signal is raised.
+fn pipe_agent(name: &str) -> (Arc<AtomicU32>, Arc<Signal>) {
+    let person = Token::own().unwrap().user().unwrap();
+    let (listener, first) = Listener::bind(&format!(r"\\.\pipe\{name}"), &person).unwrap();
+    let clients = Arc::new(AtomicU32::new(0));
+    let stop = Arc::new(Signal::new().unwrap());
+    let (counting, stopping) = (Arc::clone(&clients), Arc::clone(&stop));
+    std::thread::spawn(move || {
+        let mut instance = first;
+        loop {
+            match instance.accept(&stopping) {
+                Ok(Moved::Stopped) | Err(_) => return,
+                Ok(_) => {}
+            }
+            counting.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0u8; 5];
+            let mut filled = 0;
+            while filled < request.len() {
+                match instance.read(&mut request[filled..], None) {
+                    Ok(Moved::Bytes(read)) if read > 0 => filled += read,
+                    _ => break,
+                }
+            }
+            if filled == request.len() {
+                let _ = instance.write(&agent::identities([]), None);
+            }
+            let Ok(next) = listener.another() else { return };
+            instance = next;
+        }
+    });
+    (clients, stop)
+}
+
+/// A pipe no running gpg-agent is set to serve is opened to give it a
+/// request and at no other time: the opening of a remote's connection is
+/// decided with nothing connected, and one request is one client.
+#[test]
+fn a_pipe_no_gpg_agent_serves_is_opened_for_a_request_and_not_before() {
+    let name = unique("plain");
+    let (clients, stop) = pipe_agent(&name);
+    let at = AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap());
+    let (port, told) = relay(at, Lends::Every, served());
+    let mut connection = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    connection.set_read_timeout(Some(WAIT)).unwrap();
+    loop {
+        match told.recv_timeout(WAIT).unwrap() {
+            Relayed::Listed => break,
+            Relayed::Reached(reached) => {
+                panic!("a name in a list reaches nothing: {reached:?}")
+            }
+            Relayed::Held(_) => panic!("what serves the pipe is not read at the opening"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        clients.load(Ordering::SeqCst),
+        0,
+        "the opening connected to the pipe"
+    );
+    connection.write_all(&[0, 0, 0, 1, 11]).unwrap();
+    let mut length = [0u8; 4];
+    connection.read_exact(&mut length).unwrap();
+    let mut answer = vec![0u8; usize::try_from(u32::from_be_bytes(length)).unwrap()];
+    connection.read_exact(&mut answer).unwrap();
+    assert_eq!(answer[0], 12, "answered from the agent's list");
+    assert_eq!(
+        clients.load(Ordering::SeqCst),
+        1,
+        "one request is one client"
+    );
+    loop {
+        match told.recv_timeout(WAIT).unwrap() {
+            Relayed::Answered => break,
+            Relayed::Reached(reached) => panic!("{reached:?}"),
+            _ => {}
+        }
+    }
+    drop(connection);
+    stop.raise().unwrap();
+}
+
+/// A pipe with nothing behind it, nothing having been read of it, is refused
+/// at the opening and says no holder stands.
+#[test]
+fn an_opening_for_a_pipe_nothing_holds_says_nothing_holds_it() {
+    let at = AgentAt::Pipe(AgentPipe::try_from(unique("absent").as_str()).unwrap());
+    let (port, told) = relay(at, Lends::Every, served());
+    let _connection = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    assert_eq!(told.recv_timeout(WAIT).unwrap(), Relayed::Held(None));
+    assert_eq!(
+        told.recv_timeout(WAIT).unwrap(),
+        Relayed::Reached(Err(Failure::Unreachable))
+    );
+}
+
+/// The opening of a remote's connection to a pipe a running gpg-agent is set
+/// to serve connects to it no more than a request does: its server's wait is
+/// still pending once the opening is decided.
+#[test]
+fn an_opening_for_a_pipe_a_running_gpg_agent_is_set_to_serve_leaves_it_alone() {
+    let name = unique("loop-opening-alive");
+    let mut server = OneInstance::new(&name);
+    let _scratch = Scratch::new("ssh-opening-alive", Some(&name));
+    let at = AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap());
+    let (port, told) = relay(at, Lends::Every, served());
+    let _connection = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let reached = loop {
+        match told.recv_timeout(WAIT).unwrap() {
+            Relayed::Reached(reached) => break reached,
+            Relayed::Listed => panic!("a pipe the agent is set to serve goes to its socket"),
+            _ => {}
+        }
+    };
+    assert_eq!(reached, Ok(()), "answered at the agent's socket");
+    assert_eq!(server.wait(), Waited::Listening, "nothing connected to it");
+}
+
+/// A gpg-agent running and set to serve another pipe says nothing of this
+/// one, which is opened; the holder it answers with is the pipe's own.
+#[test]
+fn a_gpg_agent_set_to_serve_another_pipe_leaves_this_one_to_be_opened() {
+    let name = unique("plain-other");
+    let (clients, stop) = pipe_agent(&name);
+    let _scratch = Scratch::new("ssh-other", Some(&unique("elsewhere")));
+    let at = AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap());
+    let reached = keys(&at);
+    assert_eq!(reached.result.unwrap().len(), 0);
+    let holder = reached.holder.expect("the pipe's server is read");
+    assert!(
+        !holder.program.as_str().ends_with("gpg-agent.exe"),
+        "{holder:?}"
+    );
+    assert_eq!(holder.stopped, None, "no agent here is set to serve it");
+    assert_eq!(clients.load(Ordering::SeqCst), 1);
+    stop.raise().unwrap();
+}
+
+/// Where a pipe a running gpg-agent is set to serve is gone, the agent is
+/// still reached at its socket and its holder says so; where the name is
+/// there, whoever holds it, nothing is said.
+#[test]
+fn the_holder_says_when_a_pipe_its_gpg_agent_is_set_to_serve_is_gone() {
+    let name = unique("loop-gone");
+    let claimed = OneInstance::new(&name);
+    let scratch = Scratch::new("ssh-gone", Some(&name));
+    let at = AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap());
+    assert_eq!(keys(&at).holder.unwrap().stopped, None);
+    drop(claimed);
+    let reached = keys(&at);
+    assert_eq!(reached.result.unwrap().len(), 2, "answered at its socket");
+    let stopped = reached
+        .holder
+        .expect("what listens at the socket is read")
+        .stopped
+        .expect("the pipe is gone");
+    assert_eq!(stopped.pipe, AgentPipe::try_from(name.as_str()).unwrap());
+    let Home::At(home) = stopped.home else {
+        panic!("the suite's own home")
+    };
+    assert_eq!(
+        PathBuf::from(home.as_str().to_lowercase()),
+        PathBuf::from(scratch.path().to_string_lossy().to_lowercase())
+    );
+    let (_clients, stop) = pipe_agent(&name);
+    assert_eq!(keys(&at).holder.unwrap().stopped, None, "the name is back");
+    stop.raise().unwrap();
+}
+
+/// The opening of a remote's connection to a pipe whose gpg-agent has
+/// stopped serving it is answered at the agent's socket, and what it is told
+/// holds the agent says so: a remote is served however the pipe stands.
+#[test]
+fn an_opening_for_a_pipe_its_gpg_agent_no_longer_serves_is_answered_at_the_socket() {
+    let name = unique("loop-opening");
+    let claimed = OneInstance::new(&name);
+    let _scratch = Scratch::new("ssh-opening", Some(&name));
+    drop(claimed);
+    let at = AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap());
+    let (port, told) = relay(at, Lends::Every, served());
+    let connection = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let mut stopped = None;
+    loop {
+        match told.recv_timeout(WAIT).unwrap() {
+            Relayed::Held(Some(holder)) => stopped = holder.stopped,
+            Relayed::Reached(reached) => {
+                assert_eq!(reached, Ok(()));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        stopped.map(|gone| gone.pipe),
+        Some(AgentPipe::try_from(name.as_str()).unwrap()),
+        "the holder names the pipe that has gone"
+    );
+    drop(connection);
+}
+
+/// `count` signatures through a pipe a real gpg-agent is set to serve, under
+/// whatever load the workstation carries: every one is answered, the agent's
+/// pipe is still served after, and the person's own client still reaches it.
+/// The count is `HEDWIG_SIGNATURES`.
+#[test]
+#[ignore = "needs a load started beside it"]
+fn signatures_through_a_pipe_leave_its_gpg_agent_serving_it() {
+    let count: usize =
+        std::env::var("HEDWIG_SIGNATURES").map_or(500, |value| value.parse().unwrap());
+    let name = unique("loaded");
+    let scratch = Scratch::new("ssh-loaded", Some(&name));
+    let (one, _) = held(&scratch);
+    let at = AgentAt::Pipe(AgentPipe::try_from(name.as_str()).unwrap());
+    let sign = signature_request(&one);
+    let mut outcomes = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let outcome = match request(&at, &sign).result {
+            Ok(answer) if answer.get(4) == Some(&14) => "signed".to_owned(),
+            Ok(answer) => format!("answered {:?}", answer.get(4)),
+            Err(failure) => format!("{failure:?}"),
+        };
+        *outcomes.entry(outcome).or_insert(0usize) += 1;
+    }
+    println!("{name}: {outcomes:?}");
+    assert_eq!(outcomes.get("signed"), Some(&count), "{outcomes:?}");
+    let log = std::fs::read_to_string(scratch.path().join("agent.log")).unwrap();
+    assert!(
+        !log.contains("ConnectNamedPipe") && !log.contains("thread stopped"),
+        "{log}"
+    );
+    let theirs = Command::new(SSH_ADD)
+        .env("SSH_AUTH_SOCK", format!(r"\\.\pipe\{name}"))
+        .arg("-l")
+        .output()
+        .unwrap();
+    assert!(theirs.status.success(), "{theirs:?}");
 }
 
 /// A key of the run's own in the TPM, deleted when dropped.

@@ -1133,6 +1133,21 @@ pub fn mend(
 /// do about it. `source` is what the capability is defined as, where known.
 /// A source not yet tried in this run is said by what holds it alone.
 pub fn answers(found: &Found, source: Option<&Source>) -> Vec<String> {
+    let mut said = answers_of(found, source);
+    if let Some(stopped) = found
+        .holder
+        .as_ref()
+        .and_then(|holder| holder.stopped.as_ref())
+    {
+        let remedy = Remedy::StoppedPipe {
+            home: stopped.home.clone(),
+        };
+        said.push(format!("{}.", capitalised(remedy.to_string())));
+    }
+    said
+}
+
+fn answers_of(found: &Found, source: Option<&Source>) -> Vec<String> {
     let capability = &found.capability;
     let holder = found.holder.as_ref();
     let failure = match found.health {
