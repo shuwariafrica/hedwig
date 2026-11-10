@@ -692,7 +692,11 @@ fn a_lent_emulators_console_is_reached_on_the_remote_authenticated_on_the_workst
         event,
         Event::Carried { carriage: Carriage::Console { port: at, .. }, .. } if at.number() == console.port()
     )));
-    assert!(run.trail_text().contains("hosted"), "{}", run.trail_text());
+    // A refused line reaches the core by its own message and the trail by the
+    // writing thread, after the remote has its answer.
+    until("the console's refused lines recorded", || {
+        run.trail_text().contains("hosted").then_some(())
+    });
     assert!(
         !run.trail_text().contains("a-token-of-the-remotes"),
         "the remote's token is recorded nowhere"
