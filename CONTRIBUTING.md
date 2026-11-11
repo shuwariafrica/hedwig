@@ -79,10 +79,12 @@ A test marked ignored needs something not every machine has, and its marking say
 server on loopback, GnuPG for Windows installed and registered, a COM port, a TPM, a session at
 medium integrity, or the desktop's foreground, which the interface's suites take for a few seconds
 each. CI runs the two whose need its runners meet, an elevated session and a listener on every
-address that Windows Firewall does not ask about. Run one by name where you have what it needs:
+address that Windows Firewall does not ask about. Run one by name where you have what it needs. Some
+tests that need the desktop's foreground act on the whole desktop, closing every running copy of a
+program or filling the screen, so run such a suite one test at a time:
 
 ```powershell
-cargo test --release --locked --target x86_64-pc-windows-msvc -p hedwig-shell --test menu -- --ignored
+cargo test --release --locked --target x86_64-pc-windows-msvc -p hedwig-shell --test menu -- --ignored --test-threads 1
 ```
 
 The suites leave nothing of yours touched: every GnuPG home they make has no card reader, every
