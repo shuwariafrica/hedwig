@@ -2,59 +2,43 @@
 
 ## Reporting a vulnerability
 
-Use **Security → Report a vulnerability** on this repository. Please do not open
-a public issue for anything that affects the confidentiality of agent access.
-
+Use **Security, Report a vulnerability** on this repository, never a public issue, for anything
+that would let something reach what a workstation holds beyond what its person granted.
 Expect an acknowledgement within five working days.
 
 ## Supported versions
 
-The most recent release only. Fixes are shipped as a new version, not as patches
-to older tags.
+The most recent release only. A fix ships as the next release.
 
-## Scope
+## What Hedwig promises
 
-In scope: anything that lets a principal reach gpg-agent through the relay that
-could not reach it without the relay installed. Concretely, the peer admission
-policy, the nonce handshake and its ordering, socket-file parsing, and the
-autostart entry.
+- A remote reaches only what a grant lends it, decided request by request by the person's grants
+  and rules within any limit their organisation sets; what those leave to the person is asked of
+  them, and refused while nothing can ask them.
+- Hedwig's control pipe admits the person's own processes alone: their account, at medium
+  integrity or above, not restricted to less, and not in an application container.
+- GnuPG's socket file is answered on a remote's behalf only to a listener whose own token could
+  read that file, so a process learns nothing from Hedwig that it could not read itself.
+- Hedwig writes on a remote only what the person consented to, each write named first, and takes
+  it back when the consent ends or Hedwig is removed.
+- Hedwig runs as the person and is never elevated; setup refuses to run elevated.
 
-Out of scope, being accepted properties of the design rather than defects:
+A report that Hedwig breaks one of these is in scope, and so is any flaw in how it reads what a
+remote or a client sends: GnuPG's Assuan, the SSH agent's protocol, ADB, a channel's prompts, the
+control protocol, and the files Hedwig keeps.
 
-- Any process running as the user can read the nonce file and speak to gpg-agent
-  directly, with or without this tool installed. The relay's admission policy is
-  calibrated to that same set, so it neither widens nor narrows it.
-- Administrators and SYSTEM can read the nonce file, debug the relay or replace
-  it.
-- A compromised remote host can request signatures for the life of a forwarded
-  connection, bounded only by the card's touch policy.
+Out of scope, being properties of what Hedwig lends rather than defects:
 
-A report restating one of these is not a vulnerability report. A report showing
-that the relay *widens* one of them is.
+- A process running as the person reaches their gpg-agent, SSH agent and ADB server with or
+  without Hedwig.
+- Administrators and SYSTEM can read what the person holds, and replace Hedwig.
+- A remote granted a key can ask for signatures with it for as long as the grant serves it, each
+  decided as the grant says. The control that survives a compromised remote is the card's own: a
+  key whose card asks for a touch signs nothing without one.
 
 ## Verifying a release
 
-Every release asset carries a detached OpenPGP signature from the Shuwari Africa
-publishing key, `Shuwari Dev Team <developers@shuwari.africa>`:
-
-```
-9E65E1F33DB1D6615CA7DDEF5CBF5337934574A8
-```
-
-That fingerprint is the trust anchor. Fetch the key from a keyserver rather than
-from the release it authenticates, then verify the asset you downloaded, or
-`SHA256SUMS` to cover all of them at once:
-
-```
-gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 9E65E1F33DB1D6615CA7DDEF5CBF5337934574A8
-gpg --verify hedwig-x64.exe.asc hedwig-x64.exe
-```
-
-Binaries are not Authenticode-signed; expect a SmartScreen warning on direct
-download.
-
-Every release also carries a GitHub build provenance attestation:
-
-```
-gh attestation verify hedwig-x64.exe --repo shuwariafrica/hedwig
-```
+Every release lists the SHA-256 of each file in `SHA256SUMS` and carries GitHub's attestation of
+where each file was built; the README shows the commands that check both. A release cannot be
+changed once it is published, and its tag is signed by the maintainer who made it. Release files
+carry no OpenPGP signature, and no Authenticode signature, so SmartScreen warns once, at setup.

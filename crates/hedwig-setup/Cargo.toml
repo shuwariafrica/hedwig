@@ -1,0 +1,28 @@
+[package]
+name = "hedwig-setup"
+description = "Installs, updates and starts Hedwig for the person who runs it, carrying the other three executables and the window's runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+
+# Its one question and what it says while it installs are the interface's
+# surface: the confirmation's construction, painted by `hedwig-shell`.
+[dependencies]
+hedwig-model.workspace = true
+hedwig-client.workspace = true
+hedwig-win.workspace = true
+hedwig-view.workspace = true
+hedwig-shell.workspace = true
+
+[build-dependencies]
+hedwig-model.workspace = true
+hedwig-win.workspace = true
+hedwig-view.workspace = true
+
+[lints]
+workspace = true

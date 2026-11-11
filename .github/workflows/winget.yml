@@ -1,0 +1,105 @@
+name: winget
+
+# A release published as stable is submitted when it is published, or when a
+# prerelease is later marked stable; any release can be submitted by hand.
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release to submit, by its tag, such as v0.2.0.
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: winget-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    name: winget / komac / submit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    # WINGET_TOKEN opens pull requests on winget-pkgs from the organisation's
+    # fork; kept in this environment, it reaches no other job.
+    environment: winget
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      - name: Check out the release's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Fetch yq and Komac
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          foreach ($folder in ./scripts/fetch-tools.ps1 -Set gate, winget) {
+              if ($folder.Name -eq 'Path') {
+                  $folder.Value | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+              }
+          }
+
+      # The installers winget will fetch, checked against the release's own
+      # attestation before their sums go into a manifest.
+      - name: Fetch and verify the release's installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          : "${GH_TOKEN:?}" "${REPOSITORY:?}" "${TAG:?}"
+          gh release download "${TAG}" --repo "${REPOSITORY}" --dir release \
+            --pattern 'hedwig-setup-*.exe' --pattern SHA256SUMS
+          for file in release/*; do
+            gh release verify-asset "${TAG}" "${file}" --repo "${REPOSITORY}"
+          done
+          (cd release && sha256sum --check --ignore-missing --strict SHA256SUMS)
+
+      # Every field the repository's manifests do not fix is written from the
+      # release: its version, date, and each architecture's URL and SHA-256.
+      - name: Write the manifests for this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          : "${GH_TOKEN:?}" "${REPOSITORY:?}" "${TAG:?}"
+          VERSION=${TAG#v}
+          RELEASED=$(gh release view "${TAG}" --repo "${REPOSITORY}" --json publishedAt --jq '.publishedAt[0:10]')
+          export VERSION RELEASED
+          out="manifests/${VERSION}"
+          mkdir -p "${out}"
+          cp packaging/winget/*.yaml "${out}/"
+          yq --inplace '.PackageVersion = strenv(VERSION)' "${out}"/*.yaml
+          installer=("${out}"/*.installer.yaml)
+          yq --inplace '.ReleaseDate = strenv(RELEASED)' "${installer[@]}"
+          for arch in x64 arm64; do
+            URL="https://github.com/${REPOSITORY}/releases/download/${TAG}/hedwig-setup-${arch}.exe"
+            sum=$(sha256sum "release/hedwig-setup-${arch}.exe")
+            SHA=${sum%% *}
+            SHA=${SHA^^}
+            ARCH=${arch}
+            export URL SHA ARCH
+            yq --inplace '(.Installers[] | select(.Architecture == strenv(ARCH))) |= (.InstallerUrl = strenv(URL) | .InstallerSha256 = strenv(SHA))' \
+              "${installer[@]}"
+          done
+          cat "${out}"/*.yaml
+
+      - name: Submit to winget-pkgs
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          KOMAC_FORK_OWNER: ${{ github.repository_owner }}
+        run: |
+          : "${GITHUB_TOKEN:?}" "${KOMAC_FORK_OWNER:?}" "${TAG:?}"
+          komac --version
+          komac submit "manifests/${TAG#v}" --dry-run
+          komac submit "manifests/${TAG#v}" --yes

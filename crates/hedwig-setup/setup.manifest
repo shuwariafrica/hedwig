@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+  <assemblyIdentity type="win32" name="ShuwariAfrica.Hedwig.Setup" version="1.0.0.0" processorArchitecture="*"/>
+
+  <!-- Version 6 of the common controls: the question is the interface's
+       confirmation, whose controls Windows fully exposes to UI Automation
+       only there. -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!-- Setup installs for the person who runs it and asks for nothing more;
+       an elevated start is refused before anything is written. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <asmv3:application>
+    <asmv3:windowsSettings xmlns:ws2005="http://schemas.microsoft.com/SMI/2005/WindowsSettings">
+      <ws2005:dpiAware>true/pm</ws2005:dpiAware>
+    </asmv3:windowsSettings>
+    <asmv3:windowsSettings xmlns:ws2016="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+      <ws2016:dpiAwareness>PerMonitorV2</ws2016:dpiAwareness>
+      <ws2016:longPathAware>true</ws2016:longPathAware>
+    </asmv3:windowsSettings>
+    <asmv3:windowsSettings xmlns:ws2024="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
+      <!-- Console subsystem, and no window when no terminal started it: a
+           person who opens setup sees its question alone, and a script that
+           runs it waits for it and reads its status and what it says. -->
+      <ws2024:consoleAllocationPolicy>detached</ws2024:consoleAllocationPolicy>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+</assembly>

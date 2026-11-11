@@ -1,0 +1,20 @@
+[package]
+name = "hedwig-view"
+description = "What Hedwig's interface shows and offers, decided from what the core said, with nothing drawn"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+
+# The model and the client, and nothing that draws: what a surface shows is
+# decided here and checked without a desktop.
+[dependencies]
+hedwig-model.workspace = true
+hedwig-client.workspace = true
+
+[lints]
+workspace = true

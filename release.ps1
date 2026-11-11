@@ -8,19 +8,27 @@
     authoritative and the tag is checked against it. Bump Cargo.toml, run
     `cargo update -w`, commit, then run this.
 
-    Every check runs before anything is tagged: a clean working tree, Cargo.toml
-    and Cargo.lock both at the version, a remote pointing at the repository, a
-    branch level with that remote after a fetch, and no existing tag. -WhatIf
-    runs all of them, the fetch included, and stops short of the tag.
+    Every check runs before anything is tagged: notes for a pre-release, a clean
+    working tree, Cargo.toml and Cargo.lock both at the version, a remote
+    pointing at the repository, a branch level with that remote after a fetch,
+    HEAD admitted as the release workflow admits a tag's commit
+    (scripts/assert-release-commit.ps1), and no existing tag. -WhatIf runs all
+    of them, the fetch included, and stops short of the tag.
 
     MAIN_REPO_OWNER and MAIN_REPO_NAME name a fork to release from instead.
 
 .PARAMETER Version
-    Semantic version without the leading 'v'. Pre-release classifiers are
-    alpha.N, beta.N and rc.N, case-sensitive: 1.2.3, 1.2.3-rc.2.
+    Semantic version without the leading 'v'. The one pre-release classifier
+    is alpha.N, case-sensitive: 0.2.0, 0.2.0-alpha.1.
+
+.PARAMETER NotesPath
+    A file of the release's notes, which become the signed tag's message and
+    so the published release's own words, lines beginning with '#' included.
+    Required for a pre-release, whose notes name what it carries that is not
+    yet accepted.
 
 .EXAMPLE
-    ./release.ps1 0.2.0 -WhatIf
+    ./release.ps1 0.2.0-alpha.1 -NotesPath notes.md -WhatIf
 
 .OUTPUTS
     An object naming the tag pushed and the remote it went to.
@@ -28,7 +36,9 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [string] $Version
+    [string] $Version,
+
+    [string] $NotesPath
 )
 
 Set-StrictMode -Version Latest
@@ -72,8 +82,8 @@ function Invoke-Git {
 function Get-ManifestVersion {
     <#
     .SYNOPSIS
-        Reads the package version from Cargo.toml: the first top-level
-        `version = "..."` line, which is the [package] table's.
+        Reads the version from Cargo.toml: the first top-level
+        `version = "..."` line, which is the [workspace.package] table's.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -166,6 +176,10 @@ function Publish-ReleaseTag {
         Checks that the repository is ready to release a version, then creates
         the signed annotated tag v<Version> and pushes it.
 
+    .PARAMETER NotesPath
+        The file whose text is the tag's message; without it the message is
+        "Release version v<Version>".
+
     .PARAMETER Path
         Root of the repository: the directory holding Cargo.toml and Cargo.lock.
 
@@ -179,13 +193,19 @@ function Publish-ReleaseTag {
         # The options replace the default IgnoreCase, so the match is case-sensitive.
         [ValidatePattern(@'
 ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)
-(-(alpha|beta|rc)\.([1-9][0-9]*))?
+(-alpha\.([1-9][0-9]*))?
 (\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$
 '@,
             Options = 'IgnorePatternWhitespace',
             ErrorMessage = "Version '{0}' is not valid. See Get-Help ./release.ps1 for allowed formats."
         )]
         [string] $Version,
+
+        [ValidateScript(
+            { (Test-Path -LiteralPath $_ -PathType Leaf) -and (Get-Content -LiteralPath $_ -Raw) -match '\S' },
+            ErrorMessage = "Notes file '{0}' is missing or holds no notes."
+        )]
+        [string] $NotesPath,
 
         [Parameter(Mandatory)]
         [string] $Path,
@@ -196,6 +216,16 @@ function Publish-ReleaseTag {
         [Parameter(Mandatory)]
         [string] $Name
     )
+
+    if ($Version -cmatch '^[^+]*-' -and -not $NotesPath) {
+        $refusal = @{
+            Message      = "A pre-release's notes name what it carries that is not yet accepted: pass -NotesPath."
+            ErrorId      = 'NotesRequired'
+            Category     = 'InvalidArgument'
+            TargetObject = $Version
+        }
+        Write-Error @refusal -ErrorAction Stop
+    }
 
     $changes = Invoke-Git -Repository $Path -Argument 'status', '--porcelain'
     if ($changes) {
@@ -301,6 +331,16 @@ function Publish-ReleaseTag {
         Write-Error @refusal -ErrorAction Stop
     }
 
+    # The release workflow admits a tag by this check, once it is public.
+    $admission = @{
+        Commit  = 'HEAD'
+        Version = $Version
+        Branch  = "$remote/main"
+        Path    = $Path
+    }
+    $admit = Join-Path -Path $PSScriptRoot -ChildPath 'scripts' -AdditionalChildPath 'assert-release-commit.ps1'
+    $null = & $admit @admission
+
     if (Invoke-Git -Repository $Path -Argument 'tag', '--list', $tag) {
         $refusal = @{
             Message      = "Tag '$tag' already exists locally."
@@ -323,7 +363,13 @@ function Publish-ReleaseTag {
     if ($PSCmdlet.ShouldProcess($remote, "Create signed tag $tag and push it")) {
         Write-Information "Creating signed tag $tag"
         # --sign fails when no signing key is configured, which is the intent.
-        $null = Invoke-Git -Repository $Path -Argument 'tag', '--sign', '--annotate', $tag, '-m', "Release version $tag"
+        $message = if ($NotesPath) {
+            # whitespace, not git's default strip, which drops '#' lines.
+            '--cleanup=whitespace', '--file', (Resolve-Path -LiteralPath $NotesPath).ProviderPath
+        } else {
+            '-m', "Release version $tag"
+        }
+        $null = Invoke-Git -Repository $Path -Argument (@('tag', '--sign', '--annotate', $tag) + $message)
         $null = Invoke-Git -Repository $Path -Argument 'push', $remote, $tag
         [pscustomobject] @{
             Tag    = $tag
@@ -344,5 +390,6 @@ if ($MyInvocation.InvocationName -ne '.') {
         Owner   = if ($env:MAIN_REPO_OWNER) { $env:MAIN_REPO_OWNER } else { 'shuwariafrica' }
         Name    = if ($env:MAIN_REPO_NAME) { $env:MAIN_REPO_NAME } else { 'hedwig' }
     }
+    if ($NotesPath) { $release.NotesPath = $NotesPath }
     Publish-ReleaseTag @release
 }

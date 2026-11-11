@@ -1,0 +1,179 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: release / tag / verify
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.commit.outputs.version }}
+    steps:
+      # The whole history: the commit is checked against main's first-parent
+      # line.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # A tag release.ps1 made: annotated, and signed by a key GitHub
+      # verifies. main's checks are not strict, so main's head may be a merge
+      # no run tested; the full ci run below tests this commit itself. Every
+      # job builds the commit the push named, so the tag must still name it.
+      - name: Verify the tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          : "${GH_TOKEN:?}" "${REPOSITORY:?}" "${TAG:?}" "${GITHUB_OUTPUT:?}" "${GITHUB_SHA:?}"
+          ref=$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha')
+          read -r kind object <<<"${ref}"
+          if [[ "${kind}" != tag ]]; then
+            printf '::error title=tag::%s is a lightweight tag; release.ps1 makes an annotated, signed one\n' "${TAG}"
+            exit 1
+          fi
+          verified=$(gh api "repos/${REPOSITORY}/git/tags/${object}" --jq '.verification.verified')
+          if [[ "${verified}" != true ]]; then
+            printf '::error title=tag::GitHub does not verify the signature on %s\n' "${TAG}"
+            exit 1
+          fi
+          commit=$(gh api "repos/${REPOSITORY}/git/tags/${object}" --jq '.object.sha')
+          if [[ "${commit}" != "${GITHUB_SHA}" ]]; then
+            printf '::error title=tag::%s names %s, but this run was started for %s\n' "${TAG}" "${commit}" "${GITHUB_SHA}"
+            exit 1
+          fi
+          printf 'commit=%s\n' "${commit}" >>"${GITHUB_OUTPUT}"
+
+      # On main's first-parent line, so never a commit of a branch main merged,
+      # and every crate and the lock at the tag's version.
+      - name: Verify the commit
+        id: commit
+        shell: pwsh
+        env:
+          COMMIT: ${{ steps.tag.outputs.commit }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          Set-StrictMode -Version Latest
+          $admitted = ./scripts/assert-release-commit.ps1 -Commit $env:COMMIT -Version $env:TAG.Substring(1)
+          "version=$($admitted.Version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  # A called workflow comes from the caller's own commit by ./ as by $/;
+  # actionlint 1.7.12 rejects $/ (rhysd/actionlint#732).
+  ci:
+    needs: tag
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+    with:
+      retention-days: 1
+
+  publish:
+    name: release / github / publish
+    needs: [tag, ci]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    # Its rule admits only v* tags.
+    environment:
+      name: release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Collect the downloads
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: hedwig-*
+          merge-multiple: true
+
+      - name: Require both downloads for both architectures
+        run: |
+          missing=()
+          for arch in x64 arm64; do
+            for name in "hedwig-setup-${arch}.exe" "hedwig-${arch}.exe"; do
+              [[ -f "dist/${name}" ]] || missing+=("${name}")
+            done
+          done
+          if ((${#missing[@]} > 0)); then
+            printf '::error title=downloads::missing %s\n' "${missing[*]}"
+            exit 1
+          fi
+          ls -l dist
+
+      - name: Sum the downloads
+        working-directory: dist
+        run: |
+          sha256sum -- *.exe >SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest the downloads' provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      # The release is immutable once published, so its notes are whole before
+      # it is: gh drafts it, uploads every file, then publishes. The notes open
+      # with the signed tag's own message.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          : "${GH_TOKEN:?}" "${REPOSITORY:?}" "${TAG:?}"
+          object=$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.sha')
+          message=$(gh api "repos/${REPOSITORY}/git/tags/${object}" --jq '.message')
+          sed '/^-----BEGIN PGP SIGNATURE-----$/,$d' <<<"${message}" >notes.md
+          # shellcheck disable=SC2016 # The backticks are Markdown.
+          printf '\n## Verifying a download\n\n```\nsha256sum --check --ignore-missing SHA256SUMS\ngh attestation verify hedwig-setup-x64.exe --repo %s --signer-workflow %s/.github/workflows/release.yml\ngh release verify-asset %s hedwig-setup-x64.exe --repo %s\n```\n\n' \
+            "${REPOSITORY}" "${REPOSITORY}" "${TAG}" "${REPOSITORY}" >>notes.md
+          flags=()
+          if [[ "${TAG}" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${TAG}" dist/* --repo "${REPOSITORY}" --title "Hedwig ${TAG#v}" \
+            --notes-file notes.md --generate-notes --verify-tag "${flags[@]}"
+
+      # Each file checked the way the notes tell a person to check it.
+      - name: Verify the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          : "${GH_TOKEN:?}" "${REPOSITORY:?}" "${TAG:?}"
+          gh release verify "${TAG}" --repo "${REPOSITORY}"
+          for file in dist/*.exe dist/SHA256SUMS; do
+            gh release verify-asset "${TAG}" "${file}" --repo "${REPOSITORY}"
+          done
+          for file in dist/*.exe; do
+            gh attestation verify "${file}" --repo "${REPOSITORY}" \
+              --signer-workflow "${REPOSITORY}/.github/workflows/release.yml" --source-ref "refs/tags/${TAG}"
+          done

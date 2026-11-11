@@ -1,0 +1,19 @@
+[package]
+name = "hedwig-core"
+description = "Hedwig's core and the supervisor that runs it: the deciding function, the threads that serve it, the store and the relays"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+
+[dependencies]
+hedwig-model.workspace = true
+hedwig-win.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

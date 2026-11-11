@@ -1,5 +1,5 @@
-# Keep these triples in step with the release matrix in .github/workflows/build.yml:
-# an unlisted target's dependency edges are never evaluated.
+# Keep these triples in step with the architectures .github/workflows/ci.yml
+# builds: an unlisted target's dependency edges are never evaluated.
 [graph]
 targets = [
     { triple = "x86_64-pc-windows-msvc" },
@@ -20,6 +20,8 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+# Retired when windows-sys moves to windows-link 0.100.
+skip = [{ crate = "windows-link@0.2.1", reason = "windows-sys 0.61.2 links 0.2.1 and windows-reactor 0.100.0 links 0.100.0" }]
 
 [sources]
 unknown-registry = "deny"
